@@ -190,11 +190,135 @@ pub fn resolve_workspace_root(raw_value: &str, bot_home: &Path) -> Result<PathBu
     Ok(canonical)
 }
 
+/// Discover Git repositories that are direct children of `workspace_root`.
+///
+/// Each repository directory name becomes an alias and its canonical path is
+/// the value. Symlinks that resolve outside the configured root are ignored,
+/// as are names listed in `excludes`. A `.git` directory and a worktree-style
+/// `.git` file are both accepted.
+pub fn discover_workspace_repositories(
+    workspace_root: &Path,
+    excludes: &[String],
+) -> Result<HashMap<String, String>, String> {
+    let canonical_root = workspace_root.canonicalize().map_err(|error| {
+        format!(
+            "Cannot discover repositories because workspace root `{}` is unavailable: {error}",
+            workspace_root.display()
+        )
+    })?;
+    let entries = std::fs::read_dir(&canonical_root).map_err(|error| {
+        format!(
+            "Cannot list workspace root `{}`: {error}",
+            canonical_root.display()
+        )
+    })?;
+
+    let mut discovered = HashMap::new();
+    for entry in entries {
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(error) => {
+                warn!(%error, "cannot inspect workspace discovery entry");
+                continue;
+            }
+        };
+        let alias = match entry.file_name().into_string() {
+            Ok(alias) => alias,
+            Err(_) => {
+                warn!(path = %entry.path().display(), "workspace repository name is not UTF-8");
+                continue;
+            }
+        };
+        if alias.starts_with('.') || excludes.contains(&alias) {
+            continue;
+        }
+
+        let canonical_repo = match entry.path().canonicalize() {
+            Ok(path) => path,
+            Err(error) => {
+                warn!(
+                    path = %entry.path().display(),
+                    %error,
+                    "cannot canonicalize discovered workspace"
+                );
+                continue;
+            }
+        };
+        if !canonical_repo.starts_with(&canonical_root)
+            || !canonical_repo.is_dir()
+            || !canonical_repo.join(".git").exists()
+        {
+            continue;
+        }
+        let path = match canonical_repo.into_os_string().into_string() {
+            Ok(path) => path,
+            Err(_) => {
+                warn!(alias, "workspace repository path is not UTF-8");
+                continue;
+            }
+        };
+        discovered.insert(alias, path);
+    }
+
+    Ok(discovered)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::fs;
     use tempfile::TempDir;
+
+    #[test]
+    fn discovers_direct_child_git_repositories() {
+        let tmp = TempDir::new().unwrap();
+        let alpha = tmp.path().join("alpha");
+        let beta = tmp.path().join("beta");
+        let ordinary = tmp.path().join("ordinary");
+        fs::create_dir_all(alpha.join(".git")).unwrap();
+        fs::create_dir_all(&beta).unwrap();
+        fs::write(beta.join(".git"), "gitdir: /tmp/beta.git\n").unwrap();
+        fs::create_dir_all(&ordinary).unwrap();
+
+        let aliases = discover_workspace_repositories(tmp.path(), &[]).unwrap();
+
+        assert_eq!(aliases.get("alpha"), Some(&alpha.display().to_string()));
+        assert_eq!(aliases.get("beta"), Some(&beta.display().to_string()));
+        assert!(!aliases.contains_key("ordinary"));
+    }
+
+    #[test]
+    fn repository_discovery_honors_excludes_and_depth_boundary() {
+        let tmp = TempDir::new().unwrap();
+        let excluded = tmp.path().join("deployment");
+        let nested = tmp.path().join("group").join("nested");
+        fs::create_dir_all(excluded.join(".git")).unwrap();
+        fs::create_dir_all(nested.join(".git")).unwrap();
+
+        let aliases = discover_workspace_repositories(
+            tmp.path(),
+            &["deployment".to_string()],
+        )
+        .unwrap();
+
+        assert!(!aliases.contains_key("deployment"));
+        assert!(!aliases.contains_key("nested"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn repository_discovery_rejects_symlink_escape() {
+        use std::os::unix::fs::symlink;
+
+        let root = TempDir::new().unwrap();
+        let outside = TempDir::new().unwrap();
+        fs::create_dir_all(outside.path().join(".git")).unwrap();
+        symlink(outside.path(), root.path().join("escaped")).unwrap();
+
+        let aliases = discover_workspace_repositories(root.path(), &[]).unwrap();
+
+        assert!(!aliases.contains_key("escaped"));
+    }
 
     #[test]
     fn parse_basic_directives() {

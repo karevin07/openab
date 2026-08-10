@@ -356,6 +356,8 @@ error_hold_ms = 2500
 #
 # [workspace]
 # root = "~/projects"
+# discover_repositories = false       # true = add direct child Git repos as aliases
+# discovery_excludes = ["deployment"] # directory names skipped during discovery
 #
 # Users can specify an alias with [[ws:@alias]] when starting a session, e.g.:
 #   @Bot [[ws:@openab]] help me debug the tests

@@ -279,6 +279,15 @@ pub struct WorkspaceConfig {
     /// backward compatibility; production deployments should set this to a
     /// directory containing only agent-editable projects.
     pub root: Option<String>,
+    /// Discover direct child directories containing a `.git` directory or
+    /// gitfile and expose them as workspace aliases. Disabled by default for
+    /// backward compatibility.
+    #[serde(default)]
+    pub discover_repositories: bool,
+    /// Repository directory names omitted from automatic discovery. Explicit
+    /// aliases remain available, even when their parent is excluded here.
+    #[serde(default)]
+    pub discovery_excludes: Vec<String>,
     /// Workspace aliases: `name = "~/path/to/project"`
     /// Used with `[[ws:@alias]]` control directives.
     #[serde(default)]
@@ -2498,6 +2507,8 @@ mod tests {
             r#"
 [workspace]
 root = "~/projects"
+discover_repositories = true
+discovery_excludes = ["private-deployment"]
 
 [workspace.aliases]
 openab = "~/projects/openab"
@@ -2510,6 +2521,11 @@ openab = "~/projects/openab"
         .expect("workspace routing config should parse");
 
         assert_eq!(cfg.workspace.root.as_deref(), Some("~/projects"));
+        assert!(cfg.workspace.discover_repositories);
+        assert_eq!(
+            cfg.workspace.discovery_excludes,
+            vec!["private-deployment"]
+        );
         assert_eq!(
             cfg.workspace.aliases.get("openab").map(String::as_str),
             Some("~/projects/openab")

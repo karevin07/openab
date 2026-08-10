@@ -874,6 +874,24 @@ async fn main() -> anyhow::Result<()> {
     };
     info!(root = %workspace_root.display(), "workspace security root resolved");
 
+    let mut workspace_aliases = cfg.workspace.aliases;
+    if cfg.workspace.discover_repositories {
+        let discovered = openab_core::directives::discover_workspace_repositories(
+            &workspace_root,
+            &cfg.workspace.discovery_excludes,
+        )
+        .map_err(anyhow::Error::msg)?;
+        let discovered_count = discovered.len();
+        for (alias, path) in discovered {
+            workspace_aliases.entry(alias).or_insert(path);
+        }
+        info!(
+            discovered = discovered_count,
+            available = workspace_aliases.len(),
+            "workspace repository discovery completed"
+        );
+    }
+
     let router = Arc::new(
         AdapterRouter::new(
             pool.clone(),
@@ -882,7 +900,7 @@ async fn main() -> anyhow::Result<()> {
             cfg.pool.prompt_hard_timeout_secs,
             cfg.pool.liveness_check_secs,
             WorkspaceRouting {
-                aliases: cfg.workspace.aliases,
+                aliases: workspace_aliases,
                 channels: cfg.workspace.channels,
                 bot_home,
                 root: workspace_root,
