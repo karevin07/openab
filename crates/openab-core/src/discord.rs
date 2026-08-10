@@ -1549,11 +1549,16 @@ impl EventHandler for Handler {
                     "List configured workspace aliases",
                 )),
             CreateCommand::new("session")
-                .description("Inspect or close this conversation session")
+                .description("Inspect, detach, or close this conversation session")
                 .add_option(CreateCommandOption::new(
                     CommandOptionType::SubCommand,
                     "status",
                     "Show session lifecycle state and workspace",
+                ))
+                .add_option(CreateCommandOption::new(
+                    CommandOptionType::SubCommand,
+                    "detach",
+                    "Pause Discord ownership so a local ACP client can resume it",
                 ))
                 .add_option(CreateCommandOption::new(
                     CommandOptionType::SubCommand,
@@ -1845,6 +1850,16 @@ impl Handler {
                     "🧹 Dropped {dropped} buffered message(s). No session state was open."
                 ),
                 Err(_) => "⚠️ No session state to close in this channel or thread.".to_string(),
+            }
+        } else if subcommand == "detach" {
+            match self.router.pool().detach_session(&scope.session_key).await {
+                Ok(()) => concat!(
+                    "✅ Session detached and ready for local resume. ",
+                    "Do not send another Discord message until the local ACP client exits; ",
+                    "the next Discord message will then restore the updated session."
+                )
+                .to_string(),
+                Err(error) => format!("⚠️ Could not detach session: {error}"),
             }
         } else {
             let snapshot = self.router.pool().session_snapshot(&scope.session_key).await;

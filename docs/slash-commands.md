@@ -14,6 +14,7 @@ OpenAB registers Discord slash commands for session control and agent management
 | `/workspace status` | Show the current session workspace and channel default | No |
 | `/workspace list` | List configured workspace aliases | No |
 | `/session status` | Show session lifecycle state and workspace | No |
+| `/session detach` | Suspend the live ACP process while preserving its resumable session and workspace | Yes |
 | `/session close` | Close session state and drop buffered messages | Yes |
 | `/auth` | Authenticate the backend agent via device flow (**DM-only**) | No |
 | `/usage` | Show backend account usage and billing information | Yes |
@@ -81,9 +82,11 @@ This is equivalent to the `sessions close` + `sessions new` pattern used by [Ope
 
 `/workspace list` shows up to 25 configured aliases and their resolved config paths. Discord thread commands inherit the parent channel binding. Responses are ephemeral and commands fail closed outside configured channels/DMs or for users outside `allowed_users`.
 
-### `/session status` and `/session close`
+### `/session status`, `/session detach`, and `/session close`
 
 `/session status` reports one of four pool states: active, suspended, persisted (awaiting restore), or no session. It also shows the session workspace when one is assigned.
+
+`/session detach` refuses an in-flight turn, removes the idle live ACP process, and preserves the ACP session ID and workspace as suspended state. It also writes an external-handoff marker, so Discord messages cannot reload the session concurrently. The local client removes that marker after its ACP process exits; the next Discord message then restores the updated session with `session/load`.
 
 `/session close` cancels any in-flight operation, removes active/suspended/persisted state, clears the session workspace metadata, and drops buffered messages. The next message in the same thread starts a fresh session. `/reset` remains available as a backward-compatible equivalent for resetting the current conversation.
 

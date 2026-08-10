@@ -60,6 +60,7 @@ pub struct SessionPool {
     hung_threshold_secs: u64,
     mapping_path: PathBuf,
     meta_path: PathBuf,
+    handoff_dir: PathBuf,
     default_config_options: HashMap<String, String>,
     #[cfg(feature = "acp-mcp")]
     session_registrar: Option<Arc<dyn crate::acp_mcp::SessionTokenRegistrar>>,
@@ -317,6 +318,8 @@ impl SessionPool {
         let _ = std::fs::create_dir_all(&openab_dir);
         let mapping_path = openab_dir.join("thread_map.json");
         let meta_path = openab_dir.join("session_meta.json");
+        let handoff_dir = openab_dir.join("external-handoffs");
+        let _ = std::fs::create_dir_all(&handoff_dir);
         let suspended = Self::load_mapping(&mapping_path);
         let session_workdirs = Self::load_mapping(&meta_path);
         Self {
@@ -337,6 +340,7 @@ impl SessionPool {
             hung_threshold_secs,
             mapping_path,
             meta_path,
+            handoff_dir,
             default_config_options,
             #[cfg(feature = "acp-mcp")]
             session_registrar: None,
@@ -408,6 +412,15 @@ impl SessionPool {
         }
     }
 
+    fn handoff_marker_path(&self, thread_id: &str) -> PathBuf {
+        let filename: String = thread_id
+            .as_bytes()
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect();
+        self.handoff_dir.join(filename)
+    }
+
     /// Check if session state exists for this thread (active, suspended, or persisted).
     #[allow(dead_code)]
     pub async fn has_active_session(&self, thread_id: &str) -> bool {
@@ -449,6 +462,12 @@ impl SessionPool {
             get_or_insert_gate(&mut state.creating, thread_id)
         };
         let _create_guard = create_gate.lock().await;
+
+        if self.handoff_marker_path(thread_id).is_file() {
+            return Err(anyhow!(
+                "session is detached to an external ACP client; close or release it first"
+            ));
+        }
 
         let (existing, saved_session_id) = {
             let state = self.state.read().await;
@@ -856,6 +875,83 @@ impl SessionPool {
         Ok(())
     }
 
+    /// Detach an idle live ACP process while preserving its resumable session ID
+    /// and workspace metadata. This is the hand-off point for another ACP client
+    /// (for example a local terminal client) to load the same checkpoint.
+    ///
+    /// A prompt must not be in flight: two ACP processes writing the same session
+    /// store concurrently can corrupt or lose conversation state.
+    pub async fn detach_session(&self, thread_id: &str) -> Result<()> {
+        let create_gate = {
+            let mut state = self.state.write().await;
+            get_or_insert_gate(&mut state.creating, thread_id)
+        };
+        let _create_guard = create_gate.lock().await;
+
+        let active = {
+            let state = self.state.read().await;
+            if let Some(activity) = state.activity.get(thread_id) {
+                if activity.in_flight() {
+                    return Err(anyhow!(
+                        "session is busy; wait for the current reply or cancel it first"
+                    ));
+                }
+            }
+            state.active.get(thread_id).cloned()
+        };
+
+        let Some(active) = active else {
+            let state = self.state.read().await;
+            if !state.suspended.contains_key(thread_id)
+                && !state.persisted.contains_key(thread_id)
+            {
+                return Err(anyhow!(
+                    "no resumable session for thread {}",
+                    crate::redact::redact_session_ids(thread_id)
+                ));
+            }
+            drop(state);
+            std::fs::write(self.handoff_marker_path(thread_id), b"detached\n")?;
+            return Ok(());
+        };
+
+        // A held connection lock means a turn or another connection operation is
+        // active even if its activity flag has not been updated yet.
+        let session_id = {
+            let conn = active
+                .try_lock()
+                .map_err(|_| anyhow!("session is busy; wait for the current reply or cancel it first"))?;
+            conn.acp_session_id
+                .clone()
+                .ok_or_else(|| anyhow!("session has no resumable ACP session ID yet"))?
+        };
+
+        let marker_path = self.handoff_marker_path(thread_id);
+        std::fs::write(&marker_path, b"detached\n")?;
+        let mut state = self.state.write().await;
+        if remove_if_same_handle(&mut state.active, thread_id, &active).is_none() {
+            let _ = std::fs::remove_file(marker_path);
+            return Err(anyhow!("session changed while preparing the hand-off; try again"));
+        }
+        state.cancel_handles.remove(thread_id);
+        state.activity.remove(thread_id);
+        state.pgids.remove(thread_id);
+        state
+            .persisted
+            .insert(thread_id.to_string(), session_id.clone());
+        state
+            .suspended
+            .insert(thread_id.to_string(), session_id);
+        #[cfg(feature = "acp-mcp")]
+        revoke_facade_token_for_key(&mut state, thread_id, self.session_registrar.as_ref());
+        self.save_mapping(&state.persisted);
+        info!(
+            thread_id = %crate::redact::redact_session_ids(thread_id),
+            "session detached for external ACP hand-off"
+        );
+        Ok(())
+    }
+
     /// Reset a session: cancel any in-flight operation, remove the active connection,
     /// and clear all suspended state. The ACP process will be killed once the last
     /// Arc reference is dropped (after streaming finishes). The next message will
@@ -895,6 +991,7 @@ impl SessionPool {
         revoke_facade_token_for_key(&mut state, thread_id, self.session_registrar.as_ref());
         self.save_mapping(&state.persisted);
         self.save_meta(&state.session_workdirs);
+        let _ = std::fs::remove_file(self.handoff_marker_path(thread_id));
         if had_state {
             info!(thread_id = %crate::redact::redact_session_ids(thread_id), "session reset");
             Ok(())
