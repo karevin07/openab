@@ -2,7 +2,7 @@
 
 ## Overview
 
-A single OAB bot instance can serve multiple projects. Workspaces let users switch project context at session start using the `[[ws:...]]` [control directive](control-directives.md).
+A single OAB bot instance can serve multiple projects. Workspaces can be selected explicitly with a `[[ws:...]]` [control directive](control-directives.md), or automatically by binding a platform channel to a workspace.
 
 When a workspace is set, the agent:
 - Uses the workspace path as its working directory
@@ -12,16 +12,28 @@ When a workspace is set, the agent:
 
 ## Configuration
 
-Define workspace aliases in `config.toml`:
+Define a narrow security root, aliases, and optional channel bindings in `config.toml`:
 
 ```toml
+[workspace]
+root = "~/projects"
+
 [workspace.aliases]
 openab = "~/projects/openab"
 infra  = "~/projects/infra-cdk"
 web    = "~/projects/frontend"
+
+[workspace.channels.discord]
+"123456789012345678" = "@openab"
+"234567890123456789" = "@web"
 ```
 
 Paths starting with `~` expand to the bot's home directory (`$HOME`).
+
+For Discord, bindings use the parent text channel ID. A message in a bound
+channel creates a thread whose ACP session starts in that workspace; later
+messages in the thread keep the same immutable workspace. An explicit
+`[[ws:...]]` on the first message overrides the channel default.
 
 ## Usage
 
@@ -44,7 +56,7 @@ All workspace paths are validated before use:
 1. **Must be absolute** — relative paths (e.g., `../secrets`) are rejected
 2. **`~` expands to bot home** — not the requesting user's home
 3. **Canonicalized** — symlinks, `..`, `.` are resolved
-4. **Must be within bot home subtree** — paths outside are rejected
+4. **Must be within `workspace.root`** — paths outside are rejected
 5. **Must be a directory** — file paths are rejected
 6. **Must exist** — non-existent paths are rejected with a clear error showing the expanded path
 
@@ -61,11 +73,11 @@ All workspace paths are validated before use:
 |----------|-------|
 | Unknown alias | `Unknown workspace alias @foo. Available: openab, infra, web` |
 | Relative path | `Workspace path must be absolute (start with ~ or /): relative/path` |
-| Outside home | `Workspace path is outside allowed directory: /etc/passwd` |
+| Outside root | `Workspace path is outside allowed directory: /etc/passwd` |
 | Not a directory | `Workspace path is not a directory: /home/bot/Cargo.toml` |
 | Does not exist | `Workspace path does not exist: ~/nope (expanded to /home/bot/nope)` |
 
 ## See Also
 
 - [Control Directives](control-directives.md) — full directive syntax and rules
-- [Config Reference](config-reference.md#workspace) — `[workspace.aliases]` configuration
+- [Config Reference](config-reference.md#workspace) — root, aliases, and channel bindings

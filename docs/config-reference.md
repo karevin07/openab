@@ -400,8 +400,8 @@ working_dir = "/home/node"
 # Cursor Agent
 [agent]
 command = "cursor-agent"
-args = ["acp", "--model", "auto", "--workspace", "/home/agent"]
-working_dir = "/home/agent"
+args = ["--model", "auto", "--workspace", "{workspace}", "acp"]
+working_dir = "/home/agent/projects/default"
 
 # Hermes Agent
 [agent]
@@ -637,23 +637,31 @@ Speech-to-text transcription for voice messages. Uses an OpenAI-compatible `/aud
 
 ## `[workspace]`
 
-Workspace aliases for [Control Directives](adr/control-directives.md). Users specify `[[ws:@alias]]` in their first message to set the session's working directory.
+Workspace security boundary, aliases for [Control Directives](adr/control-directives.md), and automatic platform-channel bindings.
 
 ```toml
+[workspace]
+root = "~/projects"
+
 [workspace.aliases]
 openab = "~/projects/openab"
 infra  = "~/projects/infra-cdk"
 web    = "~/projects/frontend"
+
+[workspace.channels.discord]
+"123456789012345678" = "@openab"
 ```
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
-| `aliases` | map | `{}` | Key-value map of alias name → path. Users reference with `@` prefix: `[[ws:@openab]]`. Paths starting with `~` expand to `$HOME`. All paths must be within the bot's home directory (security boundary). |
+| `root` | string | `$HOME` | Security boundary for every workspace. Set this to a directory containing only agent-editable projects. Must exist and be absolute (`~` is supported). |
+| `aliases` | map | `{}` | Key-value map of alias name → path. Users reference with `@` prefix: `[[ws:@openab]]`. |
+| `channels` | nested map | `{}` | Platform → channel ID → workspace spec. For Discord threads, the parent channel ID is used. Values may be `@alias` or absolute paths. |
 
 **Security:**
 - Relative paths are rejected
 - `~` expands to bot home (`$HOME`)
-- Paths are canonicalized and must be within bot home subtree
+- Paths are canonicalized and must be within `workspace.root`
 - Symlink escapes are caught by canonicalization
 - Target must be an existing directory (not a file)
 

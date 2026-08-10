@@ -9,8 +9,14 @@ OpenAB registers Discord slash commands for session control and agent management
 | `/models` | Select the AI model via dropdown menu | Yes |
 | `/agents` | Select the agent mode via dropdown menu | Yes |
 | `/cancel` | Cancel the current in-flight operation | Yes |
+| `/cancel-all` | Cancel the operation and drop buffered messages | Yes |
 | `/reset` | Reset the conversation session (clear history, start fresh) | Yes |
+| `/workspace status` | Show the current session workspace and channel default | No |
+| `/workspace list` | List configured workspace aliases | No |
+| `/session status` | Show session lifecycle state and workspace | No |
+| `/session close` | Close session state and drop buffered messages | Yes |
 | `/auth` | Authenticate the backend agent via device flow (**DM-only**) | No |
+| `/usage` | Show backend account usage and billing information | Yes |
 | `/remind` | Set a one-shot delayed reminder to mention users/roles | No |
 | `/export-thread` | Export thread/DM as `.txt` (default: last 100 messages) | No |
 
@@ -20,8 +26,8 @@ All responses are **ephemeral** — only the user who invoked the command sees t
 
 | Platform | Supported | Notes |
 |----------|-----------|-------|
-| Discord (guild threads) | ✅ | Commands registered per-guild for instant availability |
-| Discord (DMs) | ✅ | Commands registered globally; may take up to 1 hour to appear after first deploy |
+| Discord (guild channels/threads) | ✅ | Commands are registered globally; workspace/session commands enforce configured channel and user access |
+| Discord (DMs) | ✅ | Requires `allow_dm = true`; `/auth` remains DM-only |
 | Slack | ❌ | Slack blocks third-party slash commands in threads; see [slack.md](slack.md#slash-commands-are-not-supported-on-slack) |
 
 ## How They Work
@@ -68,6 +74,18 @@ This is equivalent to the `sessions close` + `sessions new` pattern used by [Ope
 **What is preserved:**
 - Bot identity and system prompt (re-applied on next session creation)
 - Config settings in `config.toml`
+
+### `/workspace status` and `/workspace list`
+
+`/workspace status` shows the immutable workspace assigned to the current session, the workspace bound to the Discord parent channel, and the available alias names. It works before a session exists, which makes it useful for checking routing before sending the first prompt.
+
+`/workspace list` shows up to 25 configured aliases and their resolved config paths. Discord thread commands inherit the parent channel binding. Responses are ephemeral and commands fail closed outside configured channels/DMs or for users outside `allowed_users`.
+
+### `/session status` and `/session close`
+
+`/session status` reports one of four pool states: active, suspended, persisted (awaiting restore), or no session. It also shows the session workspace when one is assigned.
+
+`/session close` cancels any in-flight operation, removes active/suspended/persisted state, clears the session workspace metadata, and drops buffered messages. The next message in the same thread starts a fresh session. `/reset` remains available as a backward-compatible equivalent for resetting the current conversation.
 
 ### `/export-thread`
 

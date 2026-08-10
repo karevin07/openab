@@ -95,12 +95,13 @@ The directive parser runs **before** the message enters the agent pipeline. It o
 
 - Loads `AGENTS.md`, `.kiro/steering/`, and skill definitions from the target path
 - If the path does not exist, session fails with user-visible error
-- **Security boundary — bot home subtree only.** Enforcement order:
+- **Security boundary — configured workspace root.** `workspace.root` defaults
+  to bot home for backward compatibility. Enforcement order:
   1. Reject if path is relative (does not start with `~` or `/`)
   2. Expand `~` → bot home directory
-  3. Canonicalize both the bot home root and target path (resolve symlinks, `..`, `.`) via `std::fs::canonicalize()` or equivalent
-  4. Verify canonical path starts with bot home root (`canonical.starts_with(bot_home)`)
-  5. **Reject** if outside bot home — session does not start, user-visible error returned
+  3. Canonicalize both `workspace.root` and target path (resolve symlinks, `..`, `.`) via `std::fs::canonicalize()` or equivalent
+  4. Verify canonical path starts with the configured root
+  5. **Reject** if outside the root — session does not start, user-visible error returned
 - The canonical workspace is stored in `SessionMetadata` and reused for session creation, session load/resume, eviction rebuilds, and any persisted session mapping. A `[[ws:...]]` session must never resume in the configured default working directory unless that was the resolved workspace.
 - Workspace steering defines repo context (remote URL, branch, etc.) — no separate repo binding needed in Phase 1
 
@@ -183,7 +184,7 @@ Control directives intentionally do **not** scan the entire message body. This m
 
 ### 4.4 Security Considerations
 
-- `[[ws:...]]` enforces bot home subtree only — canonicalize, reject symlink escapes (see §3.1)
+- `[[ws:...]]` enforces `workspace.root` — canonicalize, reject symlink escapes (see §3.1)
 - `[[model:...]]` only selects from pre-configured models; cannot inject arbitrary API endpoints; unknown model = hard fail
 - Directive values are sanitized (no newlines, no control characters beyond the value delimiter)
 

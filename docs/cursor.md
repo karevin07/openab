@@ -104,10 +104,11 @@ To specify a model, pass `--model` as an arg:
 ```toml
 [agent]
 # Override args (command defaults from OPENAB_AGENT_COMMAND="cursor-agent acp")
-args = ["acp", "--model", "auto"]
+args = ["--model", "auto", "acp"]
 ```
 
-In ACP mode, `--model` can be appended after `acp`. If omitted, the account default is used.
+Cursor CLI global flags such as `--model` must appear before the `acp`
+subcommand. If omitted, the account default is used.
 
 To verify which model is active, ask the agent "who are you" — the underlying model will typically self-identify (e.g. "I am Gemini, a large language model built by Google.").
 
@@ -118,12 +119,12 @@ Cursor Agent CLI supports MCP servers configured via `.cursor/mcp.json` in the a
 ```toml
 [agent]
 # Override args (command defaults from OPENAB_AGENT_COMMAND="cursor-agent acp")
-args = ["acp", "--model", "auto", "--workspace", "/home/agent"]
+args = ["--model", "auto", "--workspace", "{workspace}", "acp"]
 ```
 
-This anchors:
-- **MCP config lookup**: `/home/agent/.cursor/mcp.json`
-- **Approval file path**: `/home/agent/.cursor/projects/home-agent/mcp-approvals.json` (slug = URL-safe workspace path)
+OpenAB expands `{workspace}` to the effective per-session working directory as
+one argv value. This anchors each repo's MCP lookup and approval path without
+hard-coding every session to the same project.
 
 Without `--workspace`, a different cwd would produce a different slug and cursor-agent would not find previously saved approvals.
 

@@ -42,7 +42,7 @@ Set the session's working directory. The agent starts with this path as cwd, loa
 - Path must be absolute (`~` or `/` prefix)
 - `~` expands to bot home directory (`$HOME`)
 - Path must exist and be a directory
-- Path must be within bot home subtree (symlink escapes caught by canonicalization)
+- Path must be within the configured `workspace.root` (defaults to bot home for backward compatibility)
 - Invalid paths abort the session with a user-visible error
 
 ### `title` — Thread Title
@@ -61,6 +61,8 @@ Set the initial thread/channel title (max 100 characters, truncated silently).
 - Directives are **immutable** — once a session starts, parameters cannot be changed mid-conversation
 - To change workspace or title, start a new session
 - If no `[[ws:...]]` is specified, the session uses the bot's default working directory
+- If the parent platform channel has a `[workspace.channels.<platform>]` binding,
+  that binding becomes the default; an explicit `[[ws:...]]` overrides it
 - If workspace resolution fails on a new session, the session is not created. However, `[[title:...]]` is applied independently before workspace validation — the thread title may already be set even if the session aborts.
 
 ## Relationship to Output Directives
