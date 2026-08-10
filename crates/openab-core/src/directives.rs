@@ -86,6 +86,7 @@ pub fn resolve_workspace(
     raw_value: &str,
     aliases: &HashMap<String, String>,
     bot_home: &Path,
+    workspace_root: &Path,
 ) -> Result<PathBuf, String> {
     let path_str = if let Some(alias) = raw_value.strip_prefix('@') {
         match aliases.get(alias) {
@@ -122,11 +123,6 @@ pub fn resolve_workspace(
     };
 
     // Rule 3: canonicalize both paths
-    let canonical_home = bot_home.canonicalize().map_err(|e| {
-        warn!(path = %bot_home.display(), error = %e, "cannot canonicalize bot home");
-        "Internal error: cannot resolve bot home directory".to_string()
-    })?;
-
     let canonical_target = expanded.canonicalize().map_err(|e| {
         warn!(path = %expanded.display(), error = %e, "cannot canonicalize workspace path");
         format!(
@@ -135,8 +131,13 @@ pub fn resolve_workspace(
         )
     })?;
 
-    // Rule 4+5: verify within bot home subtree
-    if !canonical_target.starts_with(&canonical_home) {
+    let canonical_root = workspace_root.canonicalize().map_err(|e| {
+        warn!(path = %workspace_root.display(), error = %e, "cannot canonicalize workspace root");
+        "Internal error: cannot resolve workspace root directory".to_string()
+    })?;
+
+    // Rule 4+5: verify within the configured workspace root subtree
+    if !canonical_target.starts_with(&canonical_root) {
         return Err(format!(
             "Workspace path is outside allowed directory: `{path_str}`"
         ));
@@ -151,6 +152,42 @@ pub fn resolve_workspace(
     }
 
     Ok(canonical_target)
+}
+
+/// Resolve the configured workspace security root.
+///
+/// `~` is expanded relative to the bot's real home directory. The resulting
+/// path must already exist and be a directory so a typo cannot silently widen
+/// the workspace boundary at runtime.
+pub fn resolve_workspace_root(raw_value: &str, bot_home: &Path) -> Result<PathBuf, String> {
+    if !raw_value.starts_with('~') && !raw_value.starts_with('/') {
+        return Err(format!(
+            "Workspace root must be absolute (start with `~` or `/`): `{raw_value}`"
+        ));
+    }
+
+    let expanded = if let Some(rest) = raw_value.strip_prefix('~') {
+        bot_home.join(rest.strip_prefix('/').unwrap_or(rest))
+    } else {
+        PathBuf::from(raw_value)
+    };
+
+    let canonical = expanded.canonicalize().map_err(|e| {
+        warn!(path = %expanded.display(), error = %e, "cannot canonicalize workspace root");
+        format!(
+            "Workspace root does not exist: `{raw_value}` (expanded to `{}`)",
+            expanded.display()
+        )
+    })?;
+
+    if !canonical.is_dir() {
+        return Err(format!(
+            "Workspace root is not a directory: `{}`",
+            canonical.display()
+        ));
+    }
+
+    Ok(canonical)
 }
 
 #[cfg(test)]
@@ -228,7 +265,7 @@ mod tests {
             format!("{}/projects/openab", tmp.path().display()),
         );
 
-        let result = resolve_workspace("@openab", &aliases, tmp.path()).unwrap();
+        let result = resolve_workspace("@openab", &aliases, tmp.path(), tmp.path()).unwrap();
         assert_eq!(result, projects.canonicalize().unwrap());
     }
 
@@ -236,7 +273,7 @@ mod tests {
     fn resolve_alias_not_found() {
         let tmp = TempDir::new().unwrap();
         let aliases = HashMap::new();
-        let result = resolve_workspace("@nope", &aliases, tmp.path());
+        let result = resolve_workspace("@nope", &aliases, tmp.path(), tmp.path());
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("Unknown workspace alias"));
     }
@@ -245,7 +282,7 @@ mod tests {
     fn resolve_relative_path_rejected() {
         let tmp = TempDir::new().unwrap();
         let aliases = HashMap::new();
-        let result = resolve_workspace("relative/path", &aliases, tmp.path());
+        let result = resolve_workspace("relative/path", &aliases, tmp.path(), tmp.path());
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("must be absolute"));
     }
@@ -254,7 +291,7 @@ mod tests {
     fn resolve_outside_home_rejected() {
         let tmp = TempDir::new().unwrap();
         let aliases = HashMap::new();
-        let result = resolve_workspace("/tmp", &aliases, tmp.path());
+        let result = resolve_workspace("/tmp", &aliases, tmp.path(), tmp.path());
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("outside allowed directory"));
     }
@@ -266,15 +303,44 @@ mod tests {
         fs::create_dir_all(&projects).unwrap();
 
         let aliases = HashMap::new();
-        let result = resolve_workspace("~/myapp", &aliases, tmp.path()).unwrap();
+        let result = resolve_workspace("~/myapp", &aliases, tmp.path(), tmp.path()).unwrap();
         assert_eq!(result, projects.canonicalize().unwrap());
+    }
+
+    #[test]
+    fn resolve_workspace_enforces_narrower_root_than_home() {
+        let tmp = TempDir::new().unwrap();
+        let projects_root = tmp.path().join("projects");
+        let project = projects_root.join("openab");
+        let secret = tmp.path().join(".cursor");
+        fs::create_dir_all(&project).unwrap();
+        fs::create_dir_all(&secret).unwrap();
+
+        let aliases = HashMap::new();
+        let allowed =
+            resolve_workspace("~/projects/openab", &aliases, tmp.path(), &projects_root).unwrap();
+        assert_eq!(allowed, project.canonicalize().unwrap());
+
+        let rejected = resolve_workspace("~/.cursor", &aliases, tmp.path(), &projects_root);
+        assert!(rejected.is_err());
+        assert!(rejected.unwrap_err().contains("outside allowed directory"));
+    }
+
+    #[test]
+    fn resolves_workspace_root_relative_to_bot_home() {
+        let tmp = TempDir::new().unwrap();
+        let projects_root = tmp.path().join("projects");
+        fs::create_dir_all(&projects_root).unwrap();
+
+        let resolved = resolve_workspace_root("~/projects", tmp.path()).unwrap();
+        assert_eq!(resolved, projects_root.canonicalize().unwrap());
     }
 
     #[test]
     fn resolve_nonexistent_path() {
         let tmp = TempDir::new().unwrap();
         let aliases = HashMap::new();
-        let result = resolve_workspace("~/does_not_exist", &aliases, tmp.path());
+        let result = resolve_workspace("~/does_not_exist", &aliases, tmp.path(), tmp.path());
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("does not exist"));
     }
@@ -295,7 +361,12 @@ mod tests {
         fs::write(&file_path, "").unwrap();
 
         let aliases = HashMap::new();
-        let result = resolve_workspace(&format!("{}", file_path.display()), &aliases, tmp.path());
+        let result = resolve_workspace(
+            &format!("{}", file_path.display()),
+            &aliases,
+            tmp.path(),
+            tmp.path(),
+        );
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("not a directory"));
     }
@@ -304,7 +375,7 @@ mod tests {
     fn resolve_error_shows_expanded_path() {
         let tmp = TempDir::new().unwrap();
         let aliases = HashMap::new();
-        let result = resolve_workspace("~/no_such_dir", &aliases, tmp.path());
+        let result = resolve_workspace("~/no_such_dir", &aliases, tmp.path(), tmp.path());
         assert!(result.is_err());
         let err = result.unwrap_err();
         // Error should contain both the original and expanded path

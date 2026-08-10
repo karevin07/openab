@@ -1,5 +1,5 @@
 use crate::acp::protocol::{ConfigOption, UsageReport};
-use crate::acp::ContentBlock;
+use crate::acp::{ContentBlock, SessionSnapshot, SessionState};
 use crate::adapter::{AdapterRouter, ChannelRef, ChatAdapter, MessageRef, SenderContext};
 use crate::bot_turns::{BotTurnTracker, TurnAction, TurnSeverity, BOT_TURN_LIMIT_WARNING_PREFIX};
 use crate::config::{AllowBots, AllowUsers, SttConfig};
@@ -17,7 +17,9 @@ use serenity::builder::{
 };
 use serenity::http::Http;
 use serenity::model::application::ButtonStyle;
-use serenity::model::application::{Command, CommandOptionType, ComponentInteractionDataKind, Interaction};
+use serenity::model::application::{
+    Command, CommandOptionType, ComponentInteractionDataKind, Interaction,
+};
 use serenity::model::channel::{AutoArchiveDuration, Message, MessageType, Reaction, ReactionType};
 use serenity::model::gateway::Ready;
 use serenity::model::id::{ChannelId, MessageId, UserId};
@@ -44,6 +46,9 @@ const SELECT_MENU_PAGE_SIZE: usize = 25;
 /// exceeded the cap.)
 const SELECT_OPTION_TEXT_MAX: usize = 100;
 
+/// Keep workspace catalogs comfortably below Discord's 2000-character limit.
+const WORKSPACE_LIST_LIMIT: usize = 25;
+
 /// Truncate to at most `max` characters (not bytes — Discord counts
 /// characters, and slicing on a byte boundary would panic on multi-byte
 /// UTF-8). Appends '…' when truncated.
@@ -55,6 +60,133 @@ fn truncate_for_discord(s: &str, max: usize) -> String {
         out.push('…');
         out
     }
+}
+
+fn inline_code(value: &str) -> String {
+    format!("`{}`", value.replace('`', "'"))
+}
+
+fn workspace_display(value: &str, aliases: &std::collections::HashMap<String, String>) -> String {
+    if let Some(alias) = value.strip_prefix('@') {
+        return aliases.get(alias).map_or_else(
+            || inline_code(value),
+            |path| format!("{} ({})", inline_code(value), inline_code(path)),
+        );
+    }
+
+    aliases
+        .iter()
+        .find(|(_, path)| path.as_str() == value)
+        .map_or_else(
+            || inline_code(value),
+            |(alias, _)| {
+                format!(
+                    "{} ({})",
+                    inline_code(&format!("@{alias}")),
+                    inline_code(value)
+                )
+            },
+        )
+}
+
+fn format_workspace_status(
+    snapshot: &SessionSnapshot,
+    channel_default: Option<&str>,
+    aliases: &std::collections::HashMap<String, String>,
+) -> String {
+    let current = snapshot
+        .working_dir
+        .as_deref()
+        .map(|path| workspace_display(path, aliases))
+        .unwrap_or_else(|| "_No session workspace yet_".to_string());
+    let default = channel_default
+        .map(|spec| workspace_display(spec, aliases))
+        .unwrap_or_else(|| "_Not configured_".to_string());
+    let mut names: Vec<_> = aliases.keys().map(|name| format!("@{name}")).collect();
+    names.sort();
+    let available = if names.is_empty() {
+        "_None_".to_string()
+    } else {
+        names
+            .iter()
+            .take(10)
+            .map(|name| inline_code(name))
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+
+    truncate_for_discord(
+        &format!(
+            "📁 **Workspace status**\nCurrent session: {current}\nChannel default: {default}\nAvailable aliases: {available}"
+        ),
+        1900,
+    )
+}
+
+fn format_workspace_list(
+    aliases: &std::collections::HashMap<String, String>,
+    channel_default: Option<&str>,
+) -> String {
+    let mut entries: Vec<_> = aliases.iter().collect();
+    entries.sort_by_key(|(alias, _)| *alias);
+
+    let mut lines = vec!["📚 **Available workspaces**".to_string()];
+    if entries.is_empty() {
+        lines.push("_No workspace aliases configured._".to_string());
+    } else {
+        lines.extend(
+            entries
+                .iter()
+                .take(WORKSPACE_LIST_LIMIT)
+                .map(|(alias, path)| {
+                    format!(
+                        "• {} — {}",
+                        inline_code(&format!("@{alias}")),
+                        inline_code(path)
+                    )
+                }),
+        );
+        if entries.len() > WORKSPACE_LIST_LIMIT {
+            lines.push(format!(
+                "_…and {} more workspace(s)._",
+                entries.len() - WORKSPACE_LIST_LIMIT
+            ));
+        }
+    }
+    let default = channel_default
+        .map(|spec| workspace_display(spec, aliases))
+        .unwrap_or_else(|| "_Not configured_".to_string());
+    lines.push(format!("Channel default: {default}"));
+    truncate_for_discord(&lines.join("\n"), 1900)
+}
+
+fn format_session_status(
+    snapshot: &SessionSnapshot,
+    aliases: &std::collections::HashMap<String, String>,
+) -> String {
+    let state = match snapshot.state {
+        SessionState::Active => "Active",
+        SessionState::Suspended => "Suspended",
+        SessionState::Persisted => "Persisted (awaiting restore)",
+        SessionState::None => "No session",
+    };
+    let workspace = snapshot
+        .working_dir
+        .as_deref()
+        .map(|path| workspace_display(path, aliases))
+        .unwrap_or_else(|| "_Not assigned_".to_string());
+    format!("🧵 **Session status**\nState: **{state}**\nWorkspace: {workspace}")
+}
+
+fn session_command_channel_allowed(
+    channel_id: u64,
+    thread_parent_id: Option<u64>,
+    allowed_channels: &HashSet<u64>,
+    allow_all_channels: bool,
+) -> bool {
+    allow_all_channels
+        || allowed_channels.contains(&channel_id)
+        || thread_parent_id.is_some_and(|id| allowed_channels.contains(&id))
 }
 
 /// Avoid unbounded Discord history exports from very large threads.
@@ -265,6 +397,11 @@ pub struct Handler {
     pub reminder_store: ReminderStore,
     /// Track scheduled reminder IDs to prevent duplicate scheduling on reconnect.
     pub scheduled_ids: tokio::sync::Mutex<std::collections::HashSet<String>>,
+}
+
+struct DiscordCommandScope {
+    session_key: String,
+    channel_ref: ChannelRef,
 }
 
 impl Handler {
@@ -1399,6 +1536,30 @@ impl EventHandler for Handler {
             CreateCommand::new("cancel-all")
                 .description("Cancel current operation and drop all buffered messages"),
             CreateCommand::new("reset").description("Reset the conversation session"),
+            CreateCommand::new("workspace")
+                .description("Inspect workspace routing for this channel or session")
+                .add_option(CreateCommandOption::new(
+                    CommandOptionType::SubCommand,
+                    "status",
+                    "Show the current session workspace and channel default",
+                ))
+                .add_option(CreateCommandOption::new(
+                    CommandOptionType::SubCommand,
+                    "list",
+                    "List configured workspace aliases",
+                )),
+            CreateCommand::new("session")
+                .description("Inspect or close this conversation session")
+                .add_option(CreateCommandOption::new(
+                    CommandOptionType::SubCommand,
+                    "status",
+                    "Show session lifecycle state and workspace",
+                ))
+                .add_option(CreateCommandOption::new(
+                    CommandOptionType::SubCommand,
+                    "close",
+                    "Close this session and clear buffered messages",
+                )),
             CreateCommand::new("remind")
                 .description("Set a one-shot reminder to mention users/roles after a delay")
                 .add_option(CreateCommandOption::new(
@@ -1502,6 +1663,12 @@ impl EventHandler for Handler {
             Interaction::Command(cmd) if cmd.data.name == "reset" => {
                 self.handle_reset_command(&ctx, &cmd).await;
             }
+            Interaction::Command(cmd) if cmd.data.name == "workspace" => {
+                self.handle_workspace_command(&ctx, &cmd).await;
+            }
+            Interaction::Command(cmd) if cmd.data.name == "session" => {
+                self.handle_session_command(&ctx, &cmd).await;
+            }
             Interaction::Command(cmd) if cmd.data.name == "remind" => {
                 self.handle_remind_command(&ctx, &cmd).await;
             }
@@ -1528,6 +1695,172 @@ impl EventHandler for Handler {
 // --- Slash command & interaction handlers ---
 
 impl Handler {
+    async fn resolve_command_scope(
+        &self,
+        ctx: &Context,
+        cmd: &serenity::model::application::CommandInteraction,
+    ) -> Result<DiscordCommandScope, String> {
+        if cmd.user.bot {
+            return Err("🤖 Bots cannot use session management commands.".to_string());
+        }
+        if is_denied_user(
+            false,
+            self.allow_all_users,
+            &self.allowed_users,
+            cmd.user.id.get(),
+        ) {
+            return Err("🚫 You are not allowed to use this bot.".to_string());
+        }
+
+        let channel_id = cmd.channel_id;
+        let parent_id = match channel_id.to_channel(&ctx.http).await {
+            Ok(serenity::model::channel::Channel::Guild(channel)) => {
+                let parent_id = if channel.thread_metadata.is_some() {
+                    channel.parent_id.map(|id| id.get())
+                } else {
+                    None
+                };
+                let allowed = session_command_channel_allowed(
+                    channel_id.get(),
+                    parent_id,
+                    &self.allowed_channels,
+                    self.allow_all_channels,
+                );
+                if !allowed {
+                    return Err(
+                        "⚠️ Run this command inside an allowed Discord channel or thread."
+                            .to_string(),
+                    );
+                }
+                parent_id
+            }
+            Ok(serenity::model::channel::Channel::Private(_)) if self.allow_dm => None,
+            Ok(serenity::model::channel::Channel::Private(_)) => {
+                return Err("⚠️ Discord DMs are disabled for this bot.".to_string());
+            }
+            Ok(_) => {
+                return Err(
+                    "⚠️ Run this command inside an allowed Discord channel or thread."
+                        .to_string(),
+                );
+            }
+            Err(error) => {
+                warn!(%channel_id, %error, "failed to resolve slash command channel");
+                return Err("⚠️ Could not inspect this Discord channel. Try again.".to_string());
+            }
+        };
+
+        Ok(DiscordCommandScope {
+            session_key: format!("discord:{}", channel_id.get()),
+            channel_ref: ChannelRef {
+                platform: "discord".into(),
+                channel_id: channel_id.to_string(),
+                thread_id: None,
+                parent_id: parent_id.map(|id| id.to_string()),
+                origin_event_id: None,
+            },
+        })
+    }
+
+    async fn handle_workspace_command(
+        &self,
+        ctx: &Context,
+        cmd: &serenity::model::application::CommandInteraction,
+    ) {
+        let scope = match self.resolve_command_scope(ctx, cmd).await {
+            Ok(scope) => scope,
+            Err(message) => {
+                let response = CreateInteractionResponse::Message(
+                    CreateInteractionResponseMessage::new()
+                        .content(message)
+                        .ephemeral(true),
+                );
+                let _ = cmd.create_response(&ctx.http, response).await;
+                return;
+            }
+        };
+
+        let aliases = self.router.workspace_aliases();
+        let channel_default = self.router.channel_workspace_spec(&scope.channel_ref);
+        let subcommand = cmd
+            .data
+            .options
+            .first()
+            .map(|option| option.name.as_str())
+            .unwrap_or("status");
+        let content = match subcommand {
+            "list" => format_workspace_list(&aliases, channel_default.as_deref()),
+            _ => {
+                let snapshot = self.router.pool().session_snapshot(&scope.session_key).await;
+                format_workspace_status(&snapshot, channel_default.as_deref(), &aliases)
+            }
+        };
+
+        let response = CreateInteractionResponse::Message(
+            CreateInteractionResponseMessage::new()
+                .content(content)
+                .ephemeral(true),
+        );
+        if let Err(error) = cmd.create_response(&ctx.http, response).await {
+            tracing::error!(%error, "failed to respond to /workspace command");
+        }
+    }
+
+    async fn handle_session_command(
+        &self,
+        ctx: &Context,
+        cmd: &serenity::model::application::CommandInteraction,
+    ) {
+        let scope = match self.resolve_command_scope(ctx, cmd).await {
+            Ok(scope) => scope,
+            Err(message) => {
+                let response = CreateInteractionResponse::Message(
+                    CreateInteractionResponseMessage::new()
+                        .content(message)
+                        .ephemeral(true),
+                );
+                let _ = cmd.create_response(&ctx.http, response).await;
+                return;
+            }
+        };
+
+        let subcommand = cmd
+            .data
+            .options
+            .first()
+            .map(|option| option.name.as_str())
+            .unwrap_or("status");
+        let content = if subcommand == "close" {
+            let dropped = self
+                .dispatcher
+                .cancel_buffered_thread("discord", &cmd.channel_id.get().to_string());
+            match self.router.pool().reset_session(&scope.session_key).await {
+                Ok(()) if dropped > 0 => format!(
+                    "✅ Session closed and {dropped} buffered message(s) dropped. The next message starts a fresh session."
+                ),
+                Ok(()) => {
+                    "✅ Session closed. The next message starts a fresh session.".to_string()
+                }
+                Err(_) if dropped > 0 => format!(
+                    "🧹 Dropped {dropped} buffered message(s). No session state was open."
+                ),
+                Err(_) => "⚠️ No session state to close in this channel or thread.".to_string(),
+            }
+        } else {
+            let snapshot = self.router.pool().session_snapshot(&scope.session_key).await;
+            format_session_status(&snapshot, &self.router.workspace_aliases())
+        };
+
+        let response = CreateInteractionResponse::Message(
+            CreateInteractionResponseMessage::new()
+                .content(content)
+                .ephemeral(true),
+        );
+        if let Err(error) = cmd.create_response(&ctx.http, response).await {
+            tracing::error!(%error, "failed to respond to /session command");
+        }
+    }
+
     /// Build a Discord select menu from ACP configOptions with the given category.
     /// Paginates options in pages of 25 (Discord limit). The current selection is
     /// always placed first so it appears on page 0.
@@ -3302,6 +3635,70 @@ mod tests {
         let out = truncate_for_discord(&s, 100);
         assert_eq!(out.chars().count(), 100);
         assert!(out.ends_with('…'));
+    }
+
+    // --- Phase 2 workspace/session command formatting and scope ---
+
+    #[test]
+    fn session_commands_allow_configured_channel_or_thread_parent() {
+        let allowed = HashSet::from([42]);
+        assert!(session_command_channel_allowed(42, None, &allowed, false));
+        assert!(session_command_channel_allowed(
+            100,
+            Some(42),
+            &allowed,
+            false
+        ));
+        assert!(!session_command_channel_allowed(
+            100,
+            Some(99),
+            &allowed,
+            false
+        ));
+        assert!(session_command_channel_allowed(100, None, &allowed, true));
+    }
+
+    #[test]
+    fn workspace_status_shows_session_channel_default_and_aliases() {
+        let aliases = HashMap::from([
+            ("web".to_string(), "/projects/web".to_string()),
+            ("api".to_string(), "/projects/api".to_string()),
+        ]);
+        let snapshot = SessionSnapshot {
+            state: SessionState::Active,
+            working_dir: Some("/projects/api".to_string()),
+        };
+
+        let output = format_workspace_status(&snapshot, Some("@web"), &aliases);
+        assert!(output.contains("`@api` (`/projects/api`)"));
+        assert!(output.contains("`@web` (`/projects/web`)"));
+        assert!(output.contains("`@api`, `@web`"));
+    }
+
+    #[test]
+    fn workspace_list_is_sorted_and_marks_channel_default() {
+        let aliases = HashMap::from([
+            ("web".to_string(), "/projects/web".to_string()),
+            ("api".to_string(), "/projects/api".to_string()),
+        ]);
+
+        let output = format_workspace_list(&aliases, Some("@web"));
+        assert!(output.find("`@api`").unwrap() < output.find("`@web`").unwrap());
+        assert!(output.contains("Channel default: `@web` (`/projects/web`)"));
+    }
+
+    #[test]
+    fn session_status_reports_lifecycle_and_workspace_alias() {
+        let aliases = HashMap::from([("api".to_string(), "/projects/api".to_string())]);
+        let snapshot = SessionSnapshot {
+            state: SessionState::Suspended,
+            working_dir: Some("/projects/api".to_string()),
+        };
+
+        assert_eq!(
+            format_session_status(&snapshot, &aliases),
+            "🧵 **Session status**\nState: **Suspended**\nWorkspace: `@api` (`/projects/api`)"
+        );
     }
 
     // --- format_usage_report tests (/usage slash command) ---

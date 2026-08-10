@@ -68,6 +68,22 @@ pub struct SessionPool {
 }
 
 type CancelHandle = (Arc<tokio::sync::Mutex<tokio::process::ChildStdin>>, String);
+
+/// User-facing lifecycle state for a thread session.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SessionState {
+    Active,
+    Suspended,
+    Persisted,
+    None,
+}
+
+/// Read-only session metadata used by platform status commands.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionSnapshot {
+    pub state: SessionState,
+    pub working_dir: Option<String>,
+}
 type ActiveSnapshot = Vec<(String, Arc<Mutex<AcpConnection>>)>;
 type EvictionCandidate = (String, Arc<Mutex<AcpConnection>>, Instant, Option<String>);
 
@@ -90,6 +106,22 @@ fn get_or_insert_gate(map: &mut HashMap<String, Arc<Mutex<()>>>, key: &str) -> A
     map.entry(key.to_string())
         .or_insert_with(|| Arc::new(Mutex::new(())))
         .clone()
+}
+
+fn session_state(state: &PoolState, key: &str) -> SessionState {
+    if state.active.contains_key(key) {
+        SessionState::Active
+    } else if state.suspended.contains_key(key) {
+        SessionState::Suspended
+    } else if state.persisted.contains_key(key) {
+        SessionState::Persisted
+    } else {
+        SessionState::None
+    }
+}
+
+fn has_session_state(state: &PoolState, key: &str) -> bool {
+    session_state(state, key) != SessionState::None || state.session_workdirs.contains_key(key)
 }
 
 /// Returns true when a session should be treated as stale during idle cleanup.
@@ -391,6 +423,20 @@ impl SessionPool {
             }
         }
         false
+    }
+
+    /// Return a read-only lifecycle/workspace snapshot for platform UX.
+    pub async fn session_snapshot(&self, thread_id: &str) -> SessionSnapshot {
+        let state = self.state.read().await;
+        let lifecycle = session_state(&state, thread_id);
+        let working_dir =
+            state.session_workdirs.get(thread_id).cloned().or_else(|| {
+                (lifecycle != SessionState::None).then(|| self.config.working_dir.clone())
+            });
+        SessionSnapshot {
+            state: lifecycle,
+            working_dir,
+        }
     }
 
     pub async fn get_or_create(
@@ -836,7 +882,8 @@ impl SessionPool {
         }
 
         let mut state = self.state.write().await;
-        let had_active = state.active.remove(thread_id).is_some();
+        let had_state = has_session_state(&state, thread_id);
+        state.active.remove(thread_id);
         // Everything else a reset clears is exactly what hung eviction clears, including the rule
         // that the creating gate survives. Call the one implementation rather than keeping a second
         // copy of the list: the copies are what let the two drift, and the gate rule is precisely
@@ -848,7 +895,7 @@ impl SessionPool {
         revoke_facade_token_for_key(&mut state, thread_id, self.session_registrar.as_ref());
         self.save_mapping(&state.persisted);
         self.save_meta(&state.session_workdirs);
-        if had_active {
+        if had_state {
             info!(thread_id = %crate::redact::redact_session_ids(thread_id), "session reset");
             Ok(())
         } else {
@@ -1021,8 +1068,8 @@ impl SessionPool {
 #[cfg(test)]
 mod tests {
     use super::{
-        better_candidate, classify_hung, classify_idle, get_or_insert_gate, purge_session_entries,
-        remove_if_same_handle, PoolState,
+        better_candidate, classify_hung, classify_idle, get_or_insert_gate, has_session_state,
+        purge_session_entries, remove_if_same_handle, session_state, PoolState, SessionState,
     };
     use crate::acp::connection::SessionActivity;
     use std::collections::HashMap;
@@ -1057,11 +1104,11 @@ mod tests {
     }
 
     /// Build an empty `PoolState` for a helper-level test.
-    #[cfg(feature = "acp-mcp")]
     fn empty_pool_state() -> super::PoolState {
         super::PoolState {
             active: HashMap::new(),
             cancel_handles: HashMap::new(),
+            #[cfg(feature = "acp-mcp")]
             facade_tokens: HashMap::new(),
             activity: HashMap::new(),
             pgids: HashMap::new(),
@@ -1070,6 +1117,35 @@ mod tests {
             creating: HashMap::new(),
             session_workdirs: HashMap::new(),
         }
+    }
+
+    #[test]
+    fn session_state_reports_suspended_persisted_and_none() {
+        let mut state = empty_pool_state();
+        state
+            .persisted
+            .insert("persisted".into(), "session-p".into());
+        state
+            .suspended
+            .insert("suspended".into(), "session-s".into());
+        state
+            .persisted
+            .insert("suspended".into(), "session-s".into());
+
+        assert_eq!(session_state(&state, "suspended"), SessionState::Suspended);
+        assert_eq!(session_state(&state, "persisted"), SessionState::Persisted);
+        assert_eq!(session_state(&state, "missing"), SessionState::None);
+    }
+
+    #[test]
+    fn workspace_metadata_counts_as_closable_session_state() {
+        let mut state = empty_pool_state();
+        state
+            .session_workdirs
+            .insert("metadata-only".into(), "/tmp/repo".into());
+
+        assert!(has_session_state(&state, "metadata-only"));
+        assert!(!has_session_state(&state, "missing"));
     }
 
     /// F3: replacing a hung predecessor's token revokes the predecessor's EXACT token and leaves

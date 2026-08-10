@@ -83,6 +83,15 @@ fn expand_env(val: &str) -> String {
         val.to_string()
     }
 }
+
+/// Expand per-session placeholders without invoking a shell. Each configured
+/// argument remains exactly one argv entry, so workspace paths containing
+/// spaces cannot alter command structure.
+fn expand_agent_args(args: &[String], working_dir: &str) -> Vec<String> {
+    args.iter()
+        .map(|arg| arg.replace("{workspace}", working_dir))
+        .collect()
+}
 use tokio::time::Instant;
 
 /// A content block for the ACP prompt — either text or image.
@@ -340,10 +349,11 @@ impl AcpConnection {
         env: &std::collections::HashMap<String, String>,
         inherit_env: &[String],
     ) -> Result<Self> {
-        info!(cmd = command, ?args, cwd = working_dir, "spawning agent");
+        let resolved_args = expand_agent_args(args, working_dir);
+        info!(cmd = command, args = ?resolved_args, cwd = working_dir, "spawning agent");
 
         let mut cmd = tokio::process::Command::new(command);
-        cmd.args(args)
+        cmd.args(&resolved_args)
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
@@ -852,7 +862,7 @@ impl Drop for AcpConnection {
 
 #[cfg(test)]
 mod tests {
-    use super::{build_agent_env, build_permission_response, pick_best_option};
+    use super::{build_agent_env, build_permission_response, expand_agent_args, pick_best_option};
     use serde_json::json;
 
     #[test]
@@ -984,6 +994,32 @@ mod tests {
 
         assert!(!result.contains_key("OAB_TEST_NONEXISTENT_VAR_12345"));
         assert!(inherited.is_empty());
+    }
+
+    #[test]
+    fn expands_workspace_placeholder_per_argument() {
+        let args = vec![
+            "--workspace".to_string(),
+            "{workspace}".to_string(),
+            "--label=repo:{workspace}".to_string(),
+            "acp".to_string(),
+        ];
+
+        assert_eq!(
+            expand_agent_args(&args, "/home/agent/projects/my repo"),
+            vec![
+                "--workspace",
+                "/home/agent/projects/my repo",
+                "--label=repo:/home/agent/projects/my repo",
+                "acp",
+            ]
+        );
+    }
+
+    #[test]
+    fn leaves_agent_args_without_placeholder_unchanged() {
+        let args = vec!["--model".to_string(), "auto".to_string(), "acp".to_string()];
+        assert_eq!(expand_agent_args(&args, "/tmp/project"), args);
     }
 }
 

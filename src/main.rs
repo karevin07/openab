@@ -15,7 +15,7 @@ mod acp_tunnel;
 #[cfg(feature = "acp")]
 mod acp_tunnel_source;
 use openab_core::acp;
-use openab_core::adapter::{self, AdapterRouter};
+use openab_core::adapter::{self, AdapterRouter, WorkspaceRouting};
 use openab_core::bot_turns;
 use openab_core::config;
 use openab_core::cron;
@@ -855,6 +855,25 @@ async fn main() -> anyhow::Result<()> {
         reg
     };
 
+    let bot_home = std::path::PathBuf::from(std::env::var("HOME").unwrap_or_else(|_| {
+        tracing::warn!(
+            "HOME environment variable is not set — falling back to /tmp as bot_home. \
+             Configure workspace.root to retain a narrow workspace security boundary."
+        );
+        "/tmp".into()
+    }));
+    let workspace_root = match cfg.workspace.root.as_deref() {
+        Some(root) => openab_core::directives::resolve_workspace_root(root, &bot_home)
+            .map_err(anyhow::Error::msg)?,
+        None => bot_home.canonicalize().map_err(|e| {
+            anyhow::anyhow!(
+                "cannot canonicalize default workspace root {}: {e}",
+                bot_home.display()
+            )
+        })?,
+    };
+    info!(root = %workspace_root.display(), "workspace security root resolved");
+
     let router = Arc::new(
         AdapterRouter::new(
             pool.clone(),
@@ -862,14 +881,12 @@ async fn main() -> anyhow::Result<()> {
             cfg.markdown.tables,
             cfg.pool.prompt_hard_timeout_secs,
             cfg.pool.liveness_check_secs,
-            cfg.workspace.aliases,
-            std::path::PathBuf::from(std::env::var("HOME").unwrap_or_else(|_| {
-                tracing::warn!(
-                    "HOME environment variable is not set — falling back to /tmp as bot_home. \
-                     This weakens the workspace security boundary."
-                );
-                "/tmp".into()
-            })),
+            WorkspaceRouting {
+                aliases: cfg.workspace.aliases,
+                channels: cfg.workspace.channels,
+                bot_home,
+                root: workspace_root,
+            },
         )
         .with_trust(gateway_trust),
     );

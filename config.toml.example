@@ -244,8 +244,8 @@ working_dir = "/home/agent"
 
 # [agent]
 # command = "cursor-agent"
-# args = ["acp", "--model", "auto", "--workspace", "/home/agent"]
-# working_dir = "/home/agent"
+# args = ["--model", "auto", "--workspace", "{workspace}", "acp"]
+# working_dir = "/home/agent/projects/openab"
 # env = {}  # Auth via: kubectl exec -it <pod> -- cursor-agent login
 
 # [agent]
@@ -350,14 +350,25 @@ error_hold_ms = 2500
 # channel = "123456789"
 # message = "generate weekly status report"
 
-# Workspace aliases for control directives: [[ws:@alias]]
-# Users can specify a workspace when starting a session, e.g.:
+# Workspace root, aliases, and optional platform-channel bindings.
+# `root` is the security boundary for every session workspace. When omitted,
+# it defaults to $HOME for backward compatibility.
+#
+# [workspace]
+# root = "~/projects"
+#
+# Users can specify an alias with [[ws:@alias]] when starting a session, e.g.:
 #   @Bot [[ws:@openab]] help me debug the tests
 #
 # [workspace.aliases]
 # openab = "~/projects/openab"
 # infra  = "~/projects/infra-cdk"
 # web    = "~/projects/frontend"
+#
+# Bind a Discord parent channel to a default workspace. New threads created
+# from this channel automatically start in the selected repo.
+# [workspace.channels.discord]
+# "123456789012345678" = "@openab"
 
 # --- Pre-seed: download & extract S3 zip archives before pre_boot ---
 # Seeds the agent environment (configs, tools, memory) before any hook runs.

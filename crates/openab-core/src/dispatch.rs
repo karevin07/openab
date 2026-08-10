@@ -127,8 +127,14 @@ pub trait DispatchTarget: Send + Sync + 'static {
     /// Workspace aliases from config (for `[[ws:@alias]]` resolution).
     fn workspace_aliases(&self) -> std::collections::HashMap<String, String>;
 
-    /// Bot home directory (security boundary for workspace resolution).
+    /// Bot home directory used for `~` expansion.
     fn bot_home(&self) -> std::path::PathBuf;
+
+    /// Canonical security boundary for all workspace resolution.
+    fn workspace_root(&self) -> std::path::PathBuf;
+
+    /// Workspace spec bound to this platform channel, if configured.
+    fn channel_workspace_spec(&self, channel: &ChannelRef) -> Option<String>;
 
     /// Ensure the ACP session for `session_key` exists (idempotent).
     /// Returns `true` if a new session was created, `false` if it already existed.
@@ -163,6 +169,14 @@ impl DispatchTarget for AdapterRouter {
 
     fn bot_home(&self) -> std::path::PathBuf {
         self.bot_home_path()
+    }
+
+    fn workspace_root(&self) -> std::path::PathBuf {
+        self.workspace_root_path()
+    }
+
+    fn channel_workspace_spec(&self, channel: &ChannelRef) -> Option<String> {
+        AdapterRouter::channel_workspace_spec(self, channel)
     }
 
     async fn ensure_session(&self, session_key: &str, working_dir: Option<&str>) -> Result<bool> {
@@ -668,7 +682,7 @@ async fn dispatch_batch(
     //
     // Strategy:
     //   1. Parse directives (cheap text extraction — no mutation, no I/O)
-    //   2. Attempt workspace resolution if [[ws:...]] present (may fail gracefully)
+    //   2. Resolve explicit [[ws:...]], otherwise the platform-channel binding
     //   3. Call ensure_session with resolved workspace — returns created_now
     //   4. Only strip prompt and apply title/workspace if created_now == true
     //   5. If created_now == false, the [[...]] text is preserved verbatim
@@ -677,15 +691,23 @@ async fn dispatch_batch(
         .first()
         .map(|first_msg| crate::directives::parse_directives(&first_msg.prompt));
 
-    // Tentatively resolve [[ws:...]] — if resolution fails and the session turns out to
-    // be new, we abort. If the session already existed, resolution failure is irrelevant.
-    let ws_resolved: Option<Result<String, String>> = parse_result.as_ref().and_then(|pr| {
-        pr.metadata.raw.get("ws").map(|ws_value| {
-            let aliases = target.workspace_aliases();
-            let bot_home = target.bot_home();
-            crate::directives::resolve_workspace(ws_value, &aliases, &bot_home)
-                .map(|p| p.display().to_string())
-        })
+    // An explicit directive overrides the channel default. Discord threads use
+    // their parent channel binding through `channel_workspace_spec`.
+    let directive_workspace = parse_result
+        .as_ref()
+        .and_then(|pr| pr.metadata.raw.get("ws").cloned());
+    let workspace_spec =
+        directive_workspace.or_else(|| target.channel_workspace_spec(thread_channel));
+
+    // Tentatively resolve the workspace — if resolution fails and the session
+    // turns out to be new, we abort. Existing sessions keep their immutable
+    // persisted workspace, so a later config error cannot move them.
+    let ws_resolved: Option<Result<String, String>> = workspace_spec.map(|ws_value| {
+        let aliases = target.workspace_aliases();
+        let bot_home = target.bot_home();
+        let workspace_root = target.workspace_root();
+        crate::directives::resolve_workspace(&ws_value, &aliases, &bot_home, &workspace_root)
+            .map(|p| p.display().to_string())
     });
 
     // Extract workspace path for ensure_session (None if no directive or resolution failed).
@@ -709,42 +731,42 @@ async fn dispatch_batch(
         }
     };
 
-    // Only apply directives if this is genuinely the first message (fresh session).
+    // Only apply directives/bindings if this is genuinely the first message.
     if created_now {
+        let title_to_apply = parse_result
+            .as_ref()
+            .and_then(|pr| pr.metadata.title.clone());
+
+        // If workspace resolution failed on a NEW session, rollback and abort.
+        // Reset FIRST to minimize the TOCTOU window, then rename.
+        if let Some(Err(e)) = &ws_resolved {
+            target.reset_session(&session_key).await;
+            if let Some(ref title) = title_to_apply {
+                if !title.is_empty() {
+                    let _ = adapter.rename_thread(&dispatch_channel, title).await;
+                }
+            }
+            let _ = adapter
+                .send_message(&dispatch_channel, &format!("⚠️ {e}"))
+                .await;
+            error!(session_key, error = %e, "workspace selection rejected");
+            return;
+        }
+
         if let Some(pr) = parse_result {
             if !pr.metadata.raw.is_empty() {
-                // Apply [[title:...]] independently — works regardless of ws outcome.
-                let title_to_apply = pr.metadata.title.clone();
-
-                // If workspace resolution failed on a NEW session, rollback and abort.
-                // Reset FIRST to minimize TOCTOU window (擺渡 F1), then rename.
-                if let Some(Err(e)) = ws_resolved {
-                    target.reset_session(&session_key).await;
-                    // Apply title after reset so the thread is identifiable.
-                    if let Some(ref title) = title_to_apply {
-                        if !title.is_empty() {
-                            let _ = adapter.rename_thread(&dispatch_channel, title).await;
-                        }
-                    }
-                    let _ = adapter
-                        .send_message(&dispatch_channel, &format!("⚠️ {e}"))
-                        .await;
-                    error!(session_key, error = %e, "workspace directive rejected");
-                    return;
-                }
-
                 // Strip directives from the prompt
                 if let Some(first_msg) = batch.first_mut() {
                     first_msg.prompt = pr.prompt;
                 }
+            }
+        }
 
-                // Apply title on success path.
-                if let Some(ref title) = title_to_apply {
-                    if !title.is_empty() {
-                        if let Err(e) = adapter.rename_thread(&dispatch_channel, title).await {
-                            warn!(session_key, error = %e, "failed to apply title directive");
-                        }
-                    }
+        // Apply title on success path.
+        if let Some(ref title) = title_to_apply {
+            if !title.is_empty() {
+                if let Err(e) = adapter.rename_thread(&dispatch_channel, title).await {
+                    warn!(session_key, error = %e, "failed to apply title directive");
                 }
             }
         }
@@ -1210,8 +1232,12 @@ mod tests {
             crate::markdown::TableMode::Off,
             crate::config::default_prompt_hard_timeout_secs(),
             crate::config::default_liveness_check_secs(),
-            std::collections::HashMap::new(),
-            std::path::PathBuf::from("/tmp"),
+            crate::adapter::WorkspaceRouting {
+                aliases: std::collections::HashMap::new(),
+                channels: std::collections::HashMap::new(),
+                bot_home: std::path::PathBuf::from("/tmp"),
+                root: std::path::PathBuf::from("/tmp"),
+            },
         ));
         Dispatcher::with_idle_timeout(router, 10, 24_000, grouping, DEFAULT_CONSUMER_IDLE_TIMEOUT)
     }
@@ -1375,6 +1401,11 @@ mod tests {
     struct MockDispatchTarget {
         reactions: ReactionsConfig,
         calls: Mutex<Vec<RecordedDispatch>>,
+        aliases: std::collections::HashMap<String, String>,
+        bot_home: std::path::PathBuf,
+        workspace_root: std::path::PathBuf,
+        channel_workspace: Option<String>,
+        ensured_workdirs: Mutex<Vec<Option<String>>>,
         /// If set, `ensure_session` returns this error once.
         ensure_err: Mutex<Option<String>>,
         /// If set, `stream_prompt_blocks` returns this error once.
@@ -1386,6 +1417,11 @@ mod tests {
             Self {
                 reactions: ReactionsConfig::default(),
                 calls: Mutex::new(Vec::new()),
+                aliases: std::collections::HashMap::new(),
+                bot_home: std::path::PathBuf::from("/tmp"),
+                workspace_root: std::path::PathBuf::from("/tmp"),
+                channel_workspace: None,
+                ensured_workdirs: Mutex::new(Vec::new()),
                 ensure_err: Mutex::new(None),
                 stream_err: Mutex::new(None),
             }
@@ -1403,18 +1439,30 @@ mod tests {
         }
 
         fn workspace_aliases(&self) -> std::collections::HashMap<String, String> {
-            std::collections::HashMap::new()
+            self.aliases.clone()
         }
 
         fn bot_home(&self) -> std::path::PathBuf {
-            std::path::PathBuf::from("/tmp")
+            self.bot_home.clone()
+        }
+
+        fn workspace_root(&self) -> std::path::PathBuf {
+            self.workspace_root.clone()
+        }
+
+        fn channel_workspace_spec(&self, _channel: &ChannelRef) -> Option<String> {
+            self.channel_workspace.clone()
         }
 
         async fn ensure_session(
             &self,
             _session_key: &str,
-            _working_dir: Option<&str>,
+            working_dir: Option<&str>,
         ) -> Result<bool> {
+            self.ensured_workdirs
+                .lock()
+                .unwrap()
+                .push(working_dir.map(str::to_string));
             if let Some(msg) = self.ensure_err.lock().unwrap().take() {
                 return Err(anyhow::anyhow!(msg));
             }
@@ -1552,6 +1600,48 @@ mod tests {
         // pack_arrival_event with no extra_blocks → delimiter + prompt = 2 blocks.
         assert_eq!(calls[0].block_count, 2);
         assert!(!calls[0].other_bot_present);
+    }
+
+    #[tokio::test]
+    async fn channel_binding_selects_workspace_for_new_session() {
+        let tmp = tempfile::tempdir().unwrap();
+        let projects_root = tmp.path().join("projects");
+        let project = projects_root.join("openab");
+        std::fs::create_dir_all(&project).unwrap();
+
+        let mut aliases = std::collections::HashMap::new();
+        aliases.insert("openab".to_string(), project.display().to_string());
+        let mock = Arc::new(MockDispatchTarget {
+            aliases,
+            bot_home: tmp.path().to_path_buf(),
+            workspace_root: projects_root,
+            channel_workspace: Some("@openab".to_string()),
+            ..MockDispatchTarget::new()
+        });
+        let target: Arc<dyn DispatchTarget> = mock.clone();
+        let adapter: Arc<dyn ChatAdapter> = Arc::new(MockChatAdapter);
+        let channel = ChannelRef {
+            platform: "discord".into(),
+            channel_id: "thread-1".into(),
+            thread_id: None,
+            parent_id: Some("project-channel".into()),
+            origin_event_id: None,
+        };
+
+        dispatch_batch(
+            "discord:thread-1",
+            &channel,
+            &target,
+            &adapter,
+            vec![make_msg("fix the tests", 10)],
+            false,
+        )
+        .await;
+
+        assert_eq!(
+            mock.ensured_workdirs.lock().unwrap().as_slice(),
+            &[Some(project.canonicalize().unwrap().display().to_string())]
+        );
     }
 
     #[tokio::test]

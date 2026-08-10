@@ -447,6 +447,17 @@ pub trait ChatAdapter: Send + Sync + 'static {
 
 // --- AdapterRouter ---
 
+/// Workspace routing inputs resolved at startup and shared by every adapter.
+pub struct WorkspaceRouting {
+    pub aliases: std::collections::HashMap<String, String>,
+    pub channels: std::collections::HashMap<
+        String,
+        std::collections::HashMap<String, String>,
+    >,
+    pub bot_home: std::path::PathBuf,
+    pub root: std::path::PathBuf,
+}
+
 /// Shared logic for routing messages to ACP agents, managing sessions,
 /// streaming edits, and controlling reactions. Platform-independent.
 pub struct AdapterRouter {
@@ -458,12 +469,21 @@ pub struct AdapterRouter {
     liveness_check_interval: std::time::Duration,
     /// Workspace aliases from `[workspace.aliases]` config.
     workspace_aliases: std::collections::HashMap<String, String>,
-    /// Bot home directory (security boundary for workspace directives).
+    /// Per-platform channel-to-workspace bindings from `[workspace.channels.*]`.
+    workspace_channels:
+        std::collections::HashMap<String, std::collections::HashMap<String, String>>,
+    /// Bot home directory used for `~` expansion.
     bot_home: std::path::PathBuf,
+    /// Canonical security boundary for workspace paths.
+    workspace_root: std::path::PathBuf,
     /// Per-platform trust gate (L2 scope + L3 identity). Populated via
     /// [`AdapterRouter::with_trust`]; empty default = deny-all per platform
     /// (only consulted by paths wired to the gate — currently the gateway path).
     trust: crate::trust::PlatformTrustConfigs,
+}
+
+fn workspace_binding_channel_id(channel: &ChannelRef) -> &str {
+    channel.parent_id.as_deref().unwrap_or(&channel.channel_id)
 }
 
 impl AdapterRouter {
@@ -473,8 +493,7 @@ impl AdapterRouter {
         table_mode: TableMode,
         prompt_hard_timeout_secs: u64,
         liveness_check_secs: u64,
-        workspace_aliases: std::collections::HashMap<String, String>,
-        bot_home: std::path::PathBuf,
+        workspace: WorkspaceRouting,
     ) -> Self {
         if liveness_check_secs >= prompt_hard_timeout_secs {
             warn!(
@@ -491,8 +510,10 @@ impl AdapterRouter {
             table_mode,
             prompt_hard_timeout: std::time::Duration::from_secs(prompt_hard_timeout_secs),
             liveness_check_interval: std::time::Duration::from_secs(liveness_check_secs),
-            workspace_aliases,
-            bot_home,
+            workspace_aliases: workspace.aliases,
+            workspace_channels: workspace.channels,
+            bot_home: workspace.bot_home,
+            workspace_root: workspace.root,
             trust: crate::trust::PlatformTrustConfigs::default(),
         }
     }
@@ -537,6 +558,21 @@ impl AdapterRouter {
     /// Bot home path for workspace security boundary.
     pub fn bot_home_path(&self) -> std::path::PathBuf {
         self.bot_home.clone()
+    }
+
+    /// Canonical root all session workspaces must remain within.
+    pub fn workspace_root_path(&self) -> std::path::PathBuf {
+        self.workspace_root.clone()
+    }
+
+    /// Resolve the workspace spec bound to a routed channel. Discord threads
+    /// inherit the binding of their parent text channel.
+    pub fn channel_workspace_spec(&self, channel: &ChannelRef) -> Option<String> {
+        let binding_id = workspace_binding_channel_id(channel);
+        self.workspace_channels
+            .get(&channel.platform)
+            .and_then(|channels| channels.get(binding_id))
+            .cloned()
     }
 
     /// Pack one arrival event into ContentBlocks. Per-arrival layout:
@@ -1733,6 +1769,30 @@ fn propagate_mentions_to_chunks(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn discord_thread_workspace_binding_uses_parent_channel() {
+        let channel = ChannelRef {
+            platform: "discord".into(),
+            channel_id: "thread-42".into(),
+            thread_id: None,
+            parent_id: Some("project-channel".into()),
+            origin_event_id: None,
+        };
+        assert_eq!(workspace_binding_channel_id(&channel), "project-channel");
+    }
+
+    #[test]
+    fn non_thread_workspace_binding_uses_routing_channel() {
+        let channel = ChannelRef {
+            platform: "discord".into(),
+            channel_id: "project-channel".into(),
+            thread_id: None,
+            parent_id: None,
+            origin_event_id: None,
+        };
+        assert_eq!(workspace_binding_channel_id(&channel), "project-channel");
+    }
 
     #[test]
     fn acp_reply_limit_is_unbounded_others_use_adapter_limit() {

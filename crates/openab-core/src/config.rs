@@ -275,10 +275,19 @@ pub struct Config {
 
 #[derive(Debug, Clone, Default, Deserialize)]
 pub struct WorkspaceConfig {
+    /// Security boundary for all session workspaces. Defaults to `$HOME` for
+    /// backward compatibility; production deployments should set this to a
+    /// directory containing only agent-editable projects.
+    pub root: Option<String>,
     /// Workspace aliases: `name = "~/path/to/project"`
     /// Used with `[[ws:@alias]]` control directives.
     #[serde(default)]
     pub aliases: std::collections::HashMap<String, String>,
+    /// Per-platform channel bindings: platform -> channel ID -> workspace
+    /// spec (`@alias` or an absolute path). Discord thread routing resolves
+    /// against the parent channel ID.
+    #[serde(default)]
+    pub channels: std::collections::HashMap<String, std::collections::HashMap<String, String>>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -2482,6 +2491,38 @@ fn default_ambient_context_flushes() -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn workspace_root_aliases_and_channel_bindings_parse() {
+        let cfg = parse_config_str(
+            r#"
+[workspace]
+root = "~/projects"
+
+[workspace.aliases]
+openab = "~/projects/openab"
+
+[workspace.channels.discord]
+"123456789" = "@openab"
+"#,
+            "test",
+        )
+        .expect("workspace routing config should parse");
+
+        assert_eq!(cfg.workspace.root.as_deref(), Some("~/projects"));
+        assert_eq!(
+            cfg.workspace.aliases.get("openab").map(String::as_str),
+            Some("~/projects/openab")
+        );
+        assert_eq!(
+            cfg.workspace
+                .channels
+                .get("discord")
+                .and_then(|bindings| bindings.get("123456789"))
+                .map(String::as_str),
+            Some("@openab")
+        );
+    }
 
     #[test]
     fn mcp_facade_absent_by_default() {
