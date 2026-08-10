@@ -642,6 +642,8 @@ Workspace security boundary, aliases for [Control Directives](adr/control-direct
 ```toml
 [workspace]
 root = "~/projects"
+discover_repositories = true
+discovery_excludes = ["private-deployment"]
 
 [workspace.aliases]
 openab = "~/projects/openab"
@@ -655,6 +657,8 @@ web    = "~/projects/frontend"
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
 | `root` | string | `$HOME` | Security boundary for every workspace. Set this to a directory containing only agent-editable projects. Must exist and be absolute (`~` is supported). |
+| `discover_repositories` | bool | `false` | When enabled, direct child directories containing a `.git` directory or gitfile are added as aliases using their directory names. |
+| `discovery_excludes` | string[] | `[]` | Direct child directory names omitted from automatic discovery. Explicit aliases are not removed. |
 | `aliases` | map | `{}` | Key-value map of alias name → path. Users reference with `@` prefix: `[[ws:@openab]]`. |
 | `channels` | nested map | `{}` | Platform → channel ID → workspace spec. For Discord threads, the parent channel ID is used. Values may be `@alias` or absolute paths. |
 
@@ -664,6 +668,8 @@ web    = "~/projects/frontend"
 - Paths are canonicalized and must be within `workspace.root`
 - Symlink escapes are caught by canonicalization
 - Target must be an existing directory (not a file)
+- Discovery is one level deep and ignores hidden directories
+- Explicit aliases override automatically discovered aliases with the same name
 
 ---
 

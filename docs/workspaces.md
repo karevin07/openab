@@ -17,6 +17,8 @@ Define a narrow security root, aliases, and optional channel bindings in `config
 ```toml
 [workspace]
 root = "~/projects"
+discover_repositories = true
+discovery_excludes = ["private-deployment"]
 
 [workspace.aliases]
 openab = "~/projects/openab"
@@ -29,6 +31,12 @@ web    = "~/projects/frontend"
 ```
 
 Paths starting with `~` expand to the bot's home directory (`$HOME`).
+
+With `discover_repositories = true`, every direct child containing `.git`
+becomes an alias automatically. For example, `~/projects/frontend/.git`
+creates `@frontend`. Hidden directories, excluded names, nested repositories,
+and symlinks resolving outside `workspace.root` are ignored. Explicit entries
+under `[workspace.aliases]` take precedence over discovered aliases.
 
 For Discord, bindings use the parent text channel ID. A message in a bound
 channel creates a thread whose ACP session starts in that workspace; later
@@ -59,6 +67,10 @@ All workspace paths are validated before use:
 4. **Must be within `workspace.root`** — paths outside are rejected
 5. **Must be a directory** — file paths are rejected
 6. **Must exist** — non-existent paths are rejected with a clear error showing the expanded path
+
+Automatic discovery does not grant filesystem access by itself. Containerized
+deployments must mount every repository that should be visible to the bot. Do
+not mount deployment directories containing bot tokens or unrelated secrets.
 
 ## Session Behavior
 
