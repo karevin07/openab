@@ -1033,6 +1033,12 @@ async fn main() -> anyhow::Result<()> {
                 adapters,
                 ctl_registry.clone(),
                 ctl_shard.clone(),
+                #[cfg(feature = "discord")]
+                Some(ctl::SessionPublishContext::new(
+                    pool.clone(),
+                    project_registry.clone(),
+                    router.workspace_aliases_map(),
+                )),
             ))))
         }
     };

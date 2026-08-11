@@ -6,6 +6,7 @@ pub mod redact;
 pub mod bot_turns;
 pub mod config;
 pub mod cron;
+pub mod cursor_session;
 pub mod directives;
 pub mod dispatch;
 pub mod error_display;
