@@ -34,6 +34,11 @@ pub struct TaskRecord {
     pub queued_messages: usize,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_error: Option<String>,
+    /// Most recent text request submitted for this task. Used by the Discord
+    /// recovery controls to retry or edit a failed turn. Older registries load
+    /// without migration because the field defaults to `None`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_prompt: Option<String>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }
@@ -147,6 +152,17 @@ impl TaskRegistry {
         })
     }
 
+    pub fn record_prompt(&self, thread_id: u64, prompt: &str) -> anyhow::Result<TaskRecord> {
+        self.update(thread_id, |task| {
+            let prompt = prompt.trim();
+            task.last_prompt = if prompt.is_empty() {
+                None
+            } else {
+                Some(prompt.chars().take(4000).collect())
+            };
+        })
+    }
+
     pub fn recent_for_project(&self, project_channel_id: u64, limit: usize) -> Vec<TaskRecord> {
         let mut tasks = self
             .tasks
@@ -156,7 +172,7 @@ impl TaskRegistry {
             .filter(|task| task.project_channel_id == project_channel_id)
             .cloned()
             .collect::<Vec<_>>();
-        tasks.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
+        tasks.sort_by_key(|task| std::cmp::Reverse(task.updated_at));
         tasks.truncate(limit);
         tasks
     }
@@ -231,6 +247,7 @@ mod tests {
             state: TaskState::Ready,
             queued_messages: 0,
             last_error: None,
+            last_prompt: None,
             created_at: now,
             updated_at: now,
         }
@@ -274,5 +291,21 @@ mod tests {
         let recent = registry.recent_for_project(10, 10);
         assert_eq!(recent.len(), 2);
         assert_eq!(recent[0].thread_id, 20);
+    }
+
+    #[test]
+    fn retry_prompt_is_trimmed_truncated_and_persisted() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("tasks.json");
+        let registry = TaskRegistry::load(path.clone());
+        registry.ensure(task(20)).unwrap();
+
+        let updated = registry
+            .record_prompt(20, &format!("  {}  ", "x".repeat(4100)))
+            .unwrap();
+        assert_eq!(updated.last_prompt.as_ref().unwrap().chars().count(), 4000);
+
+        let restored = TaskRegistry::load(path);
+        assert_eq!(restored.task_for_thread(20).unwrap(), updated);
     }
 }
