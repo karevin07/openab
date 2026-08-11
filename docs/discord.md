@@ -95,6 +95,13 @@ it does not delete the Discord channel or repository. The bot needs **Manage Cha
 On startup, OpenAB reconciles bindings with Discord: deleted or invalid channels are pruned,
 moved channels are retained with a warning, and transient API failures never delete mappings.
 
+New project channels receive an interactive **Project Home** embed with onboarding and project
+information buttons. Run `/project home` in an existing managed channel to post the current card.
+Inside a session thread, `/session status` opens a control panel with refresh, stop, detach-for-Cursor,
+and close actions. Closing from the panel requires confirmation. While the host terminal owns a
+handoff, the panel explicitly reports **Detached to Cursor** and disables conflicting actions.
+Run `/help` for a compact Discord-to-Cursor handoff guide and the most common daily commands.
+
 ### `allowed_channels` / `allowed_users`
 
 | `allowed_channels` | `allowed_users` | Result |
