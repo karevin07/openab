@@ -18,7 +18,9 @@ use async_trait::async_trait;
 use tracing::{debug, error, info, info_span, warn};
 
 use crate::acp::ContentBlock;
-use crate::adapter::{AdapterRouter, ChannelRef, ChatAdapter, MessageRef};
+use crate::adapter::{
+    AdapterRouter, ChannelRef, ChatAdapter, MessageRef, TaskLifecycleEvent,
+};
 use crate::config::ReactionsConfig;
 use crate::error_display::format_user_error;
 use crate::reactions::StatusReactionController;
@@ -638,6 +640,15 @@ async fn dispatch_batch(
     let dispatch_start = Instant::now();
     let batch_size = batch.len();
     let session_key = Dispatcher::session_key(thread_channel);
+    if let Err(error) = adapter
+        .update_task_lifecycle(
+            thread_channel,
+            TaskLifecycleEvent::Started { batch_size },
+        )
+        .await
+    {
+        warn!(%error, "failed to mark task as running");
+    }
 
     // Apply 👀 reaction to every message in the batch before dispatch (§6.7).
     // Skip when assistant status API is active — uses
@@ -727,6 +738,14 @@ async fn dispatch_batch(
                 .send_message(&dispatch_channel, &format!("⚠️ {user_msg}"))
                 .await;
             error!("pool error in dispatch_batch: {e}");
+            let _ = adapter
+                .update_task_lifecycle(
+                    thread_channel,
+                    TaskLifecycleEvent::Failed {
+                        message: user_msg,
+                    },
+                )
+                .await;
             return;
         }
     };
@@ -750,6 +769,14 @@ async fn dispatch_batch(
                 .send_message(&dispatch_channel, &format!("⚠️ {e}"))
                 .await;
             error!(session_key, error = %e, "workspace selection rejected");
+            let _ = adapter
+                .update_task_lifecycle(
+                    thread_channel,
+                    TaskLifecycleEvent::Failed {
+                        message: e.to_string(),
+                    },
+                )
+                .await;
             return;
         }
 
@@ -827,6 +854,19 @@ async fn dispatch_batch(
         let _ = adapter
             .send_message(&dispatch_channel, &format!("⚠️ {e}"))
             .await;
+    }
+
+    let lifecycle = match &result {
+        Ok(()) => TaskLifecycleEvent::Finished,
+        Err(error) => TaskLifecycleEvent::Failed {
+            message: format_user_error(&error.to_string()),
+        },
+    };
+    if let Err(error) = adapter
+        .update_task_lifecycle(thread_channel, lifecycle)
+        .await
+    {
+        warn!(%error, "failed to update completed task UI");
     }
 
     let agent_dispatch_ms = dispatch_start.elapsed().as_millis();

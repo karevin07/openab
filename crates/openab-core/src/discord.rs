@@ -1,6 +1,8 @@
 use crate::acp::protocol::{ConfigOption, UsageReport};
 use crate::acp::{ContentBlock, SessionSnapshot, SessionState};
-use crate::adapter::{AdapterRouter, ChannelRef, ChatAdapter, MessageRef, SenderContext};
+use crate::adapter::{
+    AdapterRouter, ChannelRef, ChatAdapter, MessageRef, SenderContext, TaskLifecycleEvent,
+};
 use crate::bot_turns::{BotTurnTracker, TurnAction, TurnSeverity, BOT_TURN_LIMIT_WARNING_PREFIX};
 use crate::config::{AllowBots, AllowUsers, SttConfig};
 use crate::dispatch::DispatchTarget;
@@ -8,6 +10,7 @@ use crate::format;
 use crate::media;
 use crate::project_registry::{ProjectAccessTarget, ProjectBinding, ProjectRegistry};
 use crate::remind::{self, ReminderStore};
+use crate::task_registry::{TaskRecord, TaskRegistry, TaskState};
 use crate::trust::l3_gate_applies;
 use async_trait::async_trait;
 use serenity::builder::{
@@ -70,6 +73,10 @@ fn truncate_for_discord(s: &str, max: usize) -> String {
 
 fn inline_code(value: &str) -> String {
     format!("`{}`", value.replace('`', "'"))
+}
+
+fn suppress_mentions(value: &str) -> String {
+    value.replace('@', "@\u{200b}")
 }
 
 fn workspace_display(value: &str, aliases: &std::collections::HashMap<String, String>) -> String {
@@ -220,7 +227,11 @@ fn session_control_message(
         .colour(colour)
         .field("狀態", format!("**{state}**"), true)
         .field("Workspace", workspace, true)
-        .field("Discord thread", inline_code(&channel_id.to_string()), false)
+        .field(
+            "Discord thread",
+            inline_code(&channel_id.to_string()),
+            false,
+        )
         .footer(CreateEmbedFooter::new(
             "一個 Discord thread 對應一個 Cursor session",
         ));
@@ -270,6 +281,122 @@ fn project_access_display(binding: &ProjectBinding) -> String {
     truncate_for_discord(&display, 1000)
 }
 
+fn task_state_presentation(state: TaskState) -> (&'static str, &'static str, u32) {
+    match state {
+        TaskState::Queued => ("⏳", "Queued", 0xF1C40F),
+        TaskState::Running => ("🟢", "Running", 0x2ECC71),
+        TaskState::Ready => ("🟦", "Waiting for you", 0x3498DB),
+        TaskState::Cursor => ("🖥️", "Cursor 接手中", 0x9B59B6),
+        TaskState::Failed => ("🔴", "Failed", 0xE74C3C),
+        TaskState::Closed => ("⚫", "Closed", 0x95A5A6),
+    }
+}
+
+fn task_status_embed(task: &TaskRecord) -> CreateEmbed {
+    let (icon, state, colour) = task_state_presentation(task.state);
+    let mut embed = CreateEmbed::new()
+        .title(format!("{icon} {}", task.title))
+        .description(match task.state {
+            TaskState::Queued => "需求已排入 queue，OpenAB 會依序處理。",
+            TaskState::Running => "Cursor agent 正在處理目前的需求。",
+            TaskState::Ready => "本輪已完成；直接在 thread 回覆即可接續同一個 session。",
+            TaskState::Cursor => "Session 已交給主機上的 Cursor terminal。",
+            TaskState::Failed => "本輪執行失敗；請查看下方訊息後重試或調整需求。",
+            TaskState::Closed => "Session 已關閉；新訊息將建立新的 session context。",
+        })
+        .colour(colour)
+        .field("狀態", format!("**{state}**"), true)
+        .field(
+            "Workspace",
+            inline_code(&format!("@{}", task.workspace_alias)),
+            true,
+        )
+        .field("Started by", format!("<@{}>", task.created_by), true)
+        .field("Task thread", format!("<#{}>", task.thread_id), false);
+    if task.queued_messages > 0 {
+        embed = embed.field(
+            "Queue",
+            format!("{} message(s) waiting", task.queued_messages),
+            true,
+        );
+    }
+    if let Some(error) = task.last_error.as_deref() {
+        embed = embed.field("Last error", truncate_for_discord(error, 900), false);
+    }
+    embed.footer(CreateEmbedFooter::new(format!(
+        "Updated {} UTC",
+        task.updated_at.format("%Y-%m-%d %H:%M")
+    )))
+}
+
+fn task_control_rows(task: &TaskRecord) -> Vec<CreateActionRow> {
+    vec![CreateActionRow::Buttons(vec![
+        CreateButton::new("oab_session:refresh")
+            .label("↻ Refresh")
+            .style(ButtonStyle::Secondary),
+        CreateButton::new("oab_session:cancel")
+            .label("■ Stop")
+            .style(ButtonStyle::Secondary)
+            .disabled(task.state != TaskState::Running),
+        CreateButton::new("oab_session:detach")
+            .label("↗ Prepare for Cursor")
+            .style(ButtonStyle::Primary)
+            .disabled(matches!(
+                task.state,
+                TaskState::Queued | TaskState::Cursor | TaskState::Closed
+            )),
+        CreateButton::new("oab_session:close")
+            .label("✕ Close")
+            .style(ButtonStyle::Danger)
+            .disabled(task.state == TaskState::Closed),
+    ])]
+}
+
+fn task_status_message(task: &TaskRecord) -> CreateMessage {
+    CreateMessage::new()
+        .embed(task_status_embed(task))
+        .components(task_control_rows(task))
+}
+
+fn task_status_edit(task: &TaskRecord) -> EditMessage {
+    EditMessage::new()
+        .content("")
+        .embed(task_status_embed(task))
+        .components(task_control_rows(task))
+}
+
+fn task_status_interaction_message(
+    task: &TaskRecord,
+    note: Option<String>,
+) -> CreateInteractionResponseMessage {
+    let mut message = CreateInteractionResponseMessage::new()
+        .embed(task_status_embed(task))
+        .components(task_control_rows(task));
+    if let Some(note) = note {
+        message = message.content(truncate_for_discord(&note, 1900));
+    }
+    message
+}
+
+fn project_recent_tasks(tasks: &[TaskRecord]) -> String {
+    if tasks.is_empty() {
+        return "_尚無 task。點 **New task** 開始。_".to_string();
+    }
+    tasks
+        .iter()
+        .take(5)
+        .map(|task| {
+            let (icon, state, _) = task_state_presentation(task.state);
+            format!(
+                "{icon} <#{}> · {state} · <t:{}:R>",
+                task.thread_id,
+                task.updated_at.timestamp()
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 fn project_info_embed(binding: &ProjectBinding) -> CreateEmbed {
     CreateEmbed::new()
         .title(format!("📁 @{}", binding.workspace_alias))
@@ -286,43 +413,47 @@ fn project_info_embed(binding: &ProjectBinding) -> CreateEmbed {
         .footer(CreateEmbedFooter::new("Managed by OpenAB"))
 }
 
-fn project_welcome_message(binding: &ProjectBinding) -> CreateMessage {
-    let embed = project_info_embed(binding)
-        .field(
-            "1 · Start a task",
-            "Send a new message in this channel. OpenAB creates a dedicated thread and Cursor session.",
-            false,
-        )
-        .field(
-            "2 · Attach a local chat",
-            "Use the button below to select a recent exited Cursor chat from this repository.",
-            false,
-        )
-        .field(
-            "3 · Continue and control",
-            "Reply in the task thread to preserve context. Run `/session status` for lifecycle controls.",
-            false,
-        );
-    CreateMessage::new().embed(embed).components(vec![
-        CreateActionRow::Buttons(vec![
-            CreateButton::new("oab_project:guide")
-                .label("▶ New task guide")
-                .style(ButtonStyle::Primary),
-            CreateButton::new("oab_project:attach")
-                .label("📤 Attach local chat")
-                .style(ButtonStyle::Success),
-            CreateButton::new("oab_project:status")
-                .label("📁 Project info")
-                .style(ButtonStyle::Secondary),
-        ]),
-    ])
+fn project_welcome_components(tasks: &[TaskRecord]) -> Vec<CreateActionRow> {
+    let mut rows = vec![CreateActionRow::Buttons(vec![
+        CreateButton::new("oab_project:new")
+            .label("▶ New task")
+            .style(ButtonStyle::Primary),
+        CreateButton::new("oab_project:attach")
+            .label("📤 Attach local chat")
+            .style(ButtonStyle::Success),
+        CreateButton::new("oab_project:status")
+            .label("📁 Project info")
+            .style(ButtonStyle::Secondary),
+    ])];
+    if !tasks.is_empty() {
+        let options = tasks
+            .iter()
+            .take(10)
+            .map(|task| {
+                let (_, state, _) = task_state_presentation(task.state);
+                CreateSelectMenuOption::new(
+                    truncate_for_discord(&task.title, SELECT_OPTION_TEXT_MAX),
+                    task.thread_id.to_string(),
+                )
+                .description(truncate_for_discord(
+                    &format!("{state} · {} UTC", task.updated_at.format("%m-%d %H:%M")),
+                    SELECT_OPTION_TEXT_MAX,
+                ))
+            })
+            .collect();
+        rows.push(CreateActionRow::SelectMenu(
+            CreateSelectMenu::new("oab_recent_task", CreateSelectMenuKind::String { options })
+                .placeholder("Recent tasks"),
+        ));
+    }
+    rows
 }
 
-fn project_welcome_edit(binding: &ProjectBinding) -> EditMessage {
+fn project_welcome_message(binding: &ProjectBinding, tasks: &[TaskRecord]) -> CreateMessage {
     let embed = project_info_embed(binding)
         .field(
             "1 · Start a task",
-            "Send a new message in this channel. OpenAB creates a dedicated thread and Cursor session.",
+            "Tap **New task**, enter a title and request, then OpenAB creates the thread and starts Cursor.",
             false,
         )
         .field(
@@ -334,20 +465,34 @@ fn project_welcome_edit(binding: &ProjectBinding) -> EditMessage {
             "3 · Continue and control",
             "Reply in the task thread to preserve context. Run `/session status` for lifecycle controls.",
             false,
-        );
-    EditMessage::new().embed(embed).components(vec![
-        CreateActionRow::Buttons(vec![
-            CreateButton::new("oab_project:guide")
-                .label("▶ New task guide")
-                .style(ButtonStyle::Primary),
-            CreateButton::new("oab_project:attach")
-                .label("📤 Attach local chat")
-                .style(ButtonStyle::Success),
-            CreateButton::new("oab_project:status")
-                .label("📁 Project info")
-                .style(ButtonStyle::Secondary),
-        ]),
-    ])
+        )
+        .field("Recent tasks", project_recent_tasks(tasks), false);
+    CreateMessage::new()
+        .embed(embed)
+        .components(project_welcome_components(tasks))
+}
+
+fn project_welcome_edit(binding: &ProjectBinding, tasks: &[TaskRecord]) -> EditMessage {
+    let embed = project_info_embed(binding)
+        .field(
+            "1 · Start a task",
+            "Tap **New task**, enter a title and request, then OpenAB creates the thread and starts Cursor.",
+            false,
+        )
+        .field(
+            "2 · Attach a local chat",
+            "Use the button below to select a recent exited Cursor chat from this repository.",
+            false,
+        )
+        .field(
+            "3 · Continue and control",
+            "Reply in the task thread to preserve context. Run `/session status` for lifecycle controls.",
+            false,
+        )
+        .field("Recent tasks", project_recent_tasks(tasks), false);
+    EditMessage::new()
+        .embed(embed)
+        .components(project_welcome_components(tasks))
 }
 
 fn modal_input_value<'a>(
@@ -475,17 +620,67 @@ const THREAD_EXPORT_MESSAGE_LIMIT: usize = 5000;
 
 pub struct DiscordAdapter {
     http: Arc<Http>,
+    task_registry: Option<TaskRegistry>,
+    project_registry: Option<ProjectRegistry>,
 }
 
 impl DiscordAdapter {
     pub fn new(http: Arc<Http>) -> Self {
-        Self { http }
+        Self {
+            http,
+            task_registry: None,
+            project_registry: None,
+        }
+    }
+
+    pub fn with_task_ui(
+        http: Arc<Http>,
+        task_registry: TaskRegistry,
+        project_registry: ProjectRegistry,
+    ) -> Self {
+        Self {
+            http,
+            task_registry: Some(task_registry),
+            project_registry: Some(project_registry),
+        }
     }
 
     /// Resolve the effective Discord channel ID from a ChannelRef.
     /// Discord threads are channels, so prefer thread_id when set.
     fn resolve_channel(channel: &ChannelRef) -> &str {
         channel.thread_id.as_deref().unwrap_or(&channel.channel_id)
+    }
+
+    async fn refresh_task_ui(&self, task: &TaskRecord) -> anyhow::Result<()> {
+        if let Some(message_id) = task.status_message_id {
+            ChannelId::new(task.thread_id)
+                .edit_message(
+                    &self.http,
+                    MessageId::new(message_id),
+                    task_status_edit(task),
+                )
+                .await?;
+        }
+        let (Some(task_registry), Some(project_registry)) =
+            (&self.task_registry, &self.project_registry)
+        else {
+            return Ok(());
+        };
+        let Some(binding) = project_registry.binding_for_channel(task.project_channel_id) else {
+            return Ok(());
+        };
+        let Some(home_message_id) = binding.home_message_id else {
+            return Ok(());
+        };
+        let recent = task_registry.recent_for_project(task.project_channel_id, 10);
+        ChannelId::new(task.project_channel_id)
+            .edit_message(
+                &self.http,
+                MessageId::new(home_message_id),
+                project_welcome_edit(&binding, &recent),
+            )
+            .await?;
+        Ok(())
     }
 }
 
@@ -556,6 +751,31 @@ impl ChatAdapter for DiscordAdapter {
         let channel_id: u64 = Self::resolve_channel(channel).parse()?;
         ChannelId::new(channel_id).delete(&self.http).await?;
         Ok(())
+    }
+
+    async fn update_task_lifecycle(
+        &self,
+        channel: &ChannelRef,
+        event: TaskLifecycleEvent,
+    ) -> anyhow::Result<()> {
+        let Some(registry) = &self.task_registry else {
+            return Ok(());
+        };
+        let thread_id: u64 = Self::resolve_channel(channel).parse()?;
+        if registry.task_for_thread(thread_id).is_none() {
+            return Ok(());
+        }
+        let task = match event {
+            TaskLifecycleEvent::Enqueued => registry.enqueue(thread_id)?,
+            TaskLifecycleEvent::Started { batch_size } => {
+                registry.start_turn(thread_id, batch_size)?
+            }
+            TaskLifecycleEvent::Finished => registry.finish_turn(thread_id, None)?,
+            TaskLifecycleEvent::Failed { message } => {
+                registry.finish_turn(thread_id, Some(truncate_for_discord(&message, 900)))?
+            }
+        };
+        self.refresh_task_ui(&task).await
     }
 
     async fn edit_message(&self, msg: &MessageRef, content: &str) -> anyhow::Result<()> {
@@ -629,7 +849,11 @@ impl ChatAdapter for DiscordAdapter {
         let ch_id: u64 = Self::resolve_channel(channel).parse()?;
         // Truncate at char boundary to avoid panic on multi-byte chars (中文/Emoji).
         let truncated: &str = if title.chars().count() > 100 {
-            let end = title.char_indices().nth(100).map(|(i, _)| i).unwrap_or(title.len());
+            let end = title
+                .char_indices()
+                .nth(100)
+                .map(|(i, _)| i)
+                .unwrap_or(title.len());
             &title[..end]
         } else {
             title
@@ -688,6 +912,8 @@ pub struct Handler {
     pub project_category_id: Option<u64>,
     /// Runtime Discord channel-to-workspace bindings persisted across restarts.
     pub project_registry: ProjectRegistry,
+    /// Persistent task metadata used by Project Home and task status cards.
+    pub task_registry: TaskRegistry,
 }
 
 struct DiscordCommandScope {
@@ -696,6 +922,18 @@ struct DiscordCommandScope {
 }
 
 impl Handler {
+    fn discord_adapter(&self, ctx: &Context) -> Arc<dyn ChatAdapter> {
+        self.adapter
+            .get_or_init(|| {
+                Arc::new(DiscordAdapter::with_task_ui(
+                    ctx.http.clone(),
+                    self.task_registry.clone(),
+                    self.project_registry.clone(),
+                ))
+            })
+            .clone()
+    }
+
     fn effective_allowed_channels(&self) -> HashSet<u64> {
         let mut channels = self.allowed_channels.clone();
         let aliases = self.router.workspace_aliases();
@@ -798,7 +1036,9 @@ impl EventHandler for Handler {
             let key = msg.channel_id.to_string();
             {
                 let mut cache = self.multibot_threads.lock().await;
-                cache.entry(key.clone()).or_insert_with(tokio::time::Instant::now);
+                cache
+                    .entry(key.clone())
+                    .or_insert_with(tokio::time::Instant::now);
             }
             // Persist to disk — multibot is irreversible
             self.multibot_cache.mark_multibot(&key).await;
@@ -910,10 +1150,7 @@ impl EventHandler for Handler {
             return;
         }
 
-        let adapter = self
-            .adapter
-            .get_or_init(|| Arc::new(DiscordAdapter::new(ctx.http.clone())))
-            .clone();
+        let adapter = self.discord_adapter(&ctx);
 
         let channel_id = msg.channel_id.get();
         let in_allowed_channel =
@@ -941,11 +1178,14 @@ impl EventHandler for Handler {
         // non-allowed channels. Moved before bot gating so ambient context
         // can be resolved early — bot messages in ambient contexts must bypass
         // discord-level bot gating (#1197).
-        let (in_thread, bot_owns_thread, thread_parent_id, is_dm, is_structural_thread, structural_parent_id) = match msg
-            .channel_id
-            .to_channel(&ctx.http)
-            .await
-        {
+        let (
+            in_thread,
+            bot_owns_thread,
+            thread_parent_id,
+            is_dm,
+            is_structural_thread,
+            structural_parent_id,
+        ) = match msg.channel_id.to_channel(&ctx.http).await {
             Ok(serenity::model::channel::Channel::Guild(gc)) => {
                 let parent = gc.parent_id.map(|id| id.get().to_string());
                 let has_thread_metadata = gc.thread_metadata.is_some();
@@ -974,7 +1214,11 @@ impl EventHandler for Handler {
                     if has_thread_metadata { parent } else { None },
                     false,
                     has_thread_metadata,
-                    if has_thread_metadata { parent_u64 } else { None },
+                    if has_thread_metadata {
+                        parent_u64
+                    } else {
+                        None
+                    },
                 )
             }
             Ok(serenity::model::channel::Channel::Private(_)) => {
@@ -994,7 +1238,12 @@ impl EventHandler for Handler {
         // Check if message is in an ambient context (resolved early so bot
         // messages destined for ambient can bypass discord-level bot gating).
         let in_ambient_context = self.ambient.as_ref().is_some_and(|ambient| {
-            ambient.should_buffer(channel_id, is_structural_thread, bot_owns_thread, structural_parent_id)
+            ambient.should_buffer(
+                channel_id,
+                is_structural_thread,
+                bot_owns_thread,
+                structural_parent_id,
+            )
         });
         // Managed project channels are dedicated bot entrypoints: a human's
         // top-level message starts a task without requiring an @mention. Once
@@ -1047,13 +1296,15 @@ impl EventHandler for Handler {
 
                     let target = Arc::clone(&self.router) as Arc<dyn DispatchTarget>;
                     debug!(channel_id = %msg.channel_id, bot_id = %msg.author.id, "ambient early-route: bot msg buffered");
-                    ambient.submit(
-                        &channel_id.to_string(),
-                        channel_ref,
-                        adapter.clone(),
-                        target,
-                        ambient_msg,
-                    ).await;
+                    ambient
+                        .submit(
+                            &channel_id.to_string(),
+                            channel_ref,
+                            adapter.clone(),
+                            target,
+                            ambient_msg,
+                        )
+                        .await;
                 }
             }
             return;
@@ -1209,13 +1460,15 @@ impl EventHandler for Handler {
                     };
 
                     let target = Arc::clone(&self.router) as Arc<dyn DispatchTarget>;
-                    ambient.submit(
-                        &channel_id.to_string(),
-                        channel_ref,
-                        adapter.clone(),
-                        target,
-                        ambient_msg,
-                    ).await;
+                    ambient
+                        .submit(
+                            &channel_id.to_string(),
+                            channel_ref,
+                            adapter.clone(),
+                            target,
+                            ambient_msg,
+                        )
+                        .await;
                     return;
                 }
             }
@@ -1366,7 +1619,8 @@ impl EventHandler for Handler {
                 // be uploaded to S3, not inlined).
                 let attachment_size = u64::from(attachment.size);
                 #[cfg(feature = "filestore")]
-                let skip_cap = self.filestore.is_some() && attachment_size > crate::media::TEXT_INLINE_LIMIT;
+                let skip_cap =
+                    self.filestore.is_some() && attachment_size > crate::media::TEXT_INLINE_LIMIT;
                 #[cfg(not(feature = "filestore"))]
                 let skip_cap = false;
                 if !skip_cap && text_file_bytes + attachment_size > TEXT_TOTAL_CAP {
@@ -1447,7 +1701,9 @@ impl EventHandler for Handler {
                                     attachment.content_type.as_deref(),
                                     None,
                                     fs,
-                                ).await {
+                                )
+                                .await
+                                {
                                     extra_blocks.push(block);
                                 }
                             }
@@ -1492,6 +1748,34 @@ impl EventHandler for Handler {
             }
         };
 
+        if let Some(project_channel_id) = thread_channel
+            .parent_id
+            .as_deref()
+            .and_then(|value| value.parse::<u64>().ok())
+        {
+            if let Some(binding) = self
+                .project_registry
+                .binding_for_channel(project_channel_id)
+            {
+                let task_title = format::shorten_thread_name(&prompt);
+                if let Err(error) = self
+                    .ensure_task(
+                        &ctx,
+                        &binding,
+                        thread_channel
+                            .channel_id
+                            .parse::<u64>()
+                            .unwrap_or(msg.channel_id.get()),
+                        &task_title,
+                        msg.author.id.get(),
+                    )
+                    .await
+                {
+                    tracing::warn!(%error, channel_id = %thread_channel.channel_id, "failed to register Discord task");
+                }
+            }
+        }
+
         // Notify user if any images couldn't be processed.
         if !failed_image_files.is_empty() {
             let file_list = failed_image_files
@@ -1512,10 +1796,11 @@ impl EventHandler for Handler {
         let trigger_msg = discord_msg_ref(&msg);
 
         // Per-thread streaming: check if another bot is present in this thread
-        let other_bot_present_flag = {
-            let cache = self.multibot_threads.lock().await;
-            cache.contains_key(&msg.channel_id.to_string())
-        } || self.multibot_cache.is_multibot(&msg.channel_id.to_string());
+        let other_bot_present_flag =
+            {
+                let cache = self.multibot_threads.lock().await;
+                cache.contains_key(&msg.channel_id.to_string())
+            } || self.multibot_cache.is_multibot(&msg.channel_id.to_string());
 
         // Backfill thread_id: when OAB just created a new thread, the sender
         // was built before the thread existed. Patch it so the agent sees
@@ -1585,10 +1870,21 @@ impl EventHandler for Handler {
                 other_bot_present: other_bot_present_flag,
                 recipient: None, // Slack-only (assistant mode); N/A for Discord
             };
+            let _ = adapter
+                .update_task_lifecycle(&thread_channel, TaskLifecycleEvent::Enqueued)
+                .await;
             if let Err(e) = dispatcher
-                .submit(thread_key, thread_channel, adapter, buf_msg)
+                .submit(thread_key, thread_channel.clone(), adapter.clone(), buf_msg)
                 .await
             {
+                let _ = adapter
+                    .update_task_lifecycle(
+                        &thread_channel,
+                        TaskLifecycleEvent::Failed {
+                            message: e.to_string(),
+                        },
+                    )
+                    .await;
                 error!("dispatcher submit error: {e}");
             }
         });
@@ -1647,10 +1943,7 @@ impl EventHandler for Handler {
             }
         }
 
-        let adapter = self
-            .adapter
-            .get_or_init(|| Arc::new(DiscordAdapter::new(ctx.http.clone())))
-            .clone();
+        let adapter = self.discord_adapter(&ctx);
 
         let channel_id = reaction.channel_id;
         let effective_allowed_channels = self.effective_allowed_channels();
@@ -1664,8 +1957,8 @@ impl EventHandler for Handler {
         // Doing this before spawn so we have &self for bot_participated_in_thread
         // and can reject unallowed channels without any expensive API calls.
 
-        let in_allowed_channel = self.allow_all_channels
-            || effective_allowed_channels.contains(&channel_id.get());
+        let in_allowed_channel =
+            self.allow_all_channels || effective_allowed_channels.contains(&channel_id.get());
 
         // F3 fix: Use detect_thread helper.
         let (thread_channel, is_thread) = match channel_id.to_channel(&ctx.http).await {
@@ -1685,24 +1978,30 @@ impl EventHandler for Handler {
                     if !in_allowed_thread {
                         return;
                     }
-                    (ChannelRef {
-                        platform: "discord".into(),
-                        channel_id: channel_id.get().to_string(),
-                        thread_id: None,
-                        parent_id: parent.map(|p| p.to_string()),
-                        origin_event_id: None,
-                    }, true)
+                    (
+                        ChannelRef {
+                            platform: "discord".into(),
+                            channel_id: channel_id.get().to_string(),
+                            thread_id: None,
+                            parent_id: parent.map(|p| p.to_string()),
+                            origin_event_id: None,
+                        },
+                        true,
+                    )
                 } else {
                     if !in_allowed_channel {
                         return;
                     }
-                    (ChannelRef {
-                        platform: "discord".into(),
-                        channel_id: channel_id.get().to_string(),
-                        thread_id: None,
-                        parent_id: None,
-                        origin_event_id: None,
-                    }, false)
+                    (
+                        ChannelRef {
+                            platform: "discord".into(),
+                            channel_id: channel_id.get().to_string(),
+                            thread_id: None,
+                            parent_id: None,
+                            origin_event_id: None,
+                        },
+                        false,
+                    )
                 }
             }
             _ => return,
@@ -1716,7 +2015,8 @@ impl EventHandler for Handler {
                 self.allow_user_messages,
                 AllowUsers::Involved | AllowUsers::MultibotMentions
             ) {
-            self.bot_participated_in_thread(&ctx.http, channel_id, bot_id).await
+            self.bot_participated_in_thread(&ctx.http, channel_id, bot_id)
+                .await
         } else {
             // For non-thread: still check multibot cache for dispatch info.
             let mb = {
@@ -1750,17 +2050,16 @@ impl EventHandler for Handler {
 
         tokio::spawn(async move {
             // F2 fix: Fetch user info first, then apply user gating with confirmed bot status.
-            let (sender_name, display_name, is_bot_confirmed) =
-                match user_id.to_user(&http).await {
-                    Ok(user) => {
-                        let display = user.global_name.as_ref().unwrap_or(&user.name).clone();
-                        (user.name.clone(), display, user.bot)
-                    }
-                    Err(_) => {
-                        let fallback = user_id.to_string();
-                        (fallback.clone(), fallback, is_reactor_bot)
-                    }
-                };
+            let (sender_name, display_name, is_bot_confirmed) = match user_id.to_user(&http).await {
+                Ok(user) => {
+                    let display = user.global_name.as_ref().unwrap_or(&user.name).clone();
+                    (user.name.clone(), display, user.bot)
+                }
+                Err(_) => {
+                    let fallback = user_id.to_string();
+                    (fallback.clone(), fallback, is_reactor_bot)
+                }
+            };
 
             // Defense-in-depth: if to_user() reveals this is a bot but member was
             // None (rare edge case), re-apply bot gating retroactively.
@@ -1768,8 +2067,7 @@ impl EventHandler for Handler {
                 match allow_bot_messages {
                     AllowBots::Off | AllowBots::Mentions => return,
                     AllowBots::All => {
-                        if !trusted_bot_ids.is_empty()
-                            && !trusted_bot_ids.contains(&user_id.get())
+                        if !trusted_bot_ids.is_empty() && !trusted_bot_ids.contains(&user_id.get())
                         {
                             return;
                         }
@@ -1828,10 +2126,21 @@ impl EventHandler for Handler {
                 recipient: None,
             };
 
+            let _ = adapter
+                .update_task_lifecycle(&thread_channel, TaskLifecycleEvent::Enqueued)
+                .await;
             if let Err(e) = dispatcher
-                .submit(thread_key, thread_channel, adapter, buf_msg)
+                .submit(thread_key, thread_channel.clone(), adapter.clone(), buf_msg)
                 .await
             {
+                let _ = adapter
+                    .update_task_lifecycle(
+                        &thread_channel,
+                        TaskLifecycleEvent::Failed {
+                            message: e.to_string(),
+                        },
+                    )
+                    .await;
                 error!("reaction mapping dispatcher submit error: {e}");
             }
         });
@@ -1992,23 +2301,31 @@ impl EventHandler for Handler {
                 ),
             CreateCommand::new("remind")
                 .description("Set a one-shot reminder to mention users/roles after a delay")
-                .add_option(CreateCommandOption::new(
-                    CommandOptionType::String,
-                    "targets",
-                    "Users/roles to mention (e.g. @user1 @role1)",
-                ).required(true))
-                .add_option(CreateCommandOption::new(
-                    CommandOptionType::String,
-                    "message",
-                    "Reminder message",
-                ).required(true))
-                .add_option(CreateCommandOption::new(
-                    CommandOptionType::String,
-                    "delay",
-                    "Delay before firing (e.g. 30m, 2h, 1d)",
-                ).required(true)),
-            CreateCommand::new("auth")
-                .description("Authenticate the backend agent (device flow)"),
+                .add_option(
+                    CreateCommandOption::new(
+                        CommandOptionType::String,
+                        "targets",
+                        "Users/roles to mention (e.g. @user1 @role1)",
+                    )
+                    .required(true),
+                )
+                .add_option(
+                    CreateCommandOption::new(
+                        CommandOptionType::String,
+                        "message",
+                        "Reminder message",
+                    )
+                    .required(true),
+                )
+                .add_option(
+                    CreateCommandOption::new(
+                        CommandOptionType::String,
+                        "delay",
+                        "Delay before firing (e.g. 30m, 2h, 1d)",
+                    )
+                    .required(true),
+                ),
+            CreateCommand::new("auth").description("Authenticate the backend agent (device flow)"),
             CreateCommand::new("usage")
                 .description("Show backend account usage and billing information"),
             CreateCommand::new("export-thread")
@@ -2125,18 +2442,20 @@ impl EventHandler for Handler {
             Interaction::Command(cmd) if cmd.data.name == "usage" => {
                 self.handle_usage_command(&ctx, &cmd).await;
             }
-            Interaction::Component(comp)
-                if comp.data.custom_id.starts_with("oab_session:") =>
-            {
+            Interaction::Component(comp) if comp.data.custom_id.starts_with("oab_session:") => {
                 self.handle_session_control(&ctx, &comp).await;
             }
-            Interaction::Component(comp)
-                if comp.data.custom_id.starts_with("oab_project:") =>
-            {
+            Interaction::Component(comp) if comp.data.custom_id.starts_with("oab_project:") => {
                 self.handle_project_component(&ctx, &comp).await;
             }
             Interaction::Component(comp) if comp.data.custom_id == "oab_attach_chat" => {
                 self.handle_attach_chat_select(&ctx, &comp).await;
+            }
+            Interaction::Component(comp) if comp.data.custom_id == "oab_recent_task" => {
+                self.handle_recent_task_select(&ctx, &comp).await;
+            }
+            Interaction::Modal(modal) if modal.data.custom_id == "oab_project_new" => {
+                self.handle_project_new_task_modal(&ctx, &modal).await;
             }
             Interaction::Modal(modal)
                 if modal.data.custom_id.starts_with("oab_project_attach:") =>
@@ -2187,7 +2506,7 @@ impl Handler {
             .colour(0x5865F2)
             .field(
                 "📱 在外面 · 用 Discord 開發",
-                "1. 進入 repository 的 project channel。\n2. 傳送新任務，OpenAB 會建立 thread。\n3. 持續在該 thread 回覆。\n4. 用 `/session status` 開啟控制面板。",
+                "1. 進入 repository 的 Project Home。\n2. 點 **New task**，填寫標題與需求。\n3. 到新 thread 查看 Task Status 並持續回覆。\n4. Project Home 的 **Recent tasks** 可快速找回任務。",
                 false,
             )
             .field(
@@ -2300,9 +2619,9 @@ impl Handler {
             .cloned()
             .ok_or_else(|| "Project workspace 目前未設定。".to_string())?;
         let query = query.trim().to_lowercase();
-        let chats = crate::cursor_session::list_cursor_chats_for_workspace(
-            std::path::Path::new(&workspace),
-        )
+        let chats = crate::cursor_session::list_cursor_chats_for_workspace(std::path::Path::new(
+            &workspace,
+        ))
         .map_err(|error| friendly_attach_error(&error.to_string()))?;
         let mut available = Vec::new();
         for chat in chats {
@@ -2335,6 +2654,88 @@ impl Handler {
         Ok(available)
     }
 
+    async fn ensure_task_status_card(
+        &self,
+        ctx: &Context,
+        task: &TaskRecord,
+    ) -> Result<TaskRecord, String> {
+        if let Some(message_id) = task.status_message_id {
+            match ChannelId::new(task.thread_id)
+                .edit_message(
+                    &ctx.http,
+                    MessageId::new(message_id),
+                    task_status_edit(task),
+                )
+                .await
+            {
+                Ok(_) => return Ok(task.clone()),
+                Err(error) if is_unknown_discord_message_error(&error) => {}
+                Err(error) => return Err(format!("Could not update Task Status: {error}")),
+            }
+        }
+        let message = ChannelId::new(task.thread_id)
+            .send_message(&ctx.http, task_status_message(task))
+            .await
+            .map_err(|error| format!("Could not post Task Status: {error}"))?;
+        match self
+            .task_registry
+            .set_status_message(task.thread_id, message.id.get())
+        {
+            Ok(updated) => Ok(updated),
+            Err(error) => {
+                let _ = message.delete(&ctx.http).await;
+                Err(format!("Could not save Task Status: {error}"))
+            }
+        }
+    }
+
+    async fn ensure_task(
+        &self,
+        ctx: &Context,
+        binding: &ProjectBinding,
+        thread_id: u64,
+        title: &str,
+        created_by: u64,
+    ) -> Result<TaskRecord, String> {
+        let now = chrono::Utc::now();
+        let title = truncate_for_discord(
+            if title.trim().is_empty() {
+                "Untitled task"
+            } else {
+                title.trim()
+            },
+            100,
+        );
+        let (task, created) = self
+            .task_registry
+            .ensure(TaskRecord {
+                guild_id: binding.guild_id,
+                project_channel_id: binding.channel_id,
+                workspace_alias: binding.workspace_alias.clone(),
+                thread_id,
+                title,
+                created_by,
+                status_message_id: None,
+                state: TaskState::Ready,
+                queued_messages: 0,
+                last_error: None,
+                created_at: now,
+                updated_at: now,
+            })
+            .map_err(|error| format!("Could not save task metadata: {error}"))?;
+        let task = if created || task.status_message_id.is_none() {
+            self.ensure_task_status_card(ctx, &task).await?
+        } else {
+            task
+        };
+        if created {
+            if let Err(error) = self.upsert_project_home(ctx, binding).await {
+                tracing::warn!(%error, thread_id, "failed to refresh Project Home after task registration");
+            }
+        }
+        Ok(task)
+    }
+
     async fn handle_session_autocomplete(
         &self,
         ctx: &Context,
@@ -2353,12 +2754,12 @@ impl Handler {
                 .unwrap_or_default(),
             Err(_) => Vec::new(),
         };
-        let response = chats.into_iter().fold(
-            CreateAutocompleteResponse::new(),
-            |response, chat| {
-                response.add_string_choice(cursor_chat_choice_label(&chat), chat.session_id)
-            },
-        );
+        let response =
+            chats
+                .into_iter()
+                .fold(CreateAutocompleteResponse::new(), |response, chat| {
+                    response.add_string_choice(cursor_chat_choice_label(&chat), chat.session_id)
+                });
         if let Err(error) = cmd
             .create_response(&ctx.http, CreateInteractionResponse::Autocomplete(response))
             .await
@@ -2373,6 +2774,9 @@ impl Handler {
         binding: &ProjectBinding,
     ) -> Result<bool, String> {
         let channel_id = ChannelId::new(binding.channel_id);
+        let recent_tasks = self
+            .task_registry
+            .recent_for_project(binding.channel_id, 10);
         let mut home_message_id = binding.home_message_id;
         if home_message_id.is_none() {
             let expected_title = format!("📁 @{}", binding.workspace_alias);
@@ -2396,31 +2800,27 @@ impl Handler {
                 .edit_message(
                     &ctx.http,
                     MessageId::new(message_id),
-                    project_welcome_edit(binding),
+                    project_welcome_edit(binding, &recent_tasks),
                 )
                 .await
             {
                 Ok(_) => {
                     if binding.home_message_id != Some(message_id) {
                         self.project_registry
-                            .set_home_message_id(
-                                binding.guild_id,
-                                binding.channel_id,
-                                message_id,
-                            )
+                            .set_home_message_id(binding.guild_id, binding.channel_id, message_id)
                             .map_err(|error| {
                                 format!("Could not save Project Home message: {error}")
                             })?;
                     }
                     return Ok(false);
                 }
-                Err(error) if is_unknown_discord_message_error(&error) => {},
+                Err(error) if is_unknown_discord_message_error(&error) => {}
                 Err(error) => return Err(format!("Could not update Project Home: {error}")),
             }
         }
 
         let message = channel_id
-            .send_message(&ctx.http, project_welcome_message(binding))
+            .send_message(&ctx.http, project_welcome_message(binding, &recent_tasks))
             .await
             .map_err(|error| format!("Could not post Project Home: {error}"))?;
         if let Err(error) = self.project_registry.set_home_message_id(
@@ -2454,7 +2854,10 @@ impl Handler {
                 continue;
             }
 
-            match ChannelId::new(binding.channel_id).to_channel(&ctx.http).await {
+            match ChannelId::new(binding.channel_id)
+                .to_channel(&ctx.http)
+                .await
+            {
                 Ok(serenity::model::channel::Channel::Guild(channel))
                     if channel.guild_id.get() == binding.guild_id
                         && channel.kind == ChannelType::Text
@@ -2493,7 +2896,7 @@ impl Handler {
                         .remove(binding.guild_id, binding.channel_id)
                     {
                         Ok(Some(_)) => stale += 1,
-                        Ok(None) => {},
+                        Ok(None) => {}
                         Err(error) => tracing::error!(
                             %error,
                             channel_id = binding.channel_id,
@@ -2509,7 +2912,7 @@ impl Handler {
                         .remove(binding.guild_id, binding.channel_id)
                     {
                         Ok(Some(_)) => stale += 1,
-                        Ok(None) => {},
+                        Ok(None) => {}
                         Err(remove_error) => tracing::error!(
                             error = %remove_error,
                             channel_id = binding.channel_id,
@@ -2529,10 +2932,7 @@ impl Handler {
 
         info!(
             active,
-            stale,
-            unavailable,
-            moved,
-            "project channel reconciliation completed"
+            stale, unavailable, moved, "project channel reconciliation completed"
         );
     }
 
@@ -2546,10 +2946,13 @@ impl Handler {
             return;
         }
 
-        let content = self.run_project_command(ctx, cmd).await.unwrap_or_else(|error| {
-            tracing::warn!(%error, user_id = %cmd.user.id, "project command rejected");
-            format!("⚠️ {error}")
-        });
+        let content = self
+            .run_project_command(ctx, cmd)
+            .await
+            .unwrap_or_else(|error| {
+                tracing::warn!(%error, user_id = %cmd.user.id, "project command rejected");
+                format!("⚠️ {error}")
+            });
         if let Err(error) = cmd
             .edit_response(&ctx.http, EditInteractionResponse::new().content(content))
             .await
@@ -2712,9 +3115,7 @@ impl Handler {
                     created_by: cmd.user.id.get(),
                     access_role_id: None,
                     access_user_ids: Vec::new(),
-                    access_role_ids: access_role_id
-                        .map(|id| vec![id.get()])
-                        .unwrap_or_default(),
+                    access_role_ids: access_role_id.map(|id| vec![id.get()]).unwrap_or_default(),
                     home_message_id: None,
                     created_at: chrono::Utc::now(),
                 };
@@ -2807,10 +3208,7 @@ impl Handler {
                         .iter()
                         .map(|id| format!("<@&{id}>"))
                         .collect::<Vec<_>>();
-                    let access = users
-                        .into_iter()
-                        .chain(roles)
-                        .collect::<Vec<_>>();
+                    let access = users.into_iter().chain(roles).collect::<Vec<_>>();
                     let access = if access.is_empty() {
                         "_Creator only_".to_string()
                     } else {
@@ -2959,6 +3357,9 @@ impl Handler {
                     })?;
                 self.router
                     .unbind_workspace_channel("discord", &project_channel_id.to_string());
+                if let Err(error) = self.task_registry.remove_project(project_channel_id) {
+                    tracing::warn!(%error, project_channel_id, "failed to remove project task metadata");
+                }
                 Ok(format!(
                     "✅ Unlinked <#{}> from {}. The Discord channel and repository were not deleted.",
                     project_channel_id,
@@ -2988,12 +3389,7 @@ impl Handler {
         if user_is_bot {
             return Err("🤖 Bots cannot use session management commands.".to_string());
         }
-        if is_denied_user(
-            false,
-            self.allow_all_users,
-            &self.allowed_users,
-            user_id,
-        ) {
+        if is_denied_user(false, self.allow_all_users, &self.allowed_users, user_id) {
             return Err("🚫 You are not allowed to use this bot.".to_string());
         }
 
@@ -3025,8 +3421,7 @@ impl Handler {
             }
             Ok(_) => {
                 return Err(
-                    "⚠️ Run this command inside an allowed Discord channel or thread."
-                        .to_string(),
+                    "⚠️ Run this command inside an allowed Discord channel or thread.".to_string(),
                 );
             }
             Err(error) => {
@@ -3076,7 +3471,11 @@ impl Handler {
         let content = match subcommand {
             "list" => format_workspace_list(&aliases, channel_default.as_deref()),
             _ => {
-                let snapshot = self.router.pool().session_snapshot(&scope.session_key).await;
+                let snapshot = self
+                    .router
+                    .pool()
+                    .session_snapshot(&scope.session_key)
+                    .await;
                 format_workspace_status(&snapshot, channel_default.as_deref(), &aliases)
             }
         };
@@ -3097,6 +3496,7 @@ impl Handler {
         channel_id: ChannelId,
         chat_id: &str,
         title: &str,
+        created_by: u64,
     ) -> Result<String, String> {
         let (binding, is_thread) = self.project_binding_for_channel(ctx, channel_id).await?;
         let project_channel_id = binding.channel_id;
@@ -3116,10 +3516,7 @@ impl Handler {
             )
             .await
             .map_err(|error| friendly_attach_error(&error.to_string()))?;
-            let adapter = self
-                .adapter
-                .get_or_init(|| Arc::new(DiscordAdapter::new(ctx.http.clone())))
-                .clone();
+            let adapter = self.discord_adapter(ctx);
             let thread = ChannelRef {
                 platform: "discord".into(),
                 channel_id: channel_id.get().to_string(),
@@ -3139,17 +3536,19 @@ impl Handler {
             {
                 tracing::warn!(%error, %channel_id, "session attached but confirmation failed");
             }
+            self.ensure_task(ctx, &binding, channel_id.get(), title, created_by)
+                .await?;
             return Ok(format!(
                 "✅ Cursor chat `{}` 已綁定到 <#{}>，請在該 thread 傳送下一則訊息繼續。",
-                checkpoint.session_id.get(..8).unwrap_or(&checkpoint.session_id),
+                checkpoint
+                    .session_id
+                    .get(..8)
+                    .unwrap_or(&checkpoint.session_id),
                 channel_id.get()
             ));
         }
 
-        let adapter = self
-            .adapter
-            .get_or_init(|| Arc::new(DiscordAdapter::new(ctx.http.clone())))
-            .clone();
+        let adapter = self.discord_adapter(ctx);
         let thread = crate::cursor_session::publish_cursor_chat(
             adapter.as_ref(),
             self.router.pool().as_ref(),
@@ -3160,6 +3559,17 @@ impl Handler {
         )
         .await
         .map_err(|error| friendly_attach_error(&error.to_string()))?;
+        self.ensure_task(
+            ctx,
+            &binding,
+            thread
+                .channel_id
+                .parse()
+                .map_err(|_| "Invalid Discord thread ID")?,
+            title,
+            created_by,
+        )
+        .await?;
         Ok(format!(
             "✅ Cursor chat 已發佈到 <#{}>，請到該 thread 繼續。",
             thread.channel_id
@@ -3210,7 +3620,7 @@ impl Handler {
                 return;
             }
             let content = self
-                .attach_cursor_chat_request(ctx, cmd.channel_id, chat_id, title)
+                .attach_cursor_chat_request(ctx, cmd.channel_id, chat_id, title, cmd.user.id.get())
                 .await
                 .unwrap_or_else(|error| format!("⚠️ 無法 attach Cursor chat：{error}"));
             if let Err(error) = cmd
@@ -3222,48 +3632,74 @@ impl Handler {
             return;
         }
         if subcommand == "status" {
-            let snapshot = self.router.pool().session_snapshot(&scope.session_key).await;
-            let response = CreateInteractionResponse::Message(session_control_message(
-                &snapshot,
-                &self.router.workspace_aliases(),
-                cmd.channel_id.get(),
-                None,
-            ).ephemeral(true));
+            let snapshot = self
+                .router
+                .pool()
+                .session_snapshot(&scope.session_key)
+                .await;
+            let response = CreateInteractionResponse::Message(
+                session_control_message(
+                    &snapshot,
+                    &self.router.workspace_aliases(),
+                    cmd.channel_id.get(),
+                    None,
+                )
+                .ephemeral(true),
+            );
             if let Err(error) = cmd.create_response(&ctx.http, response).await {
                 tracing::error!(%error, "failed to respond to /session status");
             }
             return;
         }
 
+        let mut task_state_update = None;
         let content = if subcommand == "close" {
             let dropped = self
                 .dispatcher
                 .cancel_buffered_thread("discord", &cmd.channel_id.get().to_string());
             match self.router.pool().reset_session(&scope.session_key).await {
-                Ok(()) if dropped > 0 => format!(
-                    "✅ Session closed and {dropped} buffered message(s) dropped. The next message starts a fresh session."
-                ),
+                Ok(()) if dropped > 0 => {
+                    task_state_update = Some(TaskState::Closed);
+                    format!(
+                        "✅ Session closed and {dropped} buffered message(s) dropped. The next message starts a fresh session."
+                    )
+                }
                 Ok(()) => {
+                    task_state_update = Some(TaskState::Closed);
                     "✅ Session closed. The next message starts a fresh session.".to_string()
                 }
-                Err(_) if dropped > 0 => format!(
-                    "🧹 Dropped {dropped} buffered message(s). No session state was open."
-                ),
+                Err(_) if dropped > 0 => {
+                    format!("🧹 Dropped {dropped} buffered message(s). No session state was open.")
+                }
                 Err(_) => "⚠️ No session state to close in this channel or thread.".to_string(),
             }
         } else if subcommand == "detach" {
             match self.router.pool().detach_session(&scope.session_key).await {
-                Ok(()) => concat!(
-                    "✅ Session detached and ready for local resume. ",
-                    "Do not send another Discord message until the local ACP client exits; ",
-                    "the next Discord message will then restore the updated session."
-                )
-                .to_string(),
+                Ok(()) => {
+                    task_state_update = Some(TaskState::Cursor);
+                    concat!(
+                        "✅ Session detached and ready for local resume. ",
+                        "Do not send another Discord message until the local ACP client exits; ",
+                        "the next Discord message will then restore the updated session."
+                    )
+                    .to_string()
+                }
                 Err(error) => format!("⚠️ Could not detach session: {error}"),
             }
         } else {
             "⚠️ Unknown session command.".to_string()
         };
+
+        if let Some(state) = task_state_update {
+            if let Ok(task) = self.task_registry.set_state(cmd.channel_id.get(), state) {
+                if let Some(binding) = self
+                    .project_registry
+                    .binding_for_channel(task.project_channel_id)
+                {
+                    let _ = self.upsert_project_home(ctx, &binding).await;
+                }
+            }
+        }
 
         let response = CreateInteractionResponse::Message(
             CreateInteractionResponseMessage::new()
@@ -3281,12 +3717,7 @@ impl Handler {
         comp: &serenity::model::application::ComponentInteraction,
     ) {
         let scope = match self
-            .resolve_session_scope(
-                ctx,
-                comp.user.id.get(),
-                comp.user.bot,
-                comp.channel_id,
-            )
+            .resolve_session_scope(ctx, comp.user.id.get(), comp.user.bot, comp.channel_id)
             .await
         {
             Ok(scope) => scope,
@@ -3321,10 +3752,7 @@ impl Handler {
                 ])])
                 .ephemeral(true);
             if let Err(error) = comp
-                .create_response(
-                    &ctx.http,
-                    CreateInteractionResponse::Message(confirmation),
-                )
+                .create_response(&ctx.http, CreateInteractionResponse::Message(confirmation))
                 .await
             {
                 tracing::error!(%error, "failed to show session close confirmation");
@@ -3332,52 +3760,105 @@ impl Handler {
             return;
         }
 
+        let mut task_state_update = None;
         let note = match action {
             "refresh" => None,
-            "cancel" => Some(match self.router.pool().cancel_session(&scope.session_key).await {
-                Ok(()) => "🛑 Stop signal sent. The session remains available.".to_string(),
-                Err(error) => format!("⚠️ Could not stop the current task: {error}"),
-            }),
-            "detach" => Some(match self.router.pool().detach_session(&scope.session_key).await {
-                Ok(()) => format!(
-                    "✅ Ready for Cursor on the host. Run `make session-resume THREAD_ID={}`. Do not send Discord messages until the terminal UI exits.",
-                    comp.channel_id.get()
-                ),
-                Err(error) => format!("⚠️ Could not detach session: {error}"),
-            }),
-            "confirm_close" => {
-                let dropped = self.dispatcher.cancel_buffered_thread(
-                    "discord",
-                    &comp.channel_id.get().to_string(),
-                );
-                Some(match self.router.pool().reset_session(&scope.session_key).await {
-                    Ok(()) if dropped > 0 => format!(
-                        "✅ Session closed and {dropped} buffered message(s) dropped. Send a new message to start fresh."
-                    ),
+            "cancel" => Some(
+                match self.router.pool().cancel_session(&scope.session_key).await {
+                    Ok(()) => "🛑 Stop signal sent. The session remains available.".to_string(),
+                    Err(error) => format!("⚠️ Could not stop the current task: {error}"),
+                },
+            ),
+            "detach" => Some(
+                match self.router.pool().detach_session(&scope.session_key).await {
                     Ok(()) => {
-                        "✅ Session closed. Send a new message to start fresh.".to_string()
+                        task_state_update = Some(TaskState::Cursor);
+                        format!(
+                        "✅ Ready for Cursor on the host. Run `make session-resume THREAD_ID={}`. Do not send Discord messages until the terminal UI exits.",
+                        comp.channel_id.get()
+                    )
                     }
-                    Err(_) if dropped > 0 => format!(
-                        "🧹 Dropped {dropped} buffered message(s). No session state was open."
-                    ),
-                    Err(_) => "⚠️ No session state was open.".to_string(),
-                })
+                    Err(error) => format!("⚠️ Could not detach session: {error}"),
+                },
+            ),
+            "confirm_close" => {
+                let dropped = self
+                    .dispatcher
+                    .cancel_buffered_thread("discord", &comp.channel_id.get().to_string());
+                Some(
+                    match self.router.pool().reset_session(&scope.session_key).await {
+                        Ok(()) if dropped > 0 => {
+                            task_state_update = Some(TaskState::Closed);
+                            format!(
+                            "✅ Session closed and {dropped} buffered message(s) dropped. Send a new message to start fresh."
+                        )
+                        }
+                        Ok(()) => {
+                            task_state_update = Some(TaskState::Closed);
+                            "✅ Session closed. Send a new message to start fresh.".to_string()
+                        }
+                        Err(_) if dropped > 0 => format!(
+                            "🧹 Dropped {dropped} buffered message(s). No session state was open."
+                        ),
+                        Err(_) => "⚠️ No session state was open.".to_string(),
+                    },
+                )
             }
-            _ => Some("⚠️ This session control is no longer available. Run `/session status` again.".to_string()),
+            _ => Some(
+                "⚠️ This session control is no longer available. Run `/session status` again."
+                    .to_string(),
+            ),
         };
 
-        let snapshot = self.router.pool().session_snapshot(&scope.session_key).await;
-        let message = session_control_message(
-            &snapshot,
-            &self.router.workspace_aliases(),
-            comp.channel_id.get(),
-            note,
-        );
+        let snapshot = self
+            .router
+            .pool()
+            .session_snapshot(&scope.session_key)
+            .await;
+        let task = if let Some(state) = task_state_update {
+            self.task_registry
+                .set_state(comp.channel_id.get(), state)
+                .ok()
+        } else {
+            self.task_registry.task_for_thread(comp.channel_id.get())
+        };
+        if task_state_update.is_some() {
+            if let Some(task) = task.as_ref() {
+                if task
+                    .status_message_id
+                    .is_some_and(|message_id| message_id != comp.message.id.get())
+                {
+                    if let Some(message_id) = task.status_message_id {
+                        let _ = ChannelId::new(task.thread_id)
+                            .edit_message(
+                                &ctx.http,
+                                MessageId::new(message_id),
+                                task_status_edit(task),
+                            )
+                            .await;
+                    }
+                }
+            }
+            if let Some(binding) = task.as_ref().and_then(|task| {
+                self.project_registry
+                    .binding_for_channel(task.project_channel_id)
+            }) {
+                if let Err(error) = self.upsert_project_home(ctx, &binding).await {
+                    tracing::warn!(%error, "failed to refresh Project Home after session control");
+                }
+            }
+        }
+        let message = match task {
+            Some(task) => task_status_interaction_message(&task, note),
+            None => session_control_message(
+                &snapshot,
+                &self.router.workspace_aliases(),
+                comp.channel_id.get(),
+                note,
+            ),
+        };
         if let Err(error) = comp
-            .create_response(
-                &ctx.http,
-                CreateInteractionResponse::UpdateMessage(message),
-            )
+            .create_response(&ctx.http, CreateInteractionResponse::UpdateMessage(message))
             .await
         {
             tracing::error!(%error, action, "failed to update session control");
@@ -3428,6 +3909,34 @@ impl Handler {
             .custom_id
             .strip_prefix("oab_project:")
             .unwrap_or("");
+        if action == "new" {
+            let modal = CreateModal::new("oab_project_new", "Start a new development task")
+                .components(vec![
+                    CreateActionRow::InputText(
+                        CreateInputText::new(InputTextStyle::Short, "Task title", "title")
+                            .placeholder("Fix login redirect")
+                            .max_length(100)
+                            .required(false),
+                    ),
+                    CreateActionRow::InputText(
+                        CreateInputText::new(
+                            InputTextStyle::Paragraph,
+                            "What should Cursor do?",
+                            "prompt",
+                        )
+                        .placeholder("Describe the outcome, constraints, and how to verify it")
+                        .min_length(1)
+                        .max_length(4000),
+                    ),
+                ]);
+            if let Err(error) = comp
+                .create_response(&ctx.http, CreateInteractionResponse::Modal(modal))
+                .await
+            {
+                tracing::error!(%error, "failed to open new task modal");
+            }
+            return;
+        }
         if action == "attach" {
             let chats = match self.available_cursor_chats(&binding, "").await {
                 Ok(chats) => chats,
@@ -3462,11 +3971,9 @@ impl Handler {
                     .description(format!("Cursor chat {}", chat.session_id))
                 })
                 .collect();
-            let select = CreateSelectMenu::new(
-                "oab_attach_chat",
-                CreateSelectMenuKind::String { options },
-            )
-            .placeholder("選擇最近的 Cursor chat");
+            let select =
+                CreateSelectMenu::new("oab_attach_chat", CreateSelectMenuKind::String { options })
+                    .placeholder("選擇最近的 Cursor chat");
             let response = CreateInteractionResponse::Message(
                 CreateInteractionResponseMessage::new()
                     .content(format!(
@@ -3480,12 +3987,6 @@ impl Handler {
             return;
         }
         let message = match action {
-            "guide" => CreateInteractionResponseMessage::new()
-                .content(format!(
-                    "💡 Send a new development request in <#{}>. OpenAB creates a dedicated thread automatically; keep replying in that thread to preserve context. Inside the thread, use `/session status` for controls.",
-                    binding.channel_id
-                ))
-                .ephemeral(true),
             "status" => CreateInteractionResponseMessage::new()
                 .embed(project_info_embed(&binding))
                 .ephemeral(true),
@@ -3535,7 +4036,7 @@ impl Handler {
             return;
         }
         let content = self
-            .attach_cursor_chat_request(ctx, modal.channel_id, chat_id, title)
+            .attach_cursor_chat_request(ctx, modal.channel_id, chat_id, title, modal.user.id.get())
             .await
             .unwrap_or_else(|error| format!("⚠️ 無法 attach Cursor chat：{error}"));
         if let Err(error) = modal
@@ -3544,6 +4045,264 @@ impl Handler {
         {
             tracing::error!(%error, "failed to edit Cursor attach modal response");
         }
+    }
+
+    async fn handle_project_new_task_modal(
+        &self,
+        ctx: &Context,
+        modal: &serenity::model::application::ModalInteraction,
+    ) {
+        if modal.user.bot
+            || is_denied_user(
+                false,
+                self.allow_all_users,
+                &self.allowed_users,
+                modal.user.id.get(),
+            )
+        {
+            let response = CreateInteractionResponse::Message(
+                CreateInteractionResponseMessage::new()
+                    .content("🚫 你沒有建立 task 的權限。")
+                    .ephemeral(true),
+            );
+            let _ = modal.create_response(&ctx.http, response).await;
+            return;
+        }
+        let Some(binding) = self
+            .project_registry
+            .binding_for_channel(modal.channel_id.get())
+        else {
+            let response = CreateInteractionResponse::Message(
+                CreateInteractionResponseMessage::new()
+                    .content("⚠️ 請從 managed Project Home 建立 task。")
+                    .ephemeral(true),
+            );
+            let _ = modal.create_response(&ctx.http, response).await;
+            return;
+        };
+        let prompt = modal_input_value(modal, "prompt")
+            .map(str::trim)
+            .unwrap_or("");
+        if prompt.is_empty() {
+            let response = CreateInteractionResponse::Message(
+                CreateInteractionResponseMessage::new()
+                    .content("⚠️ Task request 不可為空。")
+                    .ephemeral(true),
+            );
+            let _ = modal.create_response(&ctx.http, response).await;
+            return;
+        }
+        let title = modal_input_value(modal, "title")
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(|value| truncate_for_discord(value, 100))
+            .unwrap_or_else(|| format::shorten_thread_name(prompt));
+        if let Err(error) = modal.defer_ephemeral(&ctx.http).await {
+            tracing::error!(%error, "failed to defer new task modal");
+            return;
+        }
+
+        let parent_id = ChannelId::new(binding.channel_id);
+        let trigger = match parent_id
+            .send_message(
+                &ctx.http,
+                CreateMessage::new().content(format!(
+                    "🧵 **{}**\nStarted by <@{}> via Project Home",
+                    suppress_mentions(&title.replace('*', "").replace('`', "")),
+                    modal.user.id
+                )),
+            )
+            .await
+        {
+            Ok(message) => message,
+            Err(error) => {
+                let _ = modal
+                    .edit_response(
+                        &ctx.http,
+                        EditInteractionResponse::new()
+                            .content(format!("⚠️ Could not create task: {error}")),
+                    )
+                    .await;
+                return;
+            }
+        };
+        let thread = match parent_id
+            .create_thread_from_message(
+                &ctx.http,
+                trigger.id,
+                CreateThread::new(&title).auto_archive_duration(AutoArchiveDuration::OneDay),
+            )
+            .await
+        {
+            Ok(thread) => thread,
+            Err(error) => {
+                let _ = trigger.delete(&ctx.http).await;
+                let _ = modal
+                    .edit_response(
+                        &ctx.http,
+                        EditInteractionResponse::new()
+                            .content(format!("⚠️ Could not create task thread: {error}")),
+                    )
+                    .await;
+                return;
+            }
+        };
+        let task = match self
+            .ensure_task(ctx, &binding, thread.id.get(), &title, modal.user.id.get())
+            .await
+        {
+            Ok(task) => task,
+            Err(error) => {
+                let _ = thread.id.delete(&ctx.http).await;
+                let _ = trigger.delete(&ctx.http).await;
+                let _ = modal
+                    .edit_response(
+                        &ctx.http,
+                        EditInteractionResponse::new().content(format!("⚠️ {error}")),
+                    )
+                    .await;
+                return;
+            }
+        };
+        let request_preview = suppress_mentions(&truncate_for_discord(prompt, 1800));
+        if let Err(error) = thread
+            .id
+            .send_message(
+                &ctx.http,
+                CreateMessage::new().content(format!(
+                    "👤 **Request from <@{}>**\n{}",
+                    modal.user.id, request_preview
+                )),
+            )
+            .await
+        {
+            tracing::warn!(%error, thread_id = %thread.id, "failed to post task request preview");
+        }
+
+        let thread_channel = ChannelRef {
+            platform: "discord".into(),
+            channel_id: thread.id.to_string(),
+            thread_id: None,
+            parent_id: Some(binding.channel_id.to_string()),
+            origin_event_id: None,
+        };
+        let trigger_ref = MessageRef {
+            channel: ChannelRef {
+                platform: "discord".into(),
+                channel_id: binding.channel_id.to_string(),
+                thread_id: None,
+                parent_id: None,
+                origin_event_id: None,
+            },
+            message_id: trigger.id.to_string(),
+        };
+        let display_name = modal
+            .user
+            .global_name
+            .as_deref()
+            .unwrap_or(&modal.user.name);
+        let sender = build_sender_context(
+            &modal.user.id.to_string(),
+            &modal.user.name,
+            display_name,
+            &thread.id.to_string(),
+            Some(&binding.channel_id.to_string()),
+            false,
+            &chrono::Utc::now().to_rfc3339(),
+            &trigger.id.to_string(),
+            &ctx.cache.current_user().id.to_string(),
+        );
+        let dispatcher = self.dispatcher.clone();
+        let adapter = self.discord_adapter(ctx);
+        let prompt = prompt.to_string();
+        tokio::spawn(async move {
+            let _ = adapter
+                .update_task_lifecycle(&thread_channel, TaskLifecycleEvent::Enqueued)
+                .await;
+            let thread_key =
+                dispatcher.key("discord", &thread_channel.channel_id, &sender.sender_id);
+            let buf_msg = crate::dispatch::BufferedMessage {
+                sender_json: serde_json::to_string(&sender).unwrap_or_default(),
+                sender_name: sender.sender_name,
+                estimated_tokens: crate::dispatch::estimate_tokens(&prompt, &[]),
+                prompt,
+                extra_blocks: Vec::new(),
+                trigger_msg: trigger_ref,
+                arrived_at: std::time::Instant::now(),
+                other_bot_present: false,
+                recipient: None,
+            };
+            if let Err(error) = dispatcher
+                .submit(thread_key, thread_channel.clone(), adapter.clone(), buf_msg)
+                .await
+            {
+                let _ = adapter
+                    .update_task_lifecycle(
+                        &thread_channel,
+                        TaskLifecycleEvent::Failed {
+                            message: error.to_string(),
+                        },
+                    )
+                    .await;
+            }
+        });
+        let _ = modal
+            .edit_response(
+                &ctx.http,
+                EditInteractionResponse::new().content(format!(
+                    "✅ Task **{}** started in <#{}>.",
+                    task.title, task.thread_id
+                )),
+            )
+            .await;
+    }
+
+    async fn handle_recent_task_select(
+        &self,
+        ctx: &Context,
+        comp: &serenity::model::application::ComponentInteraction,
+    ) {
+        if comp.user.bot
+            || is_denied_user(
+                false,
+                self.allow_all_users,
+                &self.allowed_users,
+                comp.user.id.get(),
+            )
+        {
+            let response = CreateInteractionResponse::Message(
+                CreateInteractionResponseMessage::new()
+                    .content("🚫 你沒有使用這個 Bot 的權限。")
+                    .ephemeral(true),
+            );
+            let _ = comp.create_response(&ctx.http, response).await;
+            return;
+        }
+        let selected = match &comp.data.kind {
+            ComponentInteractionDataKind::StringSelect { values } => {
+                values.first().and_then(|value| value.parse::<u64>().ok())
+            }
+            _ => None,
+        };
+        let project_channel_id = comp.channel_id.get();
+        let task = selected
+            .and_then(|thread_id| self.task_registry.task_for_thread(thread_id))
+            .filter(|task| task.project_channel_id == project_channel_id);
+        let content = task.map_or_else(
+            || "⚠️ 這個 task 已不可用，請執行 `/project home` 更新清單。".to_string(),
+            |task| {
+                format!(
+                    "🧵 **{}**\nOpen <#{}> to continue.",
+                    task.title, task.thread_id
+                )
+            },
+        );
+        let response = CreateInteractionResponse::Message(
+            CreateInteractionResponseMessage::new()
+                .content(content)
+                .ephemeral(true),
+        );
+        let _ = comp.create_response(&ctx.http, response).await;
     }
 
     async fn handle_attach_chat_select(
@@ -3775,7 +4534,9 @@ impl Handler {
         if !self.router.pool().has_active_session(&thread_key).await {
             let response = CreateInteractionResponse::Message(
                 CreateInteractionResponseMessage::new()
-                    .content("⚠️ No active session. Start a conversation first by @mentioning the bot.")
+                    .content(
+                        "⚠️ No active session. Start a conversation first by @mentioning the bot.",
+                    )
                     .ephemeral(true),
             );
             if let Err(e) = cmd.create_response(&ctx.http, response).await {
@@ -3786,8 +4547,9 @@ impl Handler {
 
         // The ACP round-trip can exceed Discord's 3-second interaction
         // deadline — acknowledge with a deferred ephemeral response first.
-        let defer =
-            CreateInteractionResponse::Defer(CreateInteractionResponseMessage::new().ephemeral(true));
+        let defer = CreateInteractionResponse::Defer(
+            CreateInteractionResponseMessage::new().ephemeral(true),
+        );
         if let Err(e) = cmd.create_response(&ctx.http, defer).await {
             tracing::error!(error = %e, "failed to defer /usage response");
             return;
@@ -3924,15 +4686,18 @@ impl Handler {
 
         // Extract options
         let opts = &cmd.data.options;
-        let targets_raw = opts.iter()
+        let targets_raw = opts
+            .iter()
             .find(|o| o.name == "targets")
             .and_then(|o| o.value.as_str())
             .unwrap_or("");
-        let message = opts.iter()
+        let message = opts
+            .iter()
             .find(|o| o.name == "message")
             .and_then(|o| o.value.as_str())
             .unwrap_or("");
-        let delay_raw = opts.iter()
+        let delay_raw = opts
+            .iter()
             .find(|o| o.name == "delay")
             .and_then(|o| o.value.as_str())
             .unwrap_or("");
@@ -3994,7 +4759,10 @@ impl Handler {
         if targets.len() > remind::MAX_TARGETS {
             let response = CreateInteractionResponse::Message(
                 CreateInteractionResponseMessage::new()
-                    .content(format!("⚠️ Too many targets (max {}). Use a @role instead.", remind::MAX_TARGETS))
+                    .content(format!(
+                        "⚠️ Too many targets (max {}). Use a @role instead.",
+                        remind::MAX_TARGETS
+                    ))
                     .ephemeral(true),
             );
             let _ = cmd.create_response(&ctx.http, response).await;
@@ -4094,7 +4862,9 @@ impl Handler {
         if AUTH_IN_PROGRESS.swap(true, std::sync::atomic::Ordering::Acquire) {
             let response = CreateInteractionResponse::Message(
                 CreateInteractionResponseMessage::new()
-                    .content("⚠️ Authentication already in progress. Please wait for it to complete.")
+                    .content(
+                        "⚠️ Authentication already in progress. Please wait for it to complete.",
+                    )
                     .ephemeral(true),
             );
             let _ = cmd.create_response(&ctx.http, response).await;
@@ -4107,7 +4877,9 @@ impl Handler {
                 AUTH_IN_PROGRESS.store(false, std::sync::atomic::Ordering::Release);
                 let response = CreateInteractionResponse::Message(
                     CreateInteractionResponseMessage::new()
-                        .content("⚠️ No auth command configured (`OPENAB_AGENT_AUTH_COMMAND` not set).")
+                        .content(
+                            "⚠️ No auth command configured (`OPENAB_AGENT_AUTH_COMMAND` not set).",
+                        )
                         .ephemeral(true),
                 );
                 let _ = cmd.create_response(&ctx.http, response).await;
@@ -4130,9 +4902,9 @@ impl Handler {
         let user_id = cmd.user.id.get();
 
         tokio::spawn(async move {
+            use std::sync::Arc;
             use tokio::io::AsyncBufReadExt;
             use tokio::process::Command as TokioCommand;
-            use std::sync::Arc;
 
             // Drop guard ensures AUTH_IN_PROGRESS is cleared even on panic.
             struct AuthGuard;
@@ -4156,13 +4928,15 @@ impl Handler {
                 Ok(c) => c,
                 Err(e) => {
                     tracing::error!(error = %e, "/auth: failed to spawn auth command");
-                    let _ = http.create_followup_message(
-                        &token,
-                        &CreateInteractionResponseFollowup::new()
-                            .content(format!("❌ Failed to start auth command: {e}"))
-                            .ephemeral(true),
-                        Vec::new(),
-                    ).await;
+                    let _ = http
+                        .create_followup_message(
+                            &token,
+                            &CreateInteractionResponseFollowup::new()
+                                .content(format!("❌ Failed to start auth command: {e}"))
+                                .ephemeral(true),
+                            Vec::new(),
+                        )
+                        .await;
                     return;
                 }
             };
@@ -4181,7 +4955,10 @@ impl Handler {
                     let mut reader = tokio::io::BufReader::new(stdout).lines();
                     while let Ok(Some(line)) = reader.next_line().await {
                         let has_url = line.contains("http://") || line.contains("https://");
-                        lines_out.lock().unwrap_or_else(|e| e.into_inner()).push(line);
+                        lines_out
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner())
+                            .push(line);
                         if has_url {
                             url_found_out.notify_one();
                         }
@@ -4196,7 +4973,10 @@ impl Handler {
                     let mut reader = tokio::io::BufReader::new(stderr).lines();
                     while let Ok(Some(line)) = reader.next_line().await {
                         let has_url = line.contains("http://") || line.contains("https://");
-                        lines_err.lock().unwrap_or_else(|e| e.into_inner()).push(line);
+                        lines_err
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner())
+                            .push(line);
                         if has_url {
                             url_found_err.notify_one();
                         }
@@ -4226,12 +5006,8 @@ impl Handler {
             // Handle an early exit (the command terminated during the URL window).
             if let Some(res) = early_exit {
                 let _ = tokio::join!(stdout_task, stderr_task);
-                let collected = strip_ansi_codes(
-                    &lines
-                        .lock()
-                        .unwrap_or_else(|e| e.into_inner())
-                        .join("\n"),
-                );
+                let collected =
+                    strip_ansi_codes(&lines.lock().unwrap_or_else(|e| e.into_inner()).join("\n"));
                 let detail = if collected.trim().is_empty() {
                     String::new()
                 } else {
@@ -4251,13 +5027,15 @@ impl Handler {
                     }
                     Err(e) => format!("❌ Error waiting for auth command: {e}"),
                 };
-                let _ = http.create_followup_message(
-                    &token,
-                    &CreateInteractionResponseFollowup::new()
-                        .content(content)
-                        .ephemeral(true),
-                    Vec::new(),
-                ).await;
+                let _ = http
+                    .create_followup_message(
+                        &token,
+                        &CreateInteractionResponseFollowup::new()
+                            .content(content)
+                            .ephemeral(true),
+                        Vec::new(),
+                    )
+                    .await;
                 return;
             }
 
@@ -4288,13 +5066,15 @@ impl Handler {
             // `truncate_to_utf16_budget` for the testable implementation.
             let truncated = truncate_to_utf16_budget(&output, prefix, suffix, 2000);
             let msg = format!("{prefix}{truncated}{suffix}");
-            let _ = http.create_followup_message(
-                &token,
-                &CreateInteractionResponseFollowup::new()
-                    .content(msg)
-                    .ephemeral(true),
-                Vec::new(),
-            ).await;
+            let _ = http
+                .create_followup_message(
+                    &token,
+                    &CreateInteractionResponseFollowup::new()
+                        .content(msg)
+                        .ephemeral(true),
+                    Vec::new(),
+                )
+                .await;
 
             // Wait for the process to complete (user authorizes in browser).
             // Use 14min (not 15) to leave headroom for the Discord interaction token TTL.
@@ -4302,44 +5082,55 @@ impl Handler {
             match tokio::time::timeout(timeout, child.wait()).await {
                 Ok(Ok(status)) if status.success() => {
                     info!("/auth: authentication successful");
-                    let _ = http.create_followup_message(
-                        &token,
-                        &CreateInteractionResponseFollowup::new()
-                            .content("✅ Authentication successful!")
-                            .ephemeral(true),
-                        Vec::new(),
-                    ).await;
+                    let _ = http
+                        .create_followup_message(
+                            &token,
+                            &CreateInteractionResponseFollowup::new()
+                                .content("✅ Authentication successful!")
+                                .ephemeral(true),
+                            Vec::new(),
+                        )
+                        .await;
                 }
                 Ok(Ok(status)) => {
                     warn!(%status, "/auth: authentication failed");
-                    let _ = http.create_followup_message(
-                        &token,
-                        &CreateInteractionResponseFollowup::new()
-                            .content(format!("❌ Authentication failed (exit code: {}).", status))
-                            .ephemeral(true),
-                        Vec::new(),
-                    ).await;
+                    let _ = http
+                        .create_followup_message(
+                            &token,
+                            &CreateInteractionResponseFollowup::new()
+                                .content(format!(
+                                    "❌ Authentication failed (exit code: {}).",
+                                    status
+                                ))
+                                .ephemeral(true),
+                            Vec::new(),
+                        )
+                        .await;
                 }
                 Ok(Err(e)) => {
                     tracing::error!(error = %e, "/auth: error waiting for auth process");
-                    let _ = http.create_followup_message(
-                        &token,
-                        &CreateInteractionResponseFollowup::new()
-                            .content(format!("❌ Auth process error: {e}"))
-                            .ephemeral(true),
-                        Vec::new(),
-                    ).await;
+                    let _ = http
+                        .create_followup_message(
+                            &token,
+                            &CreateInteractionResponseFollowup::new()
+                                .content(format!("❌ Auth process error: {e}"))
+                                .ephemeral(true),
+                            Vec::new(),
+                        )
+                        .await;
                 }
                 Err(_) => {
                     warn!("/auth: timed out waiting for authorization");
                     let _ = child.kill().await;
-                    let _ = http.create_followup_message(
-                        &token,
-                        &CreateInteractionResponseFollowup::new()
-                            .content("⏰ Authentication timed out. Run `/auth` again to retry.")
-                            .ephemeral(true),
-                        Vec::new(),
-                    ).await;
+                    let _ = http
+                        .create_followup_message(
+                            &token,
+                            &CreateInteractionResponseFollowup::new()
+                                .content("⏰ Authentication timed out. Run `/auth` again to retry.")
+                                .ephemeral(true),
+                            Vec::new(),
+                        )
+                        .await;
                 }
             }
 
@@ -4387,9 +5178,7 @@ impl Handler {
                 );
                 (in_thread, gc.name.clone())
             }
-            Ok(serenity::model::channel::Channel::Private(_)) => {
-                (self.allow_dm, "dm".to_string())
-            }
+            Ok(serenity::model::channel::Channel::Private(_)) => (self.allow_dm, "dm".to_string()),
             Ok(_) => (false, "channel".to_string()),
             Err(e) => {
                 tracing::warn!(channel_id = %channel_id, error = %e, "failed to inspect channel for export");
@@ -4411,16 +5200,34 @@ impl Handler {
 
         // --- Parse and validate filter params (mutual exclusion) ---
         let opts = &cmd.data.options;
-        let limit_opt = opts.iter().find(|o| o.name == "limit").and_then(|o| o.value.as_i64());
-        let since_opt = opts.iter().find(|o| o.name == "since").and_then(|o| o.value.as_str());
-        let days_opt = opts.iter().find(|o| o.name == "days").and_then(|o| o.value.as_i64());
-        let all_opt = opts.iter().find(|o| o.name == "all").and_then(|o| o.value.as_bool()).unwrap_or(false);
+        let limit_opt = opts
+            .iter()
+            .find(|o| o.name == "limit")
+            .and_then(|o| o.value.as_i64());
+        let since_opt = opts
+            .iter()
+            .find(|o| o.name == "since")
+            .and_then(|o| o.value.as_str());
+        let days_opt = opts
+            .iter()
+            .find(|o| o.name == "days")
+            .and_then(|o| o.value.as_i64());
+        let all_opt = opts
+            .iter()
+            .find(|o| o.name == "all")
+            .and_then(|o| o.value.as_bool())
+            .unwrap_or(false);
 
-        let filter_count = limit_opt.is_some() as u8 + since_opt.is_some() as u8 + days_opt.is_some() as u8 + all_opt as u8;
+        let filter_count = limit_opt.is_some() as u8
+            + since_opt.is_some() as u8
+            + days_opt.is_some() as u8
+            + all_opt as u8;
         if filter_count > 1 {
             let response = CreateInteractionResponse::Message(
                 CreateInteractionResponseMessage::new()
-                    .content("⚠️ Please specify only one filter: `limit`, `since`, `days`, or `all`.")
+                    .content(
+                        "⚠️ Please specify only one filter: `limit`, `since`, `days`, or `all`.",
+                    )
                     .ephemeral(true),
             );
             let _ = cmd.create_response(&ctx.http, response).await;
@@ -4688,8 +5495,7 @@ fn format_usage_body(report: &UsageReport) -> (String, bool) {
 fn build_usage_reply(report: &UsageReport) -> (String, CreateEmbed) {
     let (body, over_limit) = format_usage_body(report);
     let content = format!("📊 **Usage — {}**\n{}", report.plan_name, body);
-    let mut embed =
-        CreateEmbed::new().colour(if over_limit { 0xE74C3C } else { 0x2ECC71 });
+    let mut embed = CreateEmbed::new().colour(if over_limit { 0xE74C3C } else { 0x2ECC71 });
     if let Some(reset) = &report.billing_cycle_reset {
         embed = embed.footer(CreateEmbedFooter::new(format!(
             "Billing cycle resets {reset}"
@@ -4859,7 +5665,10 @@ async fn export_channel_messages(
 
     let filename = export_filename(channel_id, channel_name);
     if attachment_size_limit < 2048 {
-        tracing::warn!(attachment_size_limit, "attachment_size_limit is very small; export will likely be truncated");
+        tracing::warn!(
+            attachment_size_limit,
+            "attachment_size_limit is very small; export will likely be truncated"
+        );
     }
     let max_bytes = usize::try_from(attachment_size_limit)
         .unwrap_or(8 * 1024 * 1024)
@@ -4929,10 +5738,7 @@ fn format_export_message(msg: &Message) -> String {
     let bot_marker = if msg.author.bot { " [bot]" } else { "" };
     let mut out = format!(
         "[{}] {}{} ({})\n",
-        msg.timestamp,
-        msg.author.name,
-        bot_marker,
-        msg.author.id
+        msg.timestamp, msg.author.name, bot_marker, msg.author.id
     );
 
     if msg.content.is_empty() {
@@ -5351,7 +6157,7 @@ fn truncate_to_utf16_budget(body: &str, prefix: &str, suffix: &str, limit: usize
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::bot_turns::{TurnResult, HARD_BOT_TURN_LIMIT, BOT_TURN_LIMIT_WARNING_PREFIX};
+    use crate::bot_turns::{TurnResult, BOT_TURN_LIMIT_WARNING_PREFIX, HARD_BOT_TURN_LIMIT};
 
     // --- truncate_for_discord (select menu option 100-char cap) ---
 
@@ -5413,7 +6219,12 @@ mod tests {
         assert_eq!(sanitize_project_channel_name(" OpenAB API "), "openab-api");
         assert_eq!(sanitize_project_channel_name("///"), "project");
         assert_eq!(sanitize_project_channel_name("x"), "x-project");
-        assert!(sanitize_project_channel_name(&"a".repeat(150)).chars().count() <= 100);
+        assert!(
+            sanitize_project_channel_name(&"a".repeat(150))
+                .chars()
+                .count()
+                <= 100
+        );
     }
 
     #[test]
@@ -5563,7 +6374,10 @@ mod tests {
         assert!(content.contains("12781.64 / 10000"));
         assert!(content.contains("Overage charges: 111.27 USD"));
         let json = serde_json::to_value(&embed).expect("embed serializes");
-        assert!(json.get("description").is_none(), "body must not be in embed");
+        assert!(
+            json.get("description").is_none(),
+            "body must not be in embed"
+        );
         assert!(json.get("title").is_none(), "title must not be in embed");
         assert_eq!(json["color"], 0xE74C3C, "over limit → red strip");
         assert_eq!(json["footer"]["text"], "Billing cycle resets 2026-08-01");
@@ -5625,7 +6439,10 @@ mod tests {
     #[test]
     fn truncate_utf16_respects_prefix_suffix_budget() {
         // limit 10, prefix "pre" (3) + suffix "su" (2) = 5 → 5 ASCII units left.
-        assert_eq!(truncate_to_utf16_budget("abcdefghij", "pre", "su", 10), "abcde");
+        assert_eq!(
+            truncate_to_utf16_budget("abcdefghij", "pre", "su", 10),
+            "abcde"
+        );
     }
 
     /// A supplementary-plane scalar counts as TWO UTF-16 code units, not one.
@@ -6518,9 +7335,8 @@ mod tests {
         trusted_bot_ids: &HashSet<u64>,
         author_id: u64,
     ) -> bool {
-        let trusted_mention = is_mentioned
-            && !trusted_bot_ids.is_empty()
-            && trusted_bot_ids.contains(&author_id);
+        let trusted_mention =
+            is_mentioned && !trusted_bot_ids.is_empty() && trusted_bot_ids.contains(&author_id);
 
         if !trusted_mention {
             match allow_bot_messages {
@@ -6553,7 +7369,12 @@ mod tests {
     #[test]
     fn bot_admission_untrusted_mention_blocked_by_off() {
         let trusted = HashSet::from([42]);
-        assert!(!should_admit_bot_message(AllowBots::Off, true, &trusted, 99));
+        assert!(!should_admit_bot_message(
+            AllowBots::Off,
+            true,
+            &trusted,
+            99
+        ));
     }
 
     /// GIVEN: allow_bot_messages=Off, trusted bot without @mention
@@ -6561,7 +7382,12 @@ mod tests {
     #[test]
     fn bot_admission_trusted_no_mention_blocked_by_off() {
         let trusted = HashSet::from([42]);
-        assert!(!should_admit_bot_message(AllowBots::Off, false, &trusted, 42));
+        assert!(!should_admit_bot_message(
+            AllowBots::Off,
+            false,
+            &trusted,
+            42
+        ));
     }
 
     /// GIVEN: allow_bot_messages=Off, empty trusted_bot_ids, bot @mentions
@@ -6569,7 +7395,12 @@ mod tests {
     #[test]
     fn bot_admission_empty_trusted_ids_off_mode() {
         let trusted: HashSet<u64> = HashSet::new();
-        assert!(!should_admit_bot_message(AllowBots::Off, true, &trusted, 42));
+        assert!(!should_admit_bot_message(
+            AllowBots::Off,
+            true,
+            &trusted,
+            42
+        ));
     }
 
     /// GIVEN: allow_bot_messages=Mentions, trusted bot @mentions
@@ -6577,7 +7408,12 @@ mod tests {
     #[test]
     fn bot_admission_mentions_mode_trusted_mention() {
         let trusted = HashSet::from([42]);
-        assert!(should_admit_bot_message(AllowBots::Mentions, true, &trusted, 42));
+        assert!(should_admit_bot_message(
+            AllowBots::Mentions,
+            true,
+            &trusted,
+            42
+        ));
     }
 
     /// GIVEN: allow_bot_messages=All, untrusted bot (not in trusted_bot_ids)
@@ -6585,7 +7421,12 @@ mod tests {
     #[test]
     fn bot_admission_all_mode_untrusted_bot_rejected() {
         let trusted = HashSet::from([42]);
-        assert!(!should_admit_bot_message(AllowBots::All, false, &trusted, 99));
+        assert!(!should_admit_bot_message(
+            AllowBots::All,
+            false,
+            &trusted,
+            99
+        ));
     }
 
     // --- DM gating tests (#656) ---
@@ -6675,19 +7516,28 @@ mod tests {
 
     #[test]
     fn dedup_detects_existing_bot_warning() {
-        let msg = format!("{} (20/20). A human must reply.", BOT_TURN_LIMIT_WARNING_PREFIX);
+        let msg = format!(
+            "{} (20/20). A human must reply.",
+            BOT_TURN_LIMIT_WARNING_PREFIX
+        );
         assert!(turn_limit_warning_present(&[(true, &msg)]));
     }
 
     #[test]
     fn dedup_ignores_human_warning_text() {
-        let msg = format!("{} (20/20). A human must reply.", BOT_TURN_LIMIT_WARNING_PREFIX);
+        let msg = format!(
+            "{} (20/20). A human must reply.",
+            BOT_TURN_LIMIT_WARNING_PREFIX
+        );
         assert!(!turn_limit_warning_present(&[(false, &msg)]));
     }
 
     #[test]
     fn dedup_returns_false_when_no_warning() {
-        assert!(!turn_limit_warning_present(&[(true, "hello"), (false, "world")]));
+        assert!(!turn_limit_warning_present(&[
+            (true, "hello"),
+            (false, "world")
+        ]));
     }
 
     #[test]
@@ -6704,7 +7554,10 @@ mod tests {
     fn reaction_mentions_mode_always_rejected() {
         assert!(!should_process_reaction(
             AllowUsers::Mentions,
-            true, true, false, false,
+            true,
+            true,
+            false,
+            false,
         ));
     }
 
@@ -6716,7 +7569,8 @@ mod tests {
             AllowUsers::Involved,
             false, // is_thread
             false, // bot_involved (irrelevant for non-thread)
-            false, false,
+            false,
+            false,
         ));
     }
 
@@ -6728,7 +7582,8 @@ mod tests {
             AllowUsers::Involved,
             true,  // is_thread
             false, // bot_involved
-            false, false,
+            false,
+            false,
         ));
     }
 
@@ -6740,7 +7595,8 @@ mod tests {
             AllowUsers::Involved,
             true, // is_thread
             true, // bot_involved
-            false, false,
+            false,
+            false,
         ));
     }
 
@@ -6790,7 +7646,9 @@ mod tests {
         assert!(!should_process_reaction(
             AllowUsers::MultibotMentions,
             false, // is_thread
-            false, false, false,
+            false,
+            false,
+            false,
         ));
     }
 }
