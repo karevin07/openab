@@ -517,6 +517,13 @@ fn default_echo_transcript() -> bool {
 #[derive(Debug, Deserialize)]
 pub struct DiscordConfig {
     pub bot_token: String,
+    /// Allow administrators with Manage Channels to provision private project
+    /// channels through `/project`. Disabled by default.
+    #[serde(default)]
+    pub project_channels_enabled: bool,
+    /// Discord category ID under which `/project create` places channels.
+    /// Required when `project_channels_enabled` is true.
+    pub project_category_id: Option<String>,
     /// Explicit flag: true = allow all channels, false = check allowed_channels list.
     /// When not set, auto-detected: non-empty list → false, empty list → true.
     pub allow_all_channels: Option<bool>,
@@ -2538,6 +2545,37 @@ openab = "~/projects/openab"
                 .map(String::as_str),
             Some("@openab")
         );
+    }
+
+    #[test]
+    fn discord_project_channel_settings_are_opt_in() {
+        let defaults = parse_config_str(
+            r#"
+[discord]
+bot_token = "token"
+"#,
+            "test",
+        )
+        .expect("default discord settings should parse")
+        .discord
+        .unwrap();
+        assert!(!defaults.project_channels_enabled);
+        assert!(defaults.project_category_id.is_none());
+
+        let cfg = parse_config_str(
+            r#"
+[discord]
+bot_token = "token"
+project_channels_enabled = true
+project_category_id = "123456789"
+"#,
+            "test",
+        )
+        .expect("discord project settings should parse");
+
+        let discord = cfg.discord.unwrap();
+        assert!(discord.project_channels_enabled);
+        assert_eq!(discord.project_category_id.as_deref(), Some("123456789"));
     }
 
     #[test]

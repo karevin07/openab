@@ -6,23 +6,29 @@ use crate::config::{AllowBots, AllowUsers, SttConfig};
 use crate::dispatch::DispatchTarget;
 use crate::format;
 use crate::media;
+use crate::project_registry::{ProjectAccessTarget, ProjectBinding, ProjectRegistry};
 use crate::remind::{self, ReminderStore};
 use crate::trust::l3_gate_applies;
 use async_trait::async_trait;
 use serenity::builder::{
-    CreateActionRow, CreateAttachment, CreateButton, CreateCommand, CreateCommandOption,
-    CreateEmbed, CreateEmbedFooter, CreateInteractionResponse, CreateInteractionResponseFollowup,
-    CreateInteractionResponseMessage, CreateSelectMenu, CreateSelectMenuKind,
-    CreateSelectMenuOption, CreateThread, EditChannel, EditMessage, GetMessages,
+    CreateActionRow, CreateAttachment, CreateAutocompleteResponse, CreateButton, CreateChannel,
+    CreateCommand, CreateCommandOption, CreateEmbed, CreateEmbedFooter,
+    CreateInteractionResponse, CreateInteractionResponseFollowup, CreateInteractionResponseMessage,
+    CreateSelectMenu, CreateSelectMenuKind, CreateSelectMenuOption, CreateThread, EditChannel,
+    EditInteractionResponse, EditMessage, GetMessages,
 };
 use serenity::http::Http;
 use serenity::model::application::ButtonStyle;
 use serenity::model::application::{
     Command, CommandOptionType, ComponentInteractionDataKind, Interaction,
 };
-use serenity::model::channel::{AutoArchiveDuration, Message, MessageType, Reaction, ReactionType};
+use serenity::model::channel::{
+    AutoArchiveDuration, ChannelType, Message, MessageType, PermissionOverwrite,
+    PermissionOverwriteType, Reaction, ReactionType,
+};
 use serenity::model::gateway::Ready;
 use serenity::model::id::{ChannelId, MessageId, UserId};
+use serenity::model::permissions::Permissions;
 use serenity::prelude::*;
 use std::collections::{HashMap, HashSet};
 use std::sync::LazyLock;
@@ -176,6 +182,65 @@ fn format_session_status(
         .map(|path| workspace_display(path, aliases))
         .unwrap_or_else(|| "_Not assigned_".to_string());
     format!("🧵 **Session status**\nState: **{state}**\nWorkspace: {workspace}")
+}
+
+fn sanitize_project_channel_name(input: &str) -> String {
+    let mut name = String::new();
+    let mut previous_dash = false;
+    for ch in input.trim().to_lowercase().chars() {
+        if ch.is_alphanumeric() || ch == '_' {
+            name.push(ch);
+            previous_dash = false;
+        } else if !previous_dash && !name.is_empty() {
+            name.push('-');
+            previous_dash = true;
+        }
+    }
+    let mut name = name.trim_matches('-').chars().take(100).collect::<String>();
+    if name.is_empty() {
+        name = "project".into();
+    } else if name.chars().count() == 1 {
+        name.push_str("-project");
+    }
+    name
+}
+
+fn project_channel_access_permissions() -> Permissions {
+    Permissions::VIEW_CHANNEL
+        | Permissions::SEND_MESSAGES
+        | Permissions::READ_MESSAGE_HISTORY
+        | Permissions::ATTACH_FILES
+        | Permissions::EMBED_LINKS
+        | Permissions::ADD_REACTIONS
+        | Permissions::USE_APPLICATION_COMMANDS
+        | Permissions::CREATE_PUBLIC_THREADS
+        | Permissions::SEND_MESSAGES_IN_THREADS
+}
+
+fn project_workspace_choices(
+    aliases: &HashMap<String, String>,
+    used_aliases: &HashSet<String>,
+    query: &str,
+) -> Vec<(String, String)> {
+    let query = query.trim().trim_start_matches('@').to_lowercase();
+    let mut names: Vec<_> = aliases
+        .keys()
+        .filter(|alias| !used_aliases.contains(*alias))
+        .filter(|alias| query.is_empty() || alias.to_lowercase().contains(&query))
+        .filter(|alias| alias.chars().count() <= 100)
+        .cloned()
+        .collect();
+    names.sort();
+    names.truncate(SELECT_MENU_PAGE_SIZE);
+    names
+        .into_iter()
+        .map(|alias| (format!("@{alias}"), alias))
+        .collect()
+}
+
+fn is_unknown_discord_channel_error(error: &serenity::Error) -> bool {
+    let message = error.to_string().to_lowercase();
+    message.contains("unknown channel") || message.contains("code: 10003")
 }
 
 fn session_command_channel_allowed(
@@ -397,6 +462,12 @@ pub struct Handler {
     pub reminder_store: ReminderStore,
     /// Track scheduled reminder IDs to prevent duplicate scheduling on reconnect.
     pub scheduled_ids: tokio::sync::Mutex<std::collections::HashSet<String>>,
+    /// Whether administrators can create project channels through `/project`.
+    pub project_channels_enabled: bool,
+    /// Category under which new private project channels are created.
+    pub project_category_id: Option<u64>,
+    /// Runtime Discord channel-to-workspace bindings persisted across restarts.
+    pub project_registry: ProjectRegistry,
 }
 
 struct DiscordCommandScope {
@@ -405,6 +476,19 @@ struct DiscordCommandScope {
 }
 
 impl Handler {
+    fn effective_allowed_channels(&self) -> HashSet<u64> {
+        let mut channels = self.allowed_channels.clone();
+        let aliases = self.router.workspace_aliases();
+        channels.extend(
+            self.project_registry
+                .all()
+                .into_iter()
+                .filter(|binding| aliases.contains_key(&binding.workspace_alias))
+                .map(|binding| binding.channel_id),
+        );
+        channels
+    }
+
     /// Check if the bot has participated in a Discord thread, and whether
     /// other bots have also posted in it.
     /// Returns `(involved, other_bot_present)`.
@@ -486,6 +570,7 @@ impl Handler {
 impl EventHandler for Handler {
     async fn message(&self, ctx: Context, msg: Message) {
         let bot_id = ctx.cache.current_user().id;
+        let effective_allowed_channels = self.effective_allowed_channels();
 
         // Early multibot detection: cache that another bot is present.
         // Runs before self-check and bot gating so we always detect other bots. (#481)
@@ -537,7 +622,7 @@ impl EventHandler for Handler {
                         // Must match the full thread allowlist semantics: a thread is allowed
                         // if its own channel_id OR its parent_id is in allowed_channels.
                         let ch = msg.channel_id.get();
-                        let in_allowed_channel = self.allowed_channels.contains(&ch);
+                        let in_allowed_channel = effective_allowed_channels.contains(&ch);
                         let mut allowed_here = self.allow_all_channels || in_allowed_channel;
                         if !allowed_here {
                             // Reuse detect_thread() for thread allowlist semantics.
@@ -551,7 +636,7 @@ impl EventHandler for Handler {
                                     gc.parent_id.map(|id| id.get()),
                                     gc.owner_id.map(|id| id.get()),
                                     bot_id.get(),
-                                    &self.allowed_channels,
+                                    &effective_allowed_channels,
                                     self.allow_all_channels,
                                     in_allowed_channel,
                                 );
@@ -612,7 +697,7 @@ impl EventHandler for Handler {
 
         let channel_id = msg.channel_id.get();
         let in_allowed_channel =
-            self.allow_all_channels || self.allowed_channels.contains(&channel_id);
+            self.allow_all_channels || effective_allowed_channels.contains(&channel_id);
 
         let is_mentioned = msg.mentions_user_id(bot_id)
             || msg.content.contains(&format!("<@{}>", bot_id))
@@ -650,7 +735,7 @@ impl EventHandler for Handler {
                     parent_u64,
                     gc.owner_id.map(|id| id.get()),
                     bot_id.get(),
-                    &self.allowed_channels,
+                    &effective_allowed_channels,
                     self.allow_all_channels,
                     in_allowed_channel,
                 );
@@ -691,6 +776,12 @@ impl EventHandler for Handler {
         let in_ambient_context = self.ambient.as_ref().is_some_and(|ambient| {
             ambient.should_buffer(channel_id, is_structural_thread, bot_owns_thread, structural_parent_id)
         });
+        // Managed project channels are dedicated bot entrypoints: a human's
+        // top-level message starts a task without requiring an @mention. Once
+        // the task moves into a thread, the normal involved-thread rules apply.
+        let implicit_project_prompt = !msg.author.bot
+            && !is_structural_thread
+            && self.project_registry.contains_channel(channel_id);
 
         // --- Ambient early-route for bot messages ---
         // Bot messages in an ambient context that do NOT @mention this bot are
@@ -917,7 +1008,7 @@ impl EventHandler for Handler {
         // MultibotMentions: same as Involved, but if other bots are also
         //   in the thread, require @mention to avoid all bots responding.
         // DMs are treated as implicit @mention (mirrors Slack behavior).
-        if !is_mentioned && !is_dm {
+        if !is_mentioned && !is_dm && !implicit_project_prompt {
             match self.allow_user_messages {
                 AllowUsers::Mentions => return,
                 AllowUsers::Involved => {
@@ -1342,6 +1433,7 @@ impl EventHandler for Handler {
             .clone();
 
         let channel_id = reaction.channel_id;
+        let effective_allowed_channels = self.effective_allowed_channels();
 
         // AllowUsers::Mentions means reactions cannot trigger (no @mention possible).
         if self.allow_user_messages == AllowUsers::Mentions {
@@ -1352,8 +1444,8 @@ impl EventHandler for Handler {
         // Doing this before spawn so we have &self for bot_participated_in_thread
         // and can reject unallowed channels without any expensive API calls.
 
-        let in_allowed_channel =
-            self.allow_all_channels || self.allowed_channels.contains(&channel_id.get());
+        let in_allowed_channel = self.allow_all_channels
+            || effective_allowed_channels.contains(&channel_id.get());
 
         // F3 fix: Use detect_thread helper.
         let (thread_channel, is_thread) = match channel_id.to_channel(&ctx.http).await {
@@ -1365,7 +1457,7 @@ impl EventHandler for Handler {
                     parent,
                     gc.owner_id.map(|o| o.get()),
                     bot_id.get(),
-                    &self.allowed_channels,
+                    &effective_allowed_channels,
                     self.allow_all_channels,
                     in_allowed_channel,
                 );
@@ -1565,6 +1657,91 @@ impl EventHandler for Handler {
                     "close",
                     "Close this session and clear buffered messages",
                 )),
+            CreateCommand::new("project")
+                .description("Create and manage private workspace channels")
+                .default_member_permissions(Permissions::MANAGE_CHANNELS)
+                .add_option(
+                    CreateCommandOption::new(
+                        CommandOptionType::SubCommand,
+                        "create",
+                        "Create a private channel for a workspace",
+                    )
+                    .add_sub_option(
+                        CreateCommandOption::new(
+                            CommandOptionType::String,
+                            "workspace",
+                            "Workspace alias from /workspace list (for example: openab)",
+                        )
+                        .required(true)
+                        .set_autocomplete(true),
+                    )
+                    .add_sub_option(CreateCommandOption::new(
+                        CommandOptionType::String,
+                        "name",
+                        "Optional Discord channel name",
+                    ))
+                    .add_sub_option(CreateCommandOption::new(
+                        CommandOptionType::Role,
+                        "role",
+                        "Optional role that can access the private channel",
+                    )),
+                )
+                .add_option(CreateCommandOption::new(
+                    CommandOptionType::SubCommand,
+                    "list",
+                    "List project channels in this server",
+                ))
+                .add_option(CreateCommandOption::new(
+                    CommandOptionType::SubCommand,
+                    "status",
+                    "Show the project bound to this channel",
+                ))
+                .add_option(CreateCommandOption::new(
+                    CommandOptionType::SubCommand,
+                    "remove",
+                    "Unlink this channel without deleting it or the repository",
+                ))
+                .add_option(
+                    CreateCommandOption::new(
+                        CommandOptionType::SubCommandGroup,
+                        "access",
+                        "Manage users and roles that can access this project channel",
+                    )
+                    .add_sub_option(
+                        CreateCommandOption::new(
+                            CommandOptionType::SubCommand,
+                            "add",
+                            "Grant a user or role access to this project channel",
+                        )
+                        .add_sub_option(CreateCommandOption::new(
+                            CommandOptionType::User,
+                            "user",
+                            "User to grant access",
+                        ))
+                        .add_sub_option(CreateCommandOption::new(
+                            CommandOptionType::Role,
+                            "role",
+                            "Role to grant access",
+                        )),
+                    )
+                    .add_sub_option(
+                        CreateCommandOption::new(
+                            CommandOptionType::SubCommand,
+                            "remove",
+                            "Revoke a user or role from this project channel",
+                        )
+                        .add_sub_option(CreateCommandOption::new(
+                            CommandOptionType::User,
+                            "user",
+                            "User to revoke",
+                        ))
+                        .add_sub_option(CreateCommandOption::new(
+                            CommandOptionType::Role,
+                            "role",
+                            "Role to revoke",
+                        )),
+                    ),
+                ),
             CreateCommand::new("remind")
                 .description("Set a one-shot reminder to mention users/roles after a delay")
                 .add_option(CreateCommandOption::new(
@@ -1632,6 +1809,8 @@ impl EventHandler for Handler {
             }
         }
 
+        self.reconcile_project_channels(&ctx).await;
+
         // Re-schedule any pending reminders that survived a restart.
         let pending = self.reminder_store.pending().await;
         if !pending.is_empty() {
@@ -1651,6 +1830,9 @@ impl EventHandler for Handler {
 
     async fn interaction_create(&self, ctx: Context, interaction: Interaction) {
         match interaction {
+            Interaction::Autocomplete(cmd) if cmd.data.name == "project" => {
+                self.handle_project_autocomplete(&ctx, &cmd).await;
+            }
             Interaction::Command(cmd) if cmd.data.name == "models" => {
                 self.handle_config_command(&ctx, &cmd, "model", "model")
                     .await;
@@ -1673,6 +1855,9 @@ impl EventHandler for Handler {
             }
             Interaction::Command(cmd) if cmd.data.name == "session" => {
                 self.handle_session_command(&ctx, &cmd).await;
+            }
+            Interaction::Command(cmd) if cmd.data.name == "project" => {
+                self.handle_project_command(&ctx, &cmd).await;
             }
             Interaction::Command(cmd) if cmd.data.name == "remind" => {
                 self.handle_remind_command(&ctx, &cmd).await;
@@ -1700,6 +1885,552 @@ impl EventHandler for Handler {
 // --- Slash command & interaction handlers ---
 
 impl Handler {
+    async fn handle_project_autocomplete(
+        &self,
+        ctx: &Context,
+        cmd: &serenity::model::application::CommandInteraction,
+    ) {
+        let Some(focused) = cmd.data.autocomplete() else {
+            return;
+        };
+        if focused.name != "workspace" {
+            return;
+        }
+        let used_aliases: HashSet<_> = cmd
+            .guild_id
+            .map(|guild_id| {
+                self.project_registry
+                    .list_guild(guild_id.get())
+                    .into_iter()
+                    .map(|binding| binding.workspace_alias)
+                    .collect()
+            })
+            .unwrap_or_default();
+        let choices = project_workspace_choices(
+            &self.router.workspace_aliases(),
+            &used_aliases,
+            focused.value,
+        );
+        let response = choices.into_iter().fold(
+            CreateAutocompleteResponse::new(),
+            |response, (label, value)| response.add_string_choice(label, value),
+        );
+        if let Err(error) = cmd
+            .create_response(&ctx.http, CreateInteractionResponse::Autocomplete(response))
+            .await
+        {
+            tracing::warn!(%error, "failed to respond to project workspace autocomplete");
+        }
+    }
+
+    async fn reconcile_project_channels(&self, ctx: &Context) {
+        let aliases = self.router.workspace_aliases();
+        let mut active = 0usize;
+        let mut stale = 0usize;
+        let mut unavailable = 0usize;
+        let mut moved = 0usize;
+
+        for binding in self.project_registry.all() {
+            if !aliases.contains_key(&binding.workspace_alias) {
+                self.router
+                    .unbind_workspace_channel("discord", &binding.channel_id.to_string());
+                unavailable += 1;
+                tracing::warn!(
+                    channel_id = binding.channel_id,
+                    alias = %binding.workspace_alias,
+                    "project reconciliation: workspace alias unavailable; binding retained"
+                );
+                continue;
+            }
+
+            match ChannelId::new(binding.channel_id).to_channel(&ctx.http).await {
+                Ok(serenity::model::channel::Channel::Guild(channel))
+                    if channel.guild_id.get() == binding.guild_id
+                        && channel.kind == ChannelType::Text
+                        && channel.thread_metadata.is_none() =>
+                {
+                    self.router.bind_workspace_channel(
+                        "discord",
+                        &binding.channel_id.to_string(),
+                        &format!("@{}", binding.workspace_alias),
+                    );
+                    if self.project_category_id.is_some()
+                        && channel.parent_id.map(|id| id.get()) != self.project_category_id
+                    {
+                        moved += 1;
+                        tracing::warn!(
+                            channel_id = binding.channel_id,
+                            actual_category_id = ?channel.parent_id.map(|id| id.get()),
+                            expected_category_id = ?self.project_category_id,
+                            "project reconciliation: channel moved outside configured category"
+                        );
+                    }
+                    active += 1;
+                }
+                Ok(_) => {
+                    self.router
+                        .unbind_workspace_channel("discord", &binding.channel_id.to_string());
+                    match self
+                        .project_registry
+                        .remove(binding.guild_id, binding.channel_id)
+                    {
+                        Ok(Some(_)) => stale += 1,
+                        Ok(None) => {},
+                        Err(error) => tracing::error!(
+                            %error,
+                            channel_id = binding.channel_id,
+                            "project reconciliation: failed to prune invalid binding"
+                        ),
+                    }
+                }
+                Err(error) if is_unknown_discord_channel_error(&error) => {
+                    self.router
+                        .unbind_workspace_channel("discord", &binding.channel_id.to_string());
+                    match self
+                        .project_registry
+                        .remove(binding.guild_id, binding.channel_id)
+                    {
+                        Ok(Some(_)) => stale += 1,
+                        Ok(None) => {},
+                        Err(remove_error) => tracing::error!(
+                            error = %remove_error,
+                            channel_id = binding.channel_id,
+                            "project reconciliation: failed to prune deleted channel"
+                        ),
+                    }
+                }
+                Err(error) => {
+                    tracing::warn!(
+                        %error,
+                        channel_id = binding.channel_id,
+                        "project reconciliation: channel check failed; binding retained"
+                    );
+                }
+            }
+        }
+
+        info!(
+            active,
+            stale,
+            unavailable,
+            moved,
+            "project channel reconciliation completed"
+        );
+    }
+
+    async fn handle_project_command(
+        &self,
+        ctx: &Context,
+        cmd: &serenity::model::application::CommandInteraction,
+    ) {
+        if let Err(error) = cmd.defer_ephemeral(&ctx.http).await {
+            tracing::error!(%error, "failed to defer /project response");
+            return;
+        }
+
+        let content = self.run_project_command(ctx, cmd).await.unwrap_or_else(|error| {
+            tracing::warn!(%error, user_id = %cmd.user.id, "project command rejected");
+            format!("⚠️ {error}")
+        });
+        if let Err(error) = cmd
+            .edit_response(&ctx.http, EditInteractionResponse::new().content(content))
+            .await
+        {
+            tracing::error!(%error, "failed to edit /project response");
+        }
+    }
+
+    async fn run_project_command(
+        &self,
+        ctx: &Context,
+        cmd: &serenity::model::application::CommandInteraction,
+    ) -> Result<String, String> {
+        if !self.project_channels_enabled {
+            return Err("Project channel creation is disabled in OpenAB configuration.".into());
+        }
+        if cmd.user.bot {
+            return Err("Bots cannot manage project channels.".into());
+        }
+        if is_denied_user(
+            false,
+            self.allow_all_users,
+            &self.allowed_users,
+            cmd.user.id.get(),
+        ) {
+            return Err("You are not allowed to use this bot.".into());
+        }
+        let permissions = cmd
+            .member
+            .as_ref()
+            .and_then(|member| member.permissions)
+            .ok_or_else(|| "Run this command inside a Discord server.".to_string())?;
+        if !permissions.contains(Permissions::ADMINISTRATOR)
+            && !permissions.contains(Permissions::MANAGE_CHANNELS)
+        {
+            return Err("You need the Manage Channels permission to use this command.".into());
+        }
+        let guild_id = cmd
+            .guild_id
+            .ok_or_else(|| "Run this command inside a Discord server.".to_string())?;
+        let top = cmd
+            .data
+            .options
+            .first()
+            .ok_or_else(|| "Choose a project subcommand.".to_string())?;
+        let (action, options) = match &top.value {
+            serenity::model::application::CommandDataOptionValue::SubCommand(options) => {
+                (top.name.as_str(), options.as_slice())
+            }
+            serenity::model::application::CommandDataOptionValue::SubCommandGroup(group)
+                if top.name == "access" =>
+            {
+                let command = group
+                    .first()
+                    .ok_or_else(|| "Choose access add or remove.".to_string())?;
+                let options = match &command.value {
+                    serenity::model::application::CommandDataOptionValue::SubCommand(options) => {
+                        options.as_slice()
+                    }
+                    _ => return Err("Invalid project access subcommand.".into()),
+                };
+                let action = match command.name.as_str() {
+                    "add" => "access-add",
+                    "remove" => "access-remove",
+                    _ => return Err("Unknown project access subcommand.".into()),
+                };
+                (action, options)
+            }
+            _ => return Err("Invalid project subcommand.".into()),
+        };
+
+        match action {
+            "create" => {
+                let raw_alias = options
+                    .iter()
+                    .find(|option| option.name == "workspace")
+                    .and_then(|option| option.value.as_str())
+                    .ok_or_else(|| "A workspace alias is required.".to_string())?;
+                let alias = raw_alias.trim().trim_start_matches('@');
+                if alias.is_empty() {
+                    return Err("Workspace alias cannot be empty.".into());
+                }
+                let aliases = self.router.workspace_aliases();
+                if !aliases.contains_key(alias) {
+                    return Err(format!(
+                        "Unknown workspace {}. Use `/workspace list` to see available aliases.",
+                        inline_code(&format!("@{alias}"))
+                    ));
+                }
+                if let Some(existing) = self
+                    .project_registry
+                    .binding_for_alias(guild_id.get(), alias)
+                {
+                    return Err(format!(
+                        "Workspace {} already uses <#{}>.",
+                        inline_code(&format!("@{alias}")),
+                        existing.channel_id
+                    ));
+                }
+
+                let requested_name = options
+                    .iter()
+                    .find(|option| option.name == "name")
+                    .and_then(|option| option.value.as_str())
+                    .unwrap_or(alias);
+                let channel_name = sanitize_project_channel_name(requested_name);
+                let access_role_id = options
+                    .iter()
+                    .find(|option| option.name == "role")
+                    .and_then(|option| option.value.as_role_id());
+                let category_id = self.project_category_id.ok_or_else(|| {
+                    "Project category is missing from OpenAB configuration.".to_string()
+                })?;
+
+                let access = project_channel_access_permissions();
+                let mut overwrites = vec![
+                    PermissionOverwrite {
+                        allow: Permissions::empty(),
+                        deny: Permissions::VIEW_CHANNEL,
+                        kind: PermissionOverwriteType::Role(guild_id.everyone_role()),
+                    },
+                    PermissionOverwrite {
+                        allow: access,
+                        deny: Permissions::empty(),
+                        kind: PermissionOverwriteType::Member(cmd.user.id),
+                    },
+                    PermissionOverwrite {
+                        allow: access,
+                        deny: Permissions::empty(),
+                        kind: PermissionOverwriteType::Member(ctx.cache.current_user().id),
+                    },
+                ];
+                if let Some(role_id) = access_role_id {
+                    overwrites.push(PermissionOverwrite {
+                        allow: access,
+                        deny: Permissions::empty(),
+                        kind: PermissionOverwriteType::Role(role_id),
+                    });
+                }
+
+                let audit_reason = format!("OpenAB project channel for @{alias}");
+                let builder = CreateChannel::new(&channel_name)
+                    .category(ChannelId::new(category_id))
+                    .topic(format!("OpenAB project: @{alias}"))
+                    .permissions(overwrites)
+                    .audit_log_reason(&audit_reason);
+                let channel = guild_id
+                    .create_channel(&ctx.http, builder)
+                    .await
+                    .map_err(|error| {
+                        format!(
+                            "Could not create the Discord channel. Check the category ID and the bot's Manage Channels/Manage Roles permissions: {error}"
+                        )
+                    })?;
+
+                let binding = ProjectBinding {
+                    guild_id: guild_id.get(),
+                    channel_id: channel.id.get(),
+                    workspace_alias: alias.to_string(),
+                    created_by: cmd.user.id.get(),
+                    access_role_id: None,
+                    access_user_ids: Vec::new(),
+                    access_role_ids: access_role_id
+                        .map(|id| vec![id.get()])
+                        .unwrap_or_default(),
+                    created_at: chrono::Utc::now(),
+                };
+                if let Err(error) = self.project_registry.add(binding) {
+                    if let Err(delete_error) = channel.id.delete(&ctx.http).await {
+                        tracing::error!(%delete_error, channel_id = %channel.id, "failed to roll back unregistered project channel");
+                    }
+                    return Err(format!(
+                        "Could not save the project mapping; the new channel was rolled back: {error}"
+                    ));
+                }
+                self.router.bind_workspace_channel(
+                    "discord",
+                    &channel.id.to_string(),
+                    &format!("@{alias}"),
+                );
+
+                let role_note = access_role_id
+                    .map(|id| format!(" and <@&{}>", id.get()))
+                    .unwrap_or_default();
+                let welcome = format!(
+                    "🔒 **Private OpenAB project**\nWorkspace: {}\nAccess: <@{}>{role_note}\n\nSend a development request here. OpenAB will create a thread and keep its Cursor session isolated in this workspace.",
+                    inline_code(&format!("@{alias}")),
+                    cmd.user.id.get(),
+                );
+                if let Err(error) = channel.id.say(&ctx.http, welcome).await {
+                    tracing::warn!(%error, channel_id = %channel.id, "failed to send project welcome message");
+                }
+
+                Ok(format!(
+                    "✅ Created private project channel <#{}> for {}.",
+                    channel.id,
+                    inline_code(&format!("@{alias}"))
+                ))
+            }
+            "list" => {
+                let entries = self.project_registry.list_guild(guild_id.get());
+                if entries.is_empty() {
+                    return Ok("📁 No managed project channels in this server.".into());
+                }
+                let mut lines = vec!["📁 **Managed project channels**".to_string()];
+                lines.extend(entries.iter().map(|binding| {
+                    format!(
+                        "• <#{}> — {}",
+                        binding.channel_id,
+                        inline_code(&format!("@{}", binding.workspace_alias))
+                    )
+                }));
+                Ok(truncate_for_discord(&lines.join("\n"), 1900))
+            }
+            "status" | "remove" | "access-add" | "access-remove" => {
+                let channel = cmd
+                    .channel_id
+                    .to_channel(&ctx.http)
+                    .await
+                    .map_err(|error| format!("Could not inspect this channel: {error}"))?;
+                let project_channel_id = match channel {
+                    serenity::model::channel::Channel::Guild(channel)
+                        if channel.thread_metadata.is_some() =>
+                    {
+                        channel.parent_id.map(|id| id.get()).ok_or_else(|| {
+                            "This thread does not have a parent project channel.".to_string()
+                        })?
+                    }
+                    serenity::model::channel::Channel::Guild(_) => cmd.channel_id.get(),
+                    _ => return Err("Run this command in a server channel or thread.".into()),
+                };
+
+                if action == "status" {
+                    let binding = self
+                        .project_registry
+                        .binding_for_channel(project_channel_id)
+                        .ok_or_else(|| {
+                            "This channel is not managed by the project registry.".to_string()
+                        })?;
+                    let users = binding
+                        .access_user_ids
+                        .iter()
+                        .map(|id| format!("<@{id}>"))
+                        .collect::<Vec<_>>();
+                    let roles = binding
+                        .access_role_ids
+                        .iter()
+                        .map(|id| format!("<@&{id}>"))
+                        .collect::<Vec<_>>();
+                    let access = users
+                        .into_iter()
+                        .chain(roles)
+                        .collect::<Vec<_>>();
+                    let access = if access.is_empty() {
+                        "_Creator only_".to_string()
+                    } else {
+                        access.join(", ")
+                    };
+                    return Ok(truncate_for_discord(
+                        &format!(
+                            "📁 **Project status**\nChannel: <#{}>\nWorkspace: {}\nCreated by: <@{}>\nAdditional access: {access}",
+                            binding.channel_id,
+                            inline_code(&format!("@{}", binding.workspace_alias)),
+                            binding.created_by
+                        ),
+                        1900,
+                    ));
+                }
+
+                if action == "access-add" || action == "access-remove" {
+                    let binding = self
+                        .project_registry
+                        .binding_for_channel(project_channel_id)
+                        .filter(|binding| binding.guild_id == guild_id.get())
+                        .ok_or_else(|| {
+                            "This channel is not managed by the project registry.".to_string()
+                        })?;
+                    let user_id = options
+                        .iter()
+                        .find(|option| option.name == "user")
+                        .and_then(|option| option.value.as_user_id());
+                    let role_id = options
+                        .iter()
+                        .find(|option| option.name == "role")
+                        .and_then(|option| option.value.as_role_id());
+                    if user_id.is_some() == role_id.is_some() {
+                        return Err("Choose exactly one user or one role.".into());
+                    }
+
+                    let (target, overwrite_type, mention) = if let Some(user_id) = user_id {
+                        if user_id == ctx.cache.current_user().id {
+                            return Err("The OpenAB bot access entry cannot be changed.".into());
+                        }
+                        if action == "access-remove" && user_id.get() == binding.created_by {
+                            return Err("The project creator cannot be removed.".into());
+                        }
+                        (
+                            ProjectAccessTarget::User(user_id.get()),
+                            PermissionOverwriteType::Member(user_id),
+                            format!("<@{}>", user_id.get()),
+                        )
+                    } else {
+                        let role_id = role_id.unwrap();
+                        if role_id == guild_id.everyone_role() {
+                            return Err("The @everyone role cannot be changed.".into());
+                        }
+                        (
+                            ProjectAccessTarget::Role(role_id.get()),
+                            PermissionOverwriteType::Role(role_id),
+                            format!("<@&{}>", role_id.get()),
+                        )
+                    };
+                    let registered = match target {
+                        ProjectAccessTarget::User(id) => binding.access_user_ids.contains(&id),
+                        ProjectAccessTarget::Role(id) => binding.access_role_ids.contains(&id),
+                    };
+                    if action == "access-add" && registered {
+                        return Err(format!("{mention} already has registered project access."));
+                    }
+                    if action == "access-remove" && !registered {
+                        return Err(format!("{mention} is not in the project access list."));
+                    }
+
+                    if action == "access-add" {
+                        ChannelId::new(project_channel_id)
+                            .create_permission(
+                                &ctx.http,
+                                PermissionOverwrite {
+                                    allow: project_channel_access_permissions(),
+                                    deny: Permissions::empty(),
+                                    kind: overwrite_type,
+                                },
+                            )
+                            .await
+                            .map_err(|error| {
+                                format!("Could not grant Discord channel access: {error}")
+                            })?;
+                        if let Err(error) = self.project_registry.add_access(
+                            guild_id.get(),
+                            project_channel_id,
+                            target,
+                        ) {
+                            let _ = ChannelId::new(project_channel_id)
+                                .delete_permission(&ctx.http, overwrite_type)
+                                .await;
+                            return Err(format!("Could not save project access: {error}"));
+                        }
+                        return Ok(format!(
+                            "✅ Granted {mention} access to <#{project_channel_id}>."
+                        ));
+                    }
+
+                    ChannelId::new(project_channel_id)
+                        .delete_permission(&ctx.http, overwrite_type)
+                        .await
+                        .map_err(|error| {
+                            format!("Could not revoke Discord channel access: {error}")
+                        })?;
+                    if let Err(error) = self.project_registry.remove_access(
+                        guild_id.get(),
+                        project_channel_id,
+                        target,
+                    ) {
+                        let _ = ChannelId::new(project_channel_id)
+                            .create_permission(
+                                &ctx.http,
+                                PermissionOverwrite {
+                                    allow: project_channel_access_permissions(),
+                                    deny: Permissions::empty(),
+                                    kind: overwrite_type,
+                                },
+                            )
+                            .await;
+                        return Err(format!("Could not save project access: {error}"));
+                    }
+                    return Ok(format!(
+                        "✅ Revoked {mention} access from <#{project_channel_id}>."
+                    ));
+                }
+
+                let removed = self
+                    .project_registry
+                    .remove(guild_id.get(), project_channel_id)
+                    .map_err(|error| format!("Could not save the registry update: {error}"))?
+                    .ok_or_else(|| {
+                        "This channel is not managed by the project registry.".to_string()
+                    })?;
+                self.router
+                    .unbind_workspace_channel("discord", &project_channel_id.to_string());
+                Ok(format!(
+                    "✅ Unlinked <#{}> from {}. The Discord channel and repository were not deleted.",
+                    project_channel_id,
+                    inline_code(&format!("@{}", removed.workspace_alias))
+                ))
+            }
+            _ => Err("Unknown project subcommand.".into()),
+        }
+    }
+
     async fn resolve_command_scope(
         &self,
         ctx: &Context,
@@ -1718,6 +2449,7 @@ impl Handler {
         }
 
         let channel_id = cmd.channel_id;
+        let effective_allowed_channels = self.effective_allowed_channels();
         let parent_id = match channel_id.to_channel(&ctx.http).await {
             Ok(serenity::model::channel::Channel::Guild(channel)) => {
                 let parent_id = if channel.thread_metadata.is_some() {
@@ -1728,7 +2460,7 @@ impl Handler {
                 let allowed = session_command_channel_allowed(
                     channel_id.get(),
                     parent_id,
-                    &self.allowed_channels,
+                    &effective_allowed_channels,
                     self.allow_all_channels,
                 );
                 if !allowed {
@@ -2637,16 +3369,17 @@ impl Handler {
         }
 
         let channel_id = cmd.channel_id;
+        let effective_allowed_channels = self.effective_allowed_channels();
         let (export_allowed, export_name) = match channel_id.to_channel(&ctx.http).await {
             Ok(serenity::model::channel::Channel::Guild(gc)) => {
-                let in_allowed_channel =
-                    self.allow_all_channels || self.allowed_channels.contains(&channel_id.get());
+                let in_allowed_channel = self.allow_all_channels
+                    || effective_allowed_channels.contains(&channel_id.get());
                 let (in_thread, _) = detect_thread(
                     gc.thread_metadata.is_some(),
                     gc.parent_id.map(|id| id.get()),
                     gc.owner_id.map(|id| id.get()),
                     ctx.cache.current_user().id.get(),
-                    &self.allowed_channels,
+                    &effective_allowed_channels,
                     self.allow_all_channels,
                     in_allowed_channel,
                 );
@@ -3671,6 +4404,44 @@ mod tests {
             false
         ));
         assert!(session_command_channel_allowed(100, None, &allowed, true));
+    }
+
+    #[test]
+    fn project_channel_names_are_safe_and_bounded() {
+        assert_eq!(sanitize_project_channel_name(" OpenAB API "), "openab-api");
+        assert_eq!(sanitize_project_channel_name("///"), "project");
+        assert_eq!(sanitize_project_channel_name("x"), "x-project");
+        assert!(sanitize_project_channel_name(&"a".repeat(150)).chars().count() <= 100);
+    }
+
+    #[test]
+    fn project_channel_access_supports_thread_workflow() {
+        let permissions = project_channel_access_permissions();
+        assert!(permissions.contains(Permissions::VIEW_CHANNEL));
+        assert!(permissions.contains(Permissions::CREATE_PUBLIC_THREADS));
+        assert!(permissions.contains(Permissions::SEND_MESSAGES_IN_THREADS));
+    }
+
+    #[test]
+    fn project_workspace_autocomplete_filters_used_aliases_and_query() {
+        let aliases = HashMap::from([
+            ("api".to_string(), "/work/api".to_string()),
+            ("frontend".to_string(), "/work/frontend".to_string()),
+            ("example-library".to_string(), "/work/example-library".to_string()),
+        ]);
+        let used = HashSet::from(["api".to_string()]);
+
+        assert_eq!(
+            project_workspace_choices(&aliases, &used, "vault"),
+            vec![("@example-library".to_string(), "example-library".to_string())]
+        );
+        assert_eq!(
+            project_workspace_choices(&aliases, &used, ""),
+            vec![
+                ("@frontend".to_string(), "frontend".to_string()),
+                ("@example-library".to_string(), "example-library".to_string()),
+            ]
+        );
     }
 
     #[test]

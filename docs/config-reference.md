@@ -73,6 +73,8 @@ Discord adapter. Requires a Discord bot token.
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
 | `bot_token` | string | *required* | Discord bot token. Use `${DISCORD_BOT_TOKEN}` for env var. |
+| `project_channels_enabled` | bool | `false` | Enable administrator-only `/project` commands for private workspace channels. Existing persisted bindings remain routable when disabled. |
+| `project_category_id` | string \| omit | none | Discord category ID used by `/project create`. Required when project channels are enabled. |
 | `allow_all_channels` | bool \| omit | auto-detect | `true` = all channels; `false` = only `allowed_channels`. Omitted = inferred from list (non-empty → false, empty → true). |
 | `allowed_channels` | string[] | `[]` | Channel IDs to allow. Only checked when `allow_all_channels` resolves to false. |
 | `allow_all_users` | bool \| omit | auto-detect | `true` = any user; `false` = only `allowed_users`. Omitted = inferred from list. |
