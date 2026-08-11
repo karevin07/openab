@@ -14,8 +14,8 @@ use serenity::builder::{
     CreateActionRow, CreateAttachment, CreateAutocompleteResponse, CreateButton, CreateChannel,
     CreateCommand, CreateCommandOption, CreateEmbed, CreateEmbedFooter,
     CreateInteractionResponse, CreateInteractionResponseFollowup, CreateInteractionResponseMessage,
-    CreateSelectMenu, CreateSelectMenuKind, CreateSelectMenuOption, CreateThread, EditChannel,
-    EditInteractionResponse, EditMessage, GetMessages,
+    CreateMessage, CreateSelectMenu, CreateSelectMenuKind, CreateSelectMenuOption, CreateThread,
+    EditChannel, EditInteractionResponse, EditMessage, GetMessages,
 };
 use serenity::http::Http;
 use serenity::model::application::ButtonStyle;
@@ -166,22 +166,153 @@ fn format_workspace_list(
     truncate_for_discord(&lines.join("\n"), 1900)
 }
 
-fn format_session_status(
+fn session_state_presentation(
+    state: SessionState,
+    externally_detached: bool,
+) -> (&'static str, u32, &'static str) {
+    if externally_detached {
+        return (
+            "Detached to Cursor",
+            0x9B59B6,
+            "The host Cursor terminal owns this session. Finish or exit it before continuing in Discord.",
+        );
+    }
+    match state {
+        SessionState::Active => (
+            "Active",
+            0x2ECC71,
+            "Send another message to continue, or hand the session to Cursor on the host.",
+        ),
+        SessionState::Suspended => (
+            "Suspended",
+            0xF1C40F,
+            "Send a message to resume this saved session in Discord.",
+        ),
+        SessionState::Persisted => (
+            "Saved",
+            0x3498DB,
+            "The session is saved and will restore when you send the next message.",
+        ),
+        SessionState::None => (
+            "Not started",
+            0x95A5A6,
+            "Send your first development request in this thread to start a Cursor session.",
+        ),
+    }
+}
+
+fn session_control_message(
     snapshot: &SessionSnapshot,
-    aliases: &std::collections::HashMap<String, String>,
-) -> String {
-    let state = match snapshot.state {
-        SessionState::Active => "Active",
-        SessionState::Suspended => "Suspended",
-        SessionState::Persisted => "Persisted (awaiting restore)",
-        SessionState::None => "No session",
-    };
+    aliases: &HashMap<String, String>,
+    channel_id: u64,
+    note: Option<String>,
+) -> CreateInteractionResponseMessage {
+    let (state, colour, guidance) =
+        session_state_presentation(snapshot.state, snapshot.externally_detached);
     let workspace = snapshot
         .working_dir
         .as_deref()
         .map(|path| workspace_display(path, aliases))
         .unwrap_or_else(|| "_Not assigned_".to_string());
-    format!("🧵 **Session status**\nState: **{state}**\nWorkspace: {workspace}")
+    let embed = CreateEmbed::new()
+        .title("🧵 Session control")
+        .description(guidance)
+        .colour(colour)
+        .field("State", format!("**{state}**"), true)
+        .field("Workspace", workspace, true)
+        .field("Discord thread", inline_code(&channel_id.to_string()), false)
+        .footer(CreateEmbedFooter::new(
+            "One Discord thread maps to one Cursor session",
+        ));
+    let has_session = snapshot.state != SessionState::None;
+    let buttons = CreateActionRow::Buttons(vec![
+        CreateButton::new("oab_session:refresh")
+            .label("↻ Refresh")
+            .style(ButtonStyle::Secondary),
+        CreateButton::new("oab_session:cancel")
+            .label("■ Stop task")
+            .style(ButtonStyle::Secondary)
+            .disabled(snapshot.state != SessionState::Active || snapshot.externally_detached),
+        CreateButton::new("oab_session:detach")
+            .label("↗ Detach for Cursor")
+            .style(ButtonStyle::Primary)
+            .disabled(!has_session || snapshot.externally_detached),
+        CreateButton::new("oab_session:close")
+            .label("✕ Close session")
+            .style(ButtonStyle::Danger)
+            .disabled(!has_session),
+    ]);
+    let mut message = CreateInteractionResponseMessage::new()
+        .embed(embed)
+        .components(vec![buttons]);
+    if let Some(note) = note {
+        message = message.content(truncate_for_discord(&note, 1900));
+    }
+    message
+}
+
+fn project_access_display(binding: &ProjectBinding) -> String {
+    let additional = binding
+        .access_user_ids
+        .iter()
+        .map(|id| format!("<@{id}>"))
+        .chain(binding.access_role_ids.iter().map(|id| format!("<@&{id}>")))
+        .collect::<Vec<_>>();
+    let display = if additional.is_empty() {
+        format!("<@{}> (creator)", binding.created_by)
+    } else {
+        format!(
+            "<@{}> (creator), {}",
+            binding.created_by,
+            additional.join(", ")
+        )
+    };
+    truncate_for_discord(&display, 1000)
+}
+
+fn project_info_embed(binding: &ProjectBinding) -> CreateEmbed {
+    CreateEmbed::new()
+        .title(format!("📁 @{}", binding.workspace_alias))
+        .description(
+            "This channel is a project home. Each top-level development request creates an isolated Discord thread and Cursor session.",
+        )
+        .colour(0x5865F2)
+        .field(
+            "Workspace",
+            inline_code(&format!("@{}", binding.workspace_alias)),
+            true,
+        )
+        .field("Access", project_access_display(binding), false)
+        .footer(CreateEmbedFooter::new("Managed by OpenAB"))
+}
+
+fn project_welcome_message(binding: &ProjectBinding) -> CreateMessage {
+    let embed = project_info_embed(binding)
+        .field(
+            "1 · Start a task",
+            "Send a new message in this channel. Describe the outcome you want; OpenAB creates the thread automatically.",
+            false,
+        )
+        .field(
+            "2 · Continue",
+            "Reply inside the generated thread to keep the same context and workspace.",
+            false,
+        )
+        .field(
+            "3 · Control",
+            "Run `/session status` inside a thread for stop, Cursor handoff, and close controls.",
+            false,
+        );
+    CreateMessage::new().embed(embed).components(vec![
+        CreateActionRow::Buttons(vec![
+            CreateButton::new("oab_project:guide")
+                .label("▶ How to start")
+                .style(ButtonStyle::Primary),
+            CreateButton::new("oab_project:status")
+                .label("📁 Project info")
+                .style(ButtonStyle::Secondary),
+        ]),
+    ])
 }
 
 fn sanitize_project_channel_name(input: &str) -> String {
@@ -1628,6 +1759,8 @@ impl EventHandler for Handler {
             CreateCommand::new("cancel-all")
                 .description("Cancel current operation and drop all buffered messages"),
             CreateCommand::new("reset").description("Reset the conversation session"),
+            CreateCommand::new("help")
+                .description("Show the Discord and Cursor handoff quick guide"),
             CreateCommand::new("workspace")
                 .description("Inspect workspace routing for this channel or session")
                 .add_option(CreateCommandOption::new(
@@ -1695,6 +1828,11 @@ impl EventHandler for Handler {
                     CommandOptionType::SubCommand,
                     "status",
                     "Show the project bound to this channel",
+                ))
+                .add_option(CreateCommandOption::new(
+                    CommandOptionType::SubCommand,
+                    "home",
+                    "Post the interactive Project Home card in this channel",
                 ))
                 .add_option(CreateCommandOption::new(
                     CommandOptionType::SubCommand,
@@ -1850,6 +1988,9 @@ impl EventHandler for Handler {
             Interaction::Command(cmd) if cmd.data.name == "reset" => {
                 self.handle_reset_command(&ctx, &cmd).await;
             }
+            Interaction::Command(cmd) if cmd.data.name == "help" => {
+                self.handle_help_command(&ctx, &cmd).await;
+            }
             Interaction::Command(cmd) if cmd.data.name == "workspace" => {
                 self.handle_workspace_command(&ctx, &cmd).await;
             }
@@ -1871,6 +2012,16 @@ impl EventHandler for Handler {
             Interaction::Command(cmd) if cmd.data.name == "usage" => {
                 self.handle_usage_command(&ctx, &cmd).await;
             }
+            Interaction::Component(comp)
+                if comp.data.custom_id.starts_with("oab_session:") =>
+            {
+                self.handle_session_control(&ctx, &comp).await;
+            }
+            Interaction::Component(comp)
+                if comp.data.custom_id.starts_with("oab_project:") =>
+            {
+                self.handle_project_component(&ctx, &comp).await;
+            }
             Interaction::Component(comp) if comp.data.custom_id.starts_with("acp_config_") => {
                 self.handle_config_select(&ctx, &comp).await;
             }
@@ -1885,6 +2036,64 @@ impl EventHandler for Handler {
 // --- Slash command & interaction handlers ---
 
 impl Handler {
+    async fn handle_help_command(
+        &self,
+        ctx: &Context,
+        cmd: &serenity::model::application::CommandInteraction,
+    ) {
+        let scope = match self.resolve_command_scope(ctx, cmd).await {
+            Ok(scope) => scope,
+            Err(message) => {
+                let response = CreateInteractionResponse::Message(
+                    CreateInteractionResponseMessage::new()
+                        .content(message)
+                        .ephemeral(true),
+                );
+                let _ = cmd.create_response(&ctx.http, response).await;
+                return;
+            }
+        };
+        let resume_id = if scope.channel_ref.parent_id.is_some() {
+            cmd.channel_id.to_string()
+        } else {
+            "<THREAD_ID>".to_string()
+        };
+        let embed = CreateEmbed::new()
+            .title("🧭 OpenAB 使用指南")
+            .description(
+                "Project channel 對應一個 repository；每個 task thread 保留一個 Cursor session 與 context。",
+            )
+            .colour(0x5865F2)
+            .field(
+                "📱 在外面 · 用 Discord 開發",
+                "1. 進入 repository 的 project channel。\n2. 傳送新任務，OpenAB 會建立 thread。\n3. 持續在該 thread 回覆。\n4. 用 `/session status` 開啟控制面板。",
+                false,
+            )
+            .field(
+                "🖥️ 回到家 · 在 Cursor CLI 接續",
+                format!(
+                    "1. 在 task thread 開啟 `/session status`。\n2. 點選 **Detach for Cursor**。\n3. 在主機執行 `make session-resume THREAD_ID={resume_id}`。\n4. 正常離開 Cursor，再回同一 Discord thread 接續。"
+                ),
+                false,
+            )
+            .field(
+                "常用指令",
+                "`/project list` 列出專案頻道\n`/workspace status` 確認當前 repository\n`/session status` 開啟 session 控制面板\n`/cancel` 中止當前任務\n`/help` 顯示這份指南",
+                false,
+            )
+            .footer(CreateEmbedFooter::new(
+                "不要同時用 Discord 與 Cursor 操作同一個 session",
+            ));
+        let response = CreateInteractionResponse::Message(
+            CreateInteractionResponseMessage::new()
+                .embed(embed)
+                .ephemeral(true),
+        );
+        if let Err(error) = cmd.create_response(&ctx.http, response).await {
+            tracing::error!(%error, "failed to respond to /help command");
+        }
+    }
+
     async fn handle_project_autocomplete(
         &self,
         ctx: &Context,
@@ -2199,7 +2408,7 @@ impl Handler {
                         .unwrap_or_default(),
                     created_at: chrono::Utc::now(),
                 };
-                if let Err(error) = self.project_registry.add(binding) {
+                if let Err(error) = self.project_registry.add(binding.clone()) {
                     if let Err(delete_error) = channel.id.delete(&ctx.http).await {
                         tracing::error!(%delete_error, channel_id = %channel.id, "failed to roll back unregistered project channel");
                     }
@@ -2213,20 +2422,16 @@ impl Handler {
                     &format!("@{alias}"),
                 );
 
-                let role_note = access_role_id
-                    .map(|id| format!(" and <@&{}>", id.get()))
-                    .unwrap_or_default();
-                let welcome = format!(
-                    "🔒 **Private OpenAB project**\nWorkspace: {}\nAccess: <@{}>{role_note}\n\nSend a development request here. OpenAB will create a thread and keep its Cursor session isolated in this workspace.",
-                    inline_code(&format!("@{alias}")),
-                    cmd.user.id.get(),
-                );
-                if let Err(error) = channel.id.say(&ctx.http, welcome).await {
+                if let Err(error) = channel
+                    .id
+                    .send_message(&ctx.http, project_welcome_message(&binding))
+                    .await
+                {
                     tracing::warn!(%error, channel_id = %channel.id, "failed to send project welcome message");
                 }
 
                 Ok(format!(
-                    "✅ Created private project channel <#{}> for {}.",
+                    "✅ Created private project channel <#{}> for {}. Open it and send the first task to start a dedicated thread.",
                     channel.id,
                     inline_code(&format!("@{alias}"))
                 ))
@@ -2246,7 +2451,7 @@ impl Handler {
                 }));
                 Ok(truncate_for_discord(&lines.join("\n"), 1900))
             }
-            "status" | "remove" | "access-add" | "access-remove" => {
+            "status" | "home" | "remove" | "access-add" | "access-remove" => {
                 let channel = cmd
                     .channel_id
                     .to_channel(&ctx.http)
@@ -2263,6 +2468,23 @@ impl Handler {
                     serenity::model::channel::Channel::Guild(_) => cmd.channel_id.get(),
                     _ => return Err("Run this command in a server channel or thread.".into()),
                 };
+
+                if action == "home" {
+                    let binding = self
+                        .project_registry
+                        .binding_for_channel(project_channel_id)
+                        .filter(|binding| binding.guild_id == guild_id.get())
+                        .ok_or_else(|| {
+                            "This channel is not managed by the project registry.".to_string()
+                        })?;
+                    ChannelId::new(project_channel_id)
+                        .send_message(&ctx.http, project_welcome_message(&binding))
+                        .await
+                        .map_err(|error| format!("Could not post Project Home: {error}"))?;
+                    return Ok(format!(
+                        "✅ Posted Project Home in <#{project_channel_id}>."
+                    ));
+                }
 
                 if action == "status" {
                     let binding = self
@@ -2436,19 +2658,29 @@ impl Handler {
         ctx: &Context,
         cmd: &serenity::model::application::CommandInteraction,
     ) -> Result<DiscordCommandScope, String> {
-        if cmd.user.bot {
+        self.resolve_session_scope(ctx, cmd.user.id.get(), cmd.user.bot, cmd.channel_id)
+            .await
+    }
+
+    async fn resolve_session_scope(
+        &self,
+        ctx: &Context,
+        user_id: u64,
+        user_is_bot: bool,
+        channel_id: ChannelId,
+    ) -> Result<DiscordCommandScope, String> {
+        if user_is_bot {
             return Err("🤖 Bots cannot use session management commands.".to_string());
         }
         if is_denied_user(
             false,
             self.allow_all_users,
             &self.allowed_users,
-            cmd.user.id.get(),
+            user_id,
         ) {
             return Err("🚫 You are not allowed to use this bot.".to_string());
         }
 
-        let channel_id = cmd.channel_id;
         let effective_allowed_channels = self.effective_allowed_channels();
         let parent_id = match channel_id.to_channel(&ctx.http).await {
             Ok(serenity::model::channel::Channel::Guild(channel)) => {
@@ -2567,6 +2799,20 @@ impl Handler {
             .first()
             .map(|option| option.name.as_str())
             .unwrap_or("status");
+        if subcommand == "status" {
+            let snapshot = self.router.pool().session_snapshot(&scope.session_key).await;
+            let response = CreateInteractionResponse::Message(session_control_message(
+                &snapshot,
+                &self.router.workspace_aliases(),
+                cmd.channel_id.get(),
+                None,
+            ).ephemeral(true));
+            if let Err(error) = cmd.create_response(&ctx.http, response).await {
+                tracing::error!(%error, "failed to respond to /session status");
+            }
+            return;
+        }
+
         let content = if subcommand == "close" {
             let dropped = self
                 .dispatcher
@@ -2594,8 +2840,7 @@ impl Handler {
                 Err(error) => format!("⚠️ Could not detach session: {error}"),
             }
         } else {
-            let snapshot = self.router.pool().session_snapshot(&scope.session_key).await;
-            format_session_status(&snapshot, &self.router.workspace_aliases())
+            "⚠️ Unknown session command.".to_string()
         };
 
         let response = CreateInteractionResponse::Message(
@@ -2605,6 +2850,181 @@ impl Handler {
         );
         if let Err(error) = cmd.create_response(&ctx.http, response).await {
             tracing::error!(%error, "failed to respond to /session command");
+        }
+    }
+
+    async fn handle_session_control(
+        &self,
+        ctx: &Context,
+        comp: &serenity::model::application::ComponentInteraction,
+    ) {
+        let scope = match self
+            .resolve_session_scope(
+                ctx,
+                comp.user.id.get(),
+                comp.user.bot,
+                comp.channel_id,
+            )
+            .await
+        {
+            Ok(scope) => scope,
+            Err(message) => {
+                let response = CreateInteractionResponse::Message(
+                    CreateInteractionResponseMessage::new()
+                        .content(message)
+                        .ephemeral(true),
+                );
+                let _ = comp.create_response(&ctx.http, response).await;
+                return;
+            }
+        };
+        let action = comp
+            .data
+            .custom_id
+            .strip_prefix("oab_session:")
+            .unwrap_or("");
+
+        if action == "close" {
+            let confirmation = CreateInteractionResponseMessage::new()
+                .content(
+                    "⚠️ **Close this session?** This clears its saved conversation and buffered messages. The next message starts a new Cursor session.",
+                )
+                .components(vec![CreateActionRow::Buttons(vec![
+                    CreateButton::new("oab_session:confirm_close")
+                        .label("Close session")
+                        .style(ButtonStyle::Danger),
+                    CreateButton::new("oab_session:refresh")
+                        .label("Keep session")
+                        .style(ButtonStyle::Secondary),
+                ])])
+                .ephemeral(true);
+            if let Err(error) = comp
+                .create_response(
+                    &ctx.http,
+                    CreateInteractionResponse::Message(confirmation),
+                )
+                .await
+            {
+                tracing::error!(%error, "failed to show session close confirmation");
+            }
+            return;
+        }
+
+        let note = match action {
+            "refresh" => None,
+            "cancel" => Some(match self.router.pool().cancel_session(&scope.session_key).await {
+                Ok(()) => "🛑 Stop signal sent. The session remains available.".to_string(),
+                Err(error) => format!("⚠️ Could not stop the current task: {error}"),
+            }),
+            "detach" => Some(match self.router.pool().detach_session(&scope.session_key).await {
+                Ok(()) => format!(
+                    "✅ Ready for Cursor on the host. Run `make session-resume THREAD_ID={}`. Do not send Discord messages until the terminal UI exits.",
+                    comp.channel_id.get()
+                ),
+                Err(error) => format!("⚠️ Could not detach session: {error}"),
+            }),
+            "confirm_close" => {
+                let dropped = self.dispatcher.cancel_buffered_thread(
+                    "discord",
+                    &comp.channel_id.get().to_string(),
+                );
+                Some(match self.router.pool().reset_session(&scope.session_key).await {
+                    Ok(()) if dropped > 0 => format!(
+                        "✅ Session closed and {dropped} buffered message(s) dropped. Send a new message to start fresh."
+                    ),
+                    Ok(()) => {
+                        "✅ Session closed. Send a new message to start fresh.".to_string()
+                    }
+                    Err(_) if dropped > 0 => format!(
+                        "🧹 Dropped {dropped} buffered message(s). No session state was open."
+                    ),
+                    Err(_) => "⚠️ No session state was open.".to_string(),
+                })
+            }
+            _ => Some("⚠️ This session control is no longer available. Run `/session status` again.".to_string()),
+        };
+
+        let snapshot = self.router.pool().session_snapshot(&scope.session_key).await;
+        let message = session_control_message(
+            &snapshot,
+            &self.router.workspace_aliases(),
+            comp.channel_id.get(),
+            note,
+        );
+        if let Err(error) = comp
+            .create_response(
+                &ctx.http,
+                CreateInteractionResponse::UpdateMessage(message),
+            )
+            .await
+        {
+            tracing::error!(%error, action, "failed to update session control");
+        }
+    }
+
+    async fn handle_project_component(
+        &self,
+        ctx: &Context,
+        comp: &serenity::model::application::ComponentInteraction,
+    ) {
+        let content = if comp.user.bot {
+            Some("🤖 Bots cannot use project controls.".to_string())
+        } else if is_denied_user(
+            false,
+            self.allow_all_users,
+            &self.allowed_users,
+            comp.user.id.get(),
+        ) {
+            Some("🚫 You are not allowed to use this bot.".to_string())
+        } else {
+            None
+        };
+        if let Some(content) = content {
+            let response = CreateInteractionResponse::Message(
+                CreateInteractionResponseMessage::new()
+                    .content(content)
+                    .ephemeral(true),
+            );
+            let _ = comp.create_response(&ctx.http, response).await;
+            return;
+        }
+
+        let Some(binding) = self
+            .project_registry
+            .binding_for_channel(comp.channel_id.get())
+        else {
+            let response = CreateInteractionResponse::Message(
+                CreateInteractionResponseMessage::new()
+                    .content("⚠️ This channel is no longer linked to an OpenAB project.")
+                    .ephemeral(true),
+            );
+            let _ = comp.create_response(&ctx.http, response).await;
+            return;
+        };
+        let action = comp
+            .data
+            .custom_id
+            .strip_prefix("oab_project:")
+            .unwrap_or("");
+        let message = match action {
+            "guide" => CreateInteractionResponseMessage::new()
+                .content(format!(
+                    "💡 Send a new development request in <#{}>. OpenAB creates a dedicated thread automatically; keep replying in that thread to preserve context. Inside the thread, use `/session status` for controls.",
+                    binding.channel_id
+                ))
+                .ephemeral(true),
+            "status" => CreateInteractionResponseMessage::new()
+                .embed(project_info_embed(&binding))
+                .ephemeral(true),
+            _ => CreateInteractionResponseMessage::new()
+                .content("⚠️ This project control is no longer available.")
+                .ephemeral(true),
+        };
+        if let Err(error) = comp
+            .create_response(&ctx.http, CreateInteractionResponse::Message(message))
+            .await
+        {
+            tracing::error!(%error, action, "failed to respond to project control");
         }
     }
 
@@ -4453,6 +4873,7 @@ mod tests {
         let snapshot = SessionSnapshot {
             state: SessionState::Active,
             working_dir: Some("/projects/api".to_string()),
+            externally_detached: false,
         };
 
         let output = format_workspace_status(&snapshot, Some("@web"), &aliases);
@@ -4474,16 +4895,45 @@ mod tests {
     }
 
     #[test]
-    fn session_status_reports_lifecycle_and_workspace_alias() {
-        let aliases = HashMap::from([("api".to_string(), "/projects/api".to_string())]);
-        let snapshot = SessionSnapshot {
-            state: SessionState::Suspended,
-            working_dir: Some("/projects/api".to_string()),
+    fn session_states_have_distinct_control_panel_copy() {
+        assert_eq!(
+            session_state_presentation(SessionState::Active, false).0,
+            "Active"
+        );
+        assert_eq!(
+            session_state_presentation(SessionState::Suspended, false).0,
+            "Suspended"
+        );
+        assert_eq!(
+            session_state_presentation(SessionState::Persisted, false).0,
+            "Saved"
+        );
+        assert_eq!(
+            session_state_presentation(SessionState::None, false).0,
+            "Not started"
+        );
+        assert_eq!(
+            session_state_presentation(SessionState::Persisted, true).0,
+            "Detached to Cursor"
+        );
+    }
+
+    #[test]
+    fn project_access_display_includes_creator_users_and_roles() {
+        let binding = ProjectBinding {
+            guild_id: 1,
+            channel_id: 2,
+            workspace_alias: "api".to_string(),
+            created_by: 3,
+            access_role_id: None,
+            access_user_ids: vec![4],
+            access_role_ids: vec![5],
+            created_at: chrono::Utc::now(),
         };
 
         assert_eq!(
-            format_session_status(&snapshot, &aliases),
-            "🧵 **Session status**\nState: **Suspended**\nWorkspace: `@api` (`/projects/api`)"
+            project_access_display(&binding),
+            "<@3> (creator), <@4>, <@&5>"
         );
     }
 

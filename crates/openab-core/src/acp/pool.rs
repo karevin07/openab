@@ -84,6 +84,9 @@ pub enum SessionState {
 pub struct SessionSnapshot {
     pub state: SessionState,
     pub working_dir: Option<String>,
+    /// True while an external ACP client owns this session through the
+    /// handoff marker. Status UIs use this to prevent conflicting actions.
+    pub externally_detached: bool,
 }
 type ActiveSnapshot = Vec<(String, Arc<Mutex<AcpConnection>>)>;
 type EvictionCandidate = (String, Arc<Mutex<AcpConnection>>, Instant, Option<String>);
@@ -449,6 +452,7 @@ impl SessionPool {
         SessionSnapshot {
             state: lifecycle,
             working_dir,
+            externally_detached: self.handoff_marker_path(thread_id).is_file(),
         }
     }
 
