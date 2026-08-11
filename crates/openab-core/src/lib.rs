@@ -22,6 +22,8 @@ pub mod filestore;
 pub mod reactions;
 #[cfg(feature = "discord")]
 pub mod remind;
+#[cfg(feature = "discord")]
+pub mod project_registry;
 pub mod secrets;
 pub mod setup;
 pub mod stt;

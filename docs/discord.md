@@ -71,7 +71,29 @@ allowed_users = ["987654321"]         # user ID allowlist (empty = all)
 allow_bot_messages = "off"            # off | mentions | all
 allow_user_messages = "multibot-mentions"      # multibot-mentions | involved | mentions
 trusted_bot_ids = []                  # bot user IDs allowed through (empty = any)
+# project_channels_enabled = true     # enable /project create/list/status/remove
+# project_category_id = "123456789"  # category for private project channels
 ```
+
+### Private project channels
+
+With `project_channels_enabled = true`, members who have **Manage Channels** and pass
+`allowed_users` can run `/project create workspace:<alias>`. OpenAB creates a private text
+channel under `project_category_id`, grants access to the creator, the bot, and an optional role,
+then routes that channel to the selected workspace immediately. Top-level human messages in a
+managed project channel start a thread without requiring an @mention.
+The optional role controls channel visibility only; `allowed_users` still controls bot access.
+The workspace option provides autocomplete and omits aliases already assigned in the server.
+
+Run `/project access add user:<user>` or `/project access add role:<role>` inside a managed
+channel (or one of its threads) to grant access. Use the matching `remove` subcommand to revoke
+an entry. The creator and bot access entries are protected.
+
+Bindings persist in `~/.openab/discord-projects.json`. `/project remove` only unlinks the mapping;
+it does not delete the Discord channel or repository. The bot needs **Manage Channels** and
+**Manage Roles** to create the channel and its permission overwrites.
+On startup, OpenAB reconciles bindings with Discord: deleted or invalid channels are pruned,
+moved channels are retained with a warning, and transient API failures never delete mappings.
 
 ### `allowed_channels` / `allowed_users`
 

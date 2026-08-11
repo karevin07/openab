@@ -909,6 +909,33 @@ async fn main() -> anyhow::Result<()> {
         .with_trust(gateway_trust),
     );
 
+    #[cfg(feature = "discord")]
+    let project_registry = {
+        let path = std::env::var("HOME")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_default()
+            .join(".openab")
+            .join("discord-projects.json");
+        let registry = openab_core::project_registry::ProjectRegistry::load(path);
+        let aliases = router.workspace_aliases_map();
+        for binding in registry.all() {
+            if aliases.contains_key(&binding.workspace_alias) {
+                router.bind_workspace_channel(
+                    "discord",
+                    &binding.channel_id.to_string(),
+                    &format!("@{}", binding.workspace_alias),
+                );
+            } else {
+                warn!(
+                    channel_id = binding.channel_id,
+                    alias = %binding.workspace_alias,
+                    "project binding references an unavailable workspace alias"
+                );
+            }
+        }
+        registry
+    };
+
     // Shutdown signal for Slack adapter
     let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
 
@@ -1655,6 +1682,17 @@ async fn main() -> anyhow::Result<()> {
     // Run Discord adapter (foreground, blocking) or wait for ctrl_c
     #[cfg(feature = "discord")]
     if let Some(discord_cfg) = cfg.discord {
+        let project_category_id = discord_cfg
+            .project_category_id
+            .as_deref()
+            .map(str::parse::<u64>)
+            .transpose()
+            .map_err(|error| anyhow::anyhow!("invalid discord.project_category_id: {error}"))?;
+        if discord_cfg.project_channels_enabled && project_category_id.is_none() {
+            anyhow::bail!(
+                "discord.project_category_id is required when project_channels_enabled=true"
+            );
+        }
         let allow_all_channels = config::resolve_allow_all(
             discord_cfg.allow_all_channels,
             &discord_cfg.allowed_channels,
@@ -1681,6 +1719,8 @@ async fn main() -> anyhow::Result<()> {
             allow_bot_messages = ?discord_cfg.allow_bot_messages,
             allow_user_messages = ?discord_cfg.allow_user_messages,
             allow_dm = discord_cfg.allow_dm,
+            project_channels_enabled = discord_cfg.project_channels_enabled,
+            project_category_id,
             "starting discord adapter"
         );
 
@@ -1748,6 +1788,9 @@ async fn main() -> anyhow::Result<()> {
             ambient: ambient_dispatcher,
             reminder_store: reminder_store.clone(),
             scheduled_ids: tokio::sync::Mutex::new(std::collections::HashSet::new()),
+            project_channels_enabled: discord_cfg.project_channels_enabled,
+            project_category_id,
+            project_registry,
         };
 
         let intents = GatewayIntents::GUILD_MESSAGES

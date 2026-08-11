@@ -470,8 +470,9 @@ pub struct AdapterRouter {
     /// Workspace aliases from `[workspace.aliases]` config.
     workspace_aliases: std::collections::HashMap<String, String>,
     /// Per-platform channel-to-workspace bindings from `[workspace.channels.*]`.
-    workspace_channels:
+    workspace_channels: std::sync::RwLock<
         std::collections::HashMap<String, std::collections::HashMap<String, String>>,
+    >,
     /// Bot home directory used for `~` expansion.
     bot_home: std::path::PathBuf,
     /// Canonical security boundary for workspace paths.
@@ -511,7 +512,7 @@ impl AdapterRouter {
             prompt_hard_timeout: std::time::Duration::from_secs(prompt_hard_timeout_secs),
             liveness_check_interval: std::time::Duration::from_secs(liveness_check_secs),
             workspace_aliases: workspace.aliases,
-            workspace_channels: workspace.channels,
+            workspace_channels: std::sync::RwLock::new(workspace.channels),
             bot_home: workspace.bot_home,
             workspace_root: workspace.root,
             trust: crate::trust::PlatformTrustConfigs::default(),
@@ -570,9 +571,32 @@ impl AdapterRouter {
     pub fn channel_workspace_spec(&self, channel: &ChannelRef) -> Option<String> {
         let binding_id = workspace_binding_channel_id(channel);
         self.workspace_channels
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
             .get(&channel.platform)
             .and_then(|channels| channels.get(binding_id))
             .cloned()
+    }
+
+    /// Add or replace a runtime channel-to-workspace binding. Runtime bindings
+    /// are used by Discord project channels and take effect without restarting.
+    pub fn bind_workspace_channel(&self, platform: &str, channel_id: &str, workspace: &str) {
+        self.workspace_channels
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .entry(platform.to_string())
+            .or_default()
+            .insert(channel_id.to_string(), workspace.to_string());
+    }
+
+    /// Remove a runtime channel binding. Returns the workspace spec that was
+    /// previously assigned, if any.
+    pub fn unbind_workspace_channel(&self, platform: &str, channel_id: &str) -> Option<String> {
+        self.workspace_channels
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get_mut(platform)
+            .and_then(|channels| channels.remove(channel_id))
     }
 
     /// Pack one arrival event into ContentBlocks. Per-arrival layout:
