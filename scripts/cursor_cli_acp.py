@@ -3,6 +3,9 @@
 
 from __future__ import annotations
 
+import base64
+import binascii
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -12,7 +15,7 @@ import subprocess
 import sys
 import threading
 import time
-from typing import Any
+from typing import Any, NamedTuple
 
 
 CHAT_ID_RE = re.compile(
@@ -24,10 +27,31 @@ WRITE_LOCK = threading.Lock()
 ACTIVE_LOCK = threading.Lock()
 SESSIONS: dict[str, str] = {}
 ACTIVE: "ActivePrompt | None" = None
+MAX_IMAGE_BYTES = 10 * 1024 * 1024
+IMAGE_ROOT = Path(
+    os.environ.get(
+        "OPENAB_CURSOR_IMAGE_DIR",
+        str(Path.home() / ".openab" / "cursor-cli-images"),
+    )
+).expanduser()
+IMAGE_TYPES = {
+    "image/gif": (".gif", lambda data: data.startswith((b"GIF87a", b"GIF89a"))),
+    "image/jpeg": (".jpg", lambda data: data.startswith(b"\xff\xd8\xff")),
+    "image/png": (".png", lambda data: data.startswith(b"\x89PNG\r\n\x1a\n")),
+    "image/webp": (
+        ".webp",
+        lambda data: len(data) >= 12 and data[:4] == b"RIFF" and data[8:12] == b"WEBP",
+    ),
+}
 
 
 class BridgeError(RuntimeError):
     pass
+
+
+class PreparedPrompt(NamedTuple):
+    text: str
+    additional_dirs: tuple[str, ...]
 
 
 class ActivePrompt:
@@ -95,7 +119,9 @@ def validate_chat_id(raw: Any) -> str:
 
 def chat_directories(session_id: str) -> list[Path]:
     root = Path.home() / ".cursor" / "chats"
-    return [path.parent for path in root.glob(f"*/{session_id}/store.db") if path.is_file()]
+    return [
+        path.parent for path in root.glob(f"*/{session_id}/store.db") if path.is_file()
+    ]
 
 
 def verify_chat(session_id: str, cwd: str) -> None:
@@ -127,7 +153,11 @@ def create_chat(cwd: str) -> str:
             )
             candidates = [line.strip() for line in completed.stdout.splitlines()]
             session_id = next(
-                (candidate.lower() for candidate in candidates if CHAT_ID_RE.fullmatch(candidate)),
+                (
+                    candidate.lower()
+                    for candidate in candidates
+                    if CHAT_ID_RE.fullmatch(candidate)
+                ),
                 None,
             )
             if session_id is None:
@@ -142,10 +172,53 @@ def create_chat(cwd: str) -> str:
     raise BridgeError("Cursor CLI could not create a chat") from last_error
 
 
-def prompt_text(blocks: Any) -> str:
+def persist_image(
+    block: dict[str, Any], session_id: str, image_root: Path = IMAGE_ROOT
+) -> Path:
+    media_type = block.get("mimeType")
+    data = block.get("data")
+    if not isinstance(media_type, str) or media_type not in IMAGE_TYPES:
+        raise BridgeError("image prompt has an unsupported MIME type")
+    if not isinstance(data, str) or not data:
+        raise BridgeError("image prompt has no base64 data")
+    if len(data) > (MAX_IMAGE_BYTES * 4 // 3) + 8:
+        raise BridgeError("image prompt exceeds the 10 MB limit")
+    try:
+        raw = base64.b64decode(data, validate=True)
+    except (binascii.Error, ValueError) as exc:
+        raise BridgeError("image prompt contains invalid base64 data") from exc
+    if len(raw) > MAX_IMAGE_BYTES:
+        raise BridgeError("image prompt exceeds the 10 MB limit")
+
+    extension, has_valid_magic = IMAGE_TYPES[media_type]
+    if not has_valid_magic(raw):
+        raise BridgeError("image prompt content does not match its MIME type")
+
+    session_dir = image_root.resolve() / validate_chat_id(session_id)
+    session_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
+    session_dir.chmod(0o700)
+    digest = hashlib.sha256(raw).hexdigest()
+    image_path = session_dir / f"{digest}{extension}"
+    if not image_path.exists():
+        temporary_path = session_dir / (
+            f".{digest}.{os.getpid()}.{threading.get_ident()}.tmp"
+        )
+        try:
+            temporary_path.write_bytes(raw)
+            temporary_path.chmod(0o600)
+            os.replace(temporary_path, image_path)
+        finally:
+            temporary_path.unlink(missing_ok=True)
+    return image_path
+
+
+def prepare_prompt(
+    blocks: Any, session_id: str, image_root: Path = IMAGE_ROOT
+) -> PreparedPrompt:
     if not isinstance(blocks, list):
         raise BridgeError("prompt must be an array")
     parts: list[str] = []
+    additional_dirs: list[str] = []
     for block in blocks:
         if not isinstance(block, dict):
             continue
@@ -153,12 +226,25 @@ def prompt_text(blocks: Any) -> str:
             parts.append(block["text"])
         elif block.get("type") == "resource_link" and isinstance(block.get("uri"), str):
             parts.append(block["uri"])
+        elif block.get("type") == "image":
+            image_path = persist_image(block, session_id, image_root)
+            parts.append(
+                "[Attached image available as a local file]\n"
+                f"path: {image_path}\n"
+                f"media_type: {block.get('mimeType')}\n"
+                "Inspect this image as part of the user's request."
+            )
+            image_dir = str(image_path.parent)
+            if image_dir not in additional_dirs:
+                additional_dirs.append(image_dir)
         else:
-            raise BridgeError("this Cursor CLI bridge currently supports text prompts only")
+            raise BridgeError(
+                "this Cursor CLI bridge does not support this prompt content type"
+            )
     text = "\n".join(part for part in parts if part)
     if not text:
         raise BridgeError("prompt contains no text")
-    return text
+    return PreparedPrompt(text=text, additional_dirs=tuple(additional_dirs))
 
 
 def tool_title(value: Any) -> str:
@@ -170,11 +256,17 @@ def tool_title(value: Any) -> str:
     return str(value.get("name") or value.get("tool_name") or "Cursor tool")
 
 
-def emit_stream_event(session_id: str, event: dict[str, Any], state: dict[str, Any]) -> None:
+def emit_stream_event(
+    session_id: str, event: dict[str, Any], state: dict[str, Any]
+) -> None:
     event_type = event.get("type")
     if event_type == "assistant":
         message = event.get("message")
-        content = message.get("content") if isinstance(message, dict) else event.get("content")
+        content = (
+            message.get("content")
+            if isinstance(message, dict)
+            else event.get("content")
+        )
         if isinstance(content, str):
             content = [{"type": "text", "text": content}]
         if not isinstance(content, list):
@@ -230,7 +322,9 @@ def emit_stream_event(session_id: str, event: dict[str, Any], state: dict[str, A
             )
     elif event_type == "result":
         state["result_seen"] = True
-        state["is_error"] = bool(event.get("is_error")) or event.get("subtype") == "error"
+        state["is_error"] = (
+            bool(event.get("is_error")) or event.get("subtype") == "error"
+        )
         result = event.get("result")
         if not state["sent_text"] and isinstance(result, str) and result:
             state["sent_text"] = True
@@ -243,7 +337,28 @@ def emit_stream_event(session_id: str, event: dict[str, Any], state: dict[str, A
             )
 
 
-def run_prompt(active: ActivePrompt, cwd: str, text: str) -> None:
+def cursor_prompt_command(
+    active: ActivePrompt, cwd: str, prompt: PreparedPrompt
+) -> list[str]:
+    command = [CURSOR_AGENT, "--workspace", cwd]
+    for directory in prompt.additional_dirs:
+        command.extend(["--add-dir", directory])
+    command.extend(
+        [
+            "--resume",
+            active.session_id,
+            "--print",
+            "--force",
+            "--output-format",
+            "stream-json",
+            "--stream-partial-output",
+            prompt.text,
+        ]
+    )
+    return command
+
+
+def run_prompt(active: ActivePrompt, cwd: str, prompt: PreparedPrompt) -> None:
     global ACTIVE
     state: dict[str, Any] = {
         "sent_text": False,
@@ -251,19 +366,7 @@ def run_prompt(active: ActivePrompt, cwd: str, text: str) -> None:
         "result_seen": False,
         "is_error": False,
     }
-    command = [
-        CURSOR_AGENT,
-        "--workspace",
-        cwd,
-        "--resume",
-        active.session_id,
-        "--print",
-        "--force",
-        "--output-format",
-        "stream-json",
-        "--stream-partial-output",
-        text,
-    ]
+    command = cursor_prompt_command(active, cwd, prompt)
     try:
         process = subprocess.Popen(
             command,
@@ -312,11 +415,11 @@ def handle_request(message: dict[str, Any]) -> None:
                 request_id,
                 {
                     "protocolVersion": 1,
-                    "agentInfo": {"name": "cursor-cli-bridge", "version": "0.1.0"},
+                    "agentInfo": {"name": "cursor-cli-bridge", "version": "0.2.0"},
                     "agentCapabilities": {
                         "loadSession": True,
                         "promptCapabilities": {
-                            "image": False,
+                            "image": True,
                             "audio": False,
                             "embeddedContext": False,
                         },
@@ -340,13 +443,15 @@ def handle_request(message: dict[str, Any]) -> None:
             cwd = SESSIONS.get(session_id)
             if cwd is None:
                 raise BridgeError("session is not loaded")
-            text = prompt_text(params.get("prompt"))
+            prompt = prepare_prompt(params.get("prompt"), session_id)
             with ACTIVE_LOCK:
                 if ACTIVE is not None:
                     raise BridgeError("another Cursor prompt is already running")
                 ACTIVE = ActivePrompt(request_id, session_id)
                 active = ACTIVE
-            threading.Thread(target=run_prompt, args=(active, cwd, text), daemon=False).start()
+            threading.Thread(
+                target=run_prompt, args=(active, cwd, prompt), daemon=False
+            ).start()
         else:
             error(request_id, -32601, f"unsupported ACP method: {method}")
     except BridgeError as exc:
@@ -373,7 +478,11 @@ def main() -> int:
                 error(None, -32700, "invalid JSON")
                 continue
             if not isinstance(message, dict) or message.get("jsonrpc") != "2.0":
-                error(message.get("id") if isinstance(message, dict) else None, -32600, "invalid request")
+                error(
+                    message.get("id") if isinstance(message, dict) else None,
+                    -32600,
+                    "invalid request",
+                )
             elif "id" in message:
                 handle_request(message)
             else:

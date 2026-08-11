@@ -271,6 +271,11 @@ for the agent. Supported types (checked in order):
 
 Unsupported attachment types are silently ignored.
 
+The downstream agent must advertise image prompt support. The Cursor resume compatibility bridge
+stores validated image blocks under `~/.openab/cursor-cli-images/<chat-id>/`, grants the active
+Cursor process access only to that directory with `--add-dir`, and adds the local image path to the
+prompt. This preserves terminal resume support without writing attachments into the repository.
+
 ### Video attachments
 
 Video files are not downloaded or transcoded. The agent receives metadata and the
