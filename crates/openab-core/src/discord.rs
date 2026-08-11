@@ -172,31 +172,31 @@ fn session_state_presentation(
 ) -> (&'static str, u32, &'static str) {
     if externally_detached {
         return (
-            "Detached to Cursor",
+            "Cursor 接手中",
             0x9B59B6,
-            "The host Cursor terminal owns this session. Finish or exit it before continuing in Discord.",
+            "主機上的 Cursor terminal 正在使用這個 session；正常離開後再回 Discord 繼續。",
         );
     }
     match state {
         SessionState::Active => (
-            "Active",
+            "執行中",
             0x2ECC71,
-            "Send another message to continue, or hand the session to Cursor on the host.",
+            "Agent 正在處理任務；可停止目前工作，但不要同時從 Cursor 操作。",
         ),
         SessionState::Suspended => (
-            "Suspended",
+            "可在 Discord 接續",
             0xF1C40F,
-            "Send a message to resume this saved session in Discord.",
+            "Session context 已保存；在這個 thread 傳送下一則訊息即可接續。",
         ),
         SessionState::Persisted => (
-            "Saved",
+            "可在 Discord 接續",
             0x3498DB,
-            "The session is saved and will restore when you send the next message.",
+            "Session context 已保存；在這個 thread 傳送下一則訊息即可載入。",
         ),
         SessionState::None => (
-            "Not started",
+            "尚未開始",
             0x95A5A6,
-            "Send your first development request in this thread to start a Cursor session.",
+            "傳送第一個開發需求以建立 Cursor session，或 attach 一個本機 chat。",
         ),
     }
 }
@@ -215,14 +215,14 @@ fn session_control_message(
         .map(|path| workspace_display(path, aliases))
         .unwrap_or_else(|| "_Not assigned_".to_string());
     let embed = CreateEmbed::new()
-        .title("🧵 Session control")
+        .title("🧵 Session 狀態與控制")
         .description(guidance)
         .colour(colour)
-        .field("State", format!("**{state}**"), true)
+        .field("狀態", format!("**{state}**"), true)
         .field("Workspace", workspace, true)
         .field("Discord thread", inline_code(&channel_id.to_string()), false)
         .footer(CreateEmbedFooter::new(
-            "One Discord thread maps to one Cursor session",
+            "一個 Discord thread 對應一個 Cursor session",
         ));
     let has_session = snapshot.state != SessionState::None;
     let buttons = CreateActionRow::Buttons(vec![
@@ -230,15 +230,15 @@ fn session_control_message(
             .label("↻ Refresh")
             .style(ButtonStyle::Secondary),
         CreateButton::new("oab_session:cancel")
-            .label("■ Stop task")
+            .label("■ Stop")
             .style(ButtonStyle::Secondary)
             .disabled(snapshot.state != SessionState::Active || snapshot.externally_detached),
         CreateButton::new("oab_session:detach")
-            .label("↗ Detach for Cursor")
+            .label("↗ Prepare for Cursor")
             .style(ButtonStyle::Primary)
             .disabled(!has_session || snapshot.externally_detached),
         CreateButton::new("oab_session:close")
-            .label("✕ Close session")
+            .label("✕ Close")
             .style(ButtonStyle::Danger)
             .disabled(!has_session),
     ]);
@@ -290,34 +290,61 @@ fn project_welcome_message(binding: &ProjectBinding) -> CreateMessage {
     let embed = project_info_embed(binding)
         .field(
             "1 · Start a task",
-            "Send a new message in this channel. Describe the outcome you want; OpenAB creates the thread automatically.",
+            "Send a new message in this channel. OpenAB creates a dedicated thread and Cursor session.",
             false,
         )
         .field(
-            "2 · Continue",
-            "Reply inside the generated thread to keep the same context and workspace.",
+            "2 · Attach a local chat",
+            "Use the button below to select a recent exited Cursor chat from this repository.",
             false,
         )
         .field(
-            "3 · Control",
-            "Run `/session status` inside a thread for stop, Cursor handoff, and close controls.",
-            false,
-        )
-        .field(
-            "Already working locally?",
-            "Exit the Cursor terminal UI, then attach that chat here to continue it from Discord.",
+            "3 · Continue and control",
+            "Reply in the task thread to preserve context. Run `/session status` for lifecycle controls.",
             false,
         );
     CreateMessage::new().embed(embed).components(vec![
         CreateActionRow::Buttons(vec![
             CreateButton::new("oab_project:guide")
-                .label("▶ How to start")
+                .label("▶ New task guide")
                 .style(ButtonStyle::Primary),
+            CreateButton::new("oab_project:attach")
+                .label("📤 Attach local chat")
+                .style(ButtonStyle::Success),
             CreateButton::new("oab_project:status")
                 .label("📁 Project info")
                 .style(ButtonStyle::Secondary),
+        ]),
+    ])
+}
+
+fn project_welcome_edit(binding: &ProjectBinding) -> EditMessage {
+    let embed = project_info_embed(binding)
+        .field(
+            "1 · Start a task",
+            "Send a new message in this channel. OpenAB creates a dedicated thread and Cursor session.",
+            false,
+        )
+        .field(
+            "2 · Attach a local chat",
+            "Use the button below to select a recent exited Cursor chat from this repository.",
+            false,
+        )
+        .field(
+            "3 · Continue and control",
+            "Reply in the task thread to preserve context. Run `/session status` for lifecycle controls.",
+            false,
+        );
+    EditMessage::new().embed(embed).components(vec![
+        CreateActionRow::Buttons(vec![
+            CreateButton::new("oab_project:guide")
+                .label("▶ New task guide")
+                .style(ButtonStyle::Primary),
             CreateButton::new("oab_project:attach")
-                .label("📤 Attach Cursor chat")
+                .label("📤 Attach local chat")
+                .style(ButtonStyle::Success),
+            CreateButton::new("oab_project:status")
+                .label("📁 Project info")
                 .style(ButtonStyle::Secondary),
         ]),
     ])
@@ -338,6 +365,32 @@ fn modal_input_value<'a>(
             }
             _ => None,
         })
+}
+
+fn cursor_chat_choice_label(chat: &crate::cursor_session::CursorChatSummary) -> String {
+    let short_id = chat.session_id.get(..8).unwrap_or(&chat.session_id);
+    let updated = chrono::DateTime::<chrono::Utc>::from_timestamp_millis(chat.updated_at_ms as i64)
+        .map(|value| value.format("%m-%d %H:%M UTC").to_string())
+        .unwrap_or_else(|| "Unknown time".to_string());
+    format!("{updated} · {short_id}")
+}
+
+fn friendly_attach_error(error: &str) -> String {
+    if error.contains("invalid Cursor chat ID") {
+        "Chat ID 格式不正確，請從最近 chats 清單重新選擇。".into()
+    } else if error.contains("checkpoint was not found") {
+        "找不到這個 Cursor chat。請確認它建立於 openab-cursor，並執行 `make session-publish-list` 檢查。".into()
+    } else if error.contains("Cursor still owns this chat") {
+        "Cursor 仍在使用這個 chat。請先在 terminal UI 輸入 `/exit` 或按 Ctrl-D，再重新操作。".into()
+    } else if error.contains("belongs to") {
+        "這個 chat 屬於其他 repository，請回到正確的 Project Home。".into()
+    } else if error.contains("already attached") || error.contains("already has a session") {
+        "這個 chat 或 Discord thread 已經綁定 session，請選擇其他項目。".into()
+    } else if error.contains("workspace is unavailable") {
+        "Project workspace 目前無法存取，請檢查 repository mount 後重啟 OpenAB。".into()
+    } else {
+        error.to_string()
+    }
 }
 
 fn sanitize_project_channel_name(input: &str) -> String {
@@ -397,6 +450,11 @@ fn project_workspace_choices(
 fn is_unknown_discord_channel_error(error: &serenity::Error) -> bool {
     let message = error.to_string().to_lowercase();
     message.contains("unknown channel") || message.contains("code: 10003")
+}
+
+fn is_unknown_discord_message_error(error: &serenity::Error) -> bool {
+    let message = error.to_string().to_lowercase();
+    message.contains("unknown message") || message.contains("code: 10008")
 }
 
 fn session_command_channel_allowed(
@@ -491,6 +549,12 @@ impl ChatAdapter for DiscordAdapter {
         self.http
             .delete_message(ChannelId::new(ch_id), MessageId::new(msg_id), None)
             .await?;
+        Ok(())
+    }
+
+    async fn delete_channel(&self, channel: &ChannelRef) -> anyhow::Result<()> {
+        let channel_id: u64 = Self::resolve_channel(channel).parse()?;
+        ChannelId::new(channel_id).delete(&self.http).await?;
         Ok(())
     }
 
@@ -1815,9 +1879,10 @@ impl EventHandler for Handler {
                         CreateCommandOption::new(
                             CommandOptionType::String,
                             "chat_id",
-                            "Cursor chat UUID from `make session-publish-list`",
+                            "Select a recent exited Cursor chat from this project",
                         )
-                        .required(true),
+                        .required(true)
+                        .set_autocomplete(true),
                     )
                     .add_sub_option(CreateCommandOption::new(
                         CommandOptionType::String,
@@ -1877,7 +1942,7 @@ impl EventHandler for Handler {
                 .add_option(CreateCommandOption::new(
                     CommandOptionType::SubCommand,
                     "home",
-                    "Post the interactive Project Home card in this channel",
+                    "Create or update the interactive Project Home card",
                 ))
                 .add_option(CreateCommandOption::new(
                     CommandOptionType::SubCommand,
@@ -2016,6 +2081,9 @@ impl EventHandler for Handler {
             Interaction::Autocomplete(cmd) if cmd.data.name == "project" => {
                 self.handle_project_autocomplete(&ctx, &cmd).await;
             }
+            Interaction::Autocomplete(cmd) if cmd.data.name == "session" => {
+                self.handle_session_autocomplete(&ctx, &cmd).await;
+            }
             Interaction::Command(cmd) if cmd.data.name == "models" => {
                 self.handle_config_command(&ctx, &cmd, "model", "model")
                     .await;
@@ -2067,7 +2135,12 @@ impl EventHandler for Handler {
             {
                 self.handle_project_component(&ctx, &comp).await;
             }
-            Interaction::Modal(modal) if modal.data.custom_id == "oab_project_attach" => {
+            Interaction::Component(comp) if comp.data.custom_id == "oab_attach_chat" => {
+                self.handle_attach_chat_select(&ctx, &comp).await;
+            }
+            Interaction::Modal(modal)
+                if modal.data.custom_id.starts_with("oab_project_attach:") =>
+            {
                 self.handle_project_attach_modal(&ctx, &modal).await;
             }
             Interaction::Component(comp) if comp.data.custom_id.starts_with("acp_config_") => {
@@ -2120,13 +2193,13 @@ impl Handler {
             .field(
                 "🖥️ 回到家 · 在 Cursor CLI 接續",
                 format!(
-                    "1. 在 task thread 開啟 `/session status`。\n2. 點選 **Detach for Cursor**。\n3. 在主機執行 `make session-resume THREAD_ID={resume_id}`。\n4. 正常離開 Cursor，再回同一 Discord thread 接續。"
+                    "1. 在 task thread 開啟 `/session status`。\n2. 點選 **Prepare for Cursor**。\n3. 在主機執行 `make session-resume THREAD_ID={resume_id}`。\n4. 正常離開 Cursor，再回同一 Discord thread 接續。"
                 ),
                 false,
             )
             .field(
                 "📤 從電腦發佈既有 Cursor chat",
-                "1. 正常離開本機 Cursor terminal UI。\n2. 在 Project Home 點 **Attach Cursor chat**，或執行 `/session attach`。\n3. 貼上 chat ID；OpenAB 會建立或綁定 task thread。",
+                "1. 正常離開本機 Cursor terminal UI。\n2. 在 Project Home 點 **Attach local chat**，從最近清單選擇。\n3. 輸入 thread title；OpenAB 會建立或綁定 task thread。",
                 false,
             )
             .field(
@@ -2185,6 +2258,182 @@ impl Handler {
         }
     }
 
+    async fn project_binding_for_channel(
+        &self,
+        ctx: &Context,
+        channel_id: ChannelId,
+    ) -> Result<(ProjectBinding, bool), String> {
+        let channel = channel_id
+            .to_channel(&ctx.http)
+            .await
+            .map_err(|error| format!("Could not inspect this Discord channel: {error}"))?;
+        let serenity::model::channel::Channel::Guild(channel) = channel else {
+            return Err("請在 managed project channel 或其 task thread 使用這個功能。".into());
+        };
+        let is_thread = channel.thread_metadata.is_some();
+        let project_channel_id = if is_thread {
+            channel
+                .parent_id
+                .map(|id| id.get())
+                .ok_or_else(|| "這個 thread 沒有 parent project channel。".to_string())?
+        } else {
+            channel_id.get()
+        };
+        let binding = self
+            .project_registry
+            .binding_for_channel(project_channel_id)
+            .ok_or_else(|| {
+                "請在 managed project channel 或其 task thread 使用這個功能。".to_string()
+            })?;
+        Ok((binding, is_thread))
+    }
+
+    async fn available_cursor_chats(
+        &self,
+        binding: &ProjectBinding,
+        query: &str,
+    ) -> Result<Vec<crate::cursor_session::CursorChatSummary>, String> {
+        let workspace = self
+            .router
+            .workspace_aliases()
+            .get(&binding.workspace_alias)
+            .cloned()
+            .ok_or_else(|| "Project workspace 目前未設定。".to_string())?;
+        let query = query.trim().to_lowercase();
+        let chats = crate::cursor_session::list_cursor_chats_for_workspace(
+            std::path::Path::new(&workspace),
+        )
+        .map_err(|error| friendly_attach_error(&error.to_string()))?;
+        let mut available = Vec::new();
+        for chat in chats {
+            let label = cursor_chat_choice_label(&chat).to_lowercase();
+            if !query.is_empty()
+                && !chat.session_id.to_lowercase().contains(&query)
+                && !label.contains(&query)
+            {
+                continue;
+            }
+            let checkpoint = crate::cursor_session::CursorChatCheckpoint {
+                session_id: chat.session_id.clone(),
+                working_dir: chat.working_dir.clone(),
+            };
+            if crate::cursor_session::cursor_chat_is_running(&checkpoint) {
+                continue;
+            }
+            if self
+                .router
+                .pool()
+                .external_session_is_available(&chat.session_id)
+                .await
+            {
+                available.push(chat);
+                if available.len() == SELECT_MENU_PAGE_SIZE {
+                    break;
+                }
+            }
+        }
+        Ok(available)
+    }
+
+    async fn handle_session_autocomplete(
+        &self,
+        ctx: &Context,
+        cmd: &serenity::model::application::CommandInteraction,
+    ) {
+        let query = cmd
+            .data
+            .autocomplete()
+            .filter(|focused| focused.name == "chat_id")
+            .map(|focused| focused.value)
+            .unwrap_or("");
+        let chats = match self.project_binding_for_channel(ctx, cmd.channel_id).await {
+            Ok((binding, _)) => self
+                .available_cursor_chats(&binding, query)
+                .await
+                .unwrap_or_default(),
+            Err(_) => Vec::new(),
+        };
+        let response = chats.into_iter().fold(
+            CreateAutocompleteResponse::new(),
+            |response, chat| {
+                response.add_string_choice(cursor_chat_choice_label(&chat), chat.session_id)
+            },
+        );
+        if let Err(error) = cmd
+            .create_response(&ctx.http, CreateInteractionResponse::Autocomplete(response))
+            .await
+        {
+            tracing::warn!(%error, "failed to respond to session attach autocomplete");
+        }
+    }
+
+    async fn upsert_project_home(
+        &self,
+        ctx: &Context,
+        binding: &ProjectBinding,
+    ) -> Result<bool, String> {
+        let channel_id = ChannelId::new(binding.channel_id);
+        let mut home_message_id = binding.home_message_id;
+        if home_message_id.is_none() {
+            let expected_title = format!("📁 @{}", binding.workspace_alias);
+            let messages = channel_id
+                .messages(&ctx.http, GetMessages::new().limit(100))
+                .await
+                .map_err(|error| format!("Could not inspect existing Project Home: {error}"))?;
+            home_message_id = messages
+                .iter()
+                .find(|message| {
+                    message.author.id == ctx.cache.current_user().id
+                        && message
+                            .embeds
+                            .iter()
+                            .any(|embed| embed.title.as_deref() == Some(expected_title.as_str()))
+                })
+                .map(|message| message.id.get());
+        }
+        if let Some(message_id) = home_message_id {
+            match channel_id
+                .edit_message(
+                    &ctx.http,
+                    MessageId::new(message_id),
+                    project_welcome_edit(binding),
+                )
+                .await
+            {
+                Ok(_) => {
+                    if binding.home_message_id != Some(message_id) {
+                        self.project_registry
+                            .set_home_message_id(
+                                binding.guild_id,
+                                binding.channel_id,
+                                message_id,
+                            )
+                            .map_err(|error| {
+                                format!("Could not save Project Home message: {error}")
+                            })?;
+                    }
+                    return Ok(false);
+                }
+                Err(error) if is_unknown_discord_message_error(&error) => {},
+                Err(error) => return Err(format!("Could not update Project Home: {error}")),
+            }
+        }
+
+        let message = channel_id
+            .send_message(&ctx.http, project_welcome_message(binding))
+            .await
+            .map_err(|error| format!("Could not post Project Home: {error}"))?;
+        if let Err(error) = self.project_registry.set_home_message_id(
+            binding.guild_id,
+            binding.channel_id,
+            message.id.get(),
+        ) {
+            let _ = message.delete(&ctx.http).await;
+            return Err(format!("Could not save Project Home message: {error}"));
+        }
+        Ok(true)
+    }
+
     async fn reconcile_project_channels(&self, ctx: &Context) {
         let aliases = self.router.workspace_aliases();
         let mut active = 0usize;
@@ -2225,6 +2474,13 @@ impl Handler {
                             actual_category_id = ?channel.parent_id.map(|id| id.get()),
                             expected_category_id = ?self.project_category_id,
                             "project reconciliation: channel moved outside configured category"
+                        );
+                    }
+                    if let Err(error) = self.upsert_project_home(ctx, &binding).await {
+                        tracing::warn!(
+                            %error,
+                            channel_id = binding.channel_id,
+                            "project reconciliation: Project Home update failed"
                         );
                     }
                     active += 1;
@@ -2459,6 +2715,7 @@ impl Handler {
                     access_role_ids: access_role_id
                         .map(|id| vec![id.get()])
                         .unwrap_or_default(),
+                    home_message_id: None,
                     created_at: chrono::Utc::now(),
                 };
                 if let Err(error) = self.project_registry.add(binding.clone()) {
@@ -2475,12 +2732,8 @@ impl Handler {
                     &format!("@{alias}"),
                 );
 
-                if let Err(error) = channel
-                    .id
-                    .send_message(&ctx.http, project_welcome_message(&binding))
-                    .await
-                {
-                    tracing::warn!(%error, channel_id = %channel.id, "failed to send project welcome message");
+                if let Err(error) = self.upsert_project_home(ctx, &binding).await {
+                    tracing::warn!(%error, channel_id = %channel.id, "failed to upsert Project Home");
                 }
 
                 Ok(format!(
@@ -2530,12 +2783,10 @@ impl Handler {
                         .ok_or_else(|| {
                             "This channel is not managed by the project registry.".to_string()
                         })?;
-                    ChannelId::new(project_channel_id)
-                        .send_message(&ctx.http, project_welcome_message(&binding))
-                        .await
-                        .map_err(|error| format!("Could not post Project Home: {error}"))?;
+                    let created = self.upsert_project_home(ctx, &binding).await?;
                     return Ok(format!(
-                        "✅ Posted Project Home in <#{project_channel_id}>."
+                        "✅ {} Project Home in <#{project_channel_id}>.",
+                        if created { "Posted" } else { "Updated" }
                     ));
                 }
 
@@ -2644,15 +2895,21 @@ impl Handler {
                             .map_err(|error| {
                                 format!("Could not grant Discord channel access: {error}")
                             })?;
-                        if let Err(error) = self.project_registry.add_access(
+                        let updated = match self.project_registry.add_access(
                             guild_id.get(),
                             project_channel_id,
                             target,
                         ) {
-                            let _ = ChannelId::new(project_channel_id)
-                                .delete_permission(&ctx.http, overwrite_type)
-                                .await;
-                            return Err(format!("Could not save project access: {error}"));
+                            Ok(updated) => updated,
+                            Err(error) => {
+                                let _ = ChannelId::new(project_channel_id)
+                                    .delete_permission(&ctx.http, overwrite_type)
+                                    .await;
+                                return Err(format!("Could not save project access: {error}"));
+                            }
+                        };
+                        if let Err(error) = self.upsert_project_home(ctx, &updated).await {
+                            tracing::warn!(%error, project_channel_id, "failed to refresh Project Home access");
                         }
                         return Ok(format!(
                             "✅ Granted {mention} access to <#{project_channel_id}>."
@@ -2665,22 +2922,28 @@ impl Handler {
                         .map_err(|error| {
                             format!("Could not revoke Discord channel access: {error}")
                         })?;
-                    if let Err(error) = self.project_registry.remove_access(
+                    let updated = match self.project_registry.remove_access(
                         guild_id.get(),
                         project_channel_id,
                         target,
                     ) {
-                        let _ = ChannelId::new(project_channel_id)
-                            .create_permission(
-                                &ctx.http,
-                                PermissionOverwrite {
-                                    allow: project_channel_access_permissions(),
-                                    deny: Permissions::empty(),
-                                    kind: overwrite_type,
-                                },
-                            )
-                            .await;
-                        return Err(format!("Could not save project access: {error}"));
+                        Ok(updated) => updated,
+                        Err(error) => {
+                            let _ = ChannelId::new(project_channel_id)
+                                .create_permission(
+                                    &ctx.http,
+                                    PermissionOverwrite {
+                                        allow: project_channel_access_permissions(),
+                                        deny: Permissions::empty(),
+                                        kind: overwrite_type,
+                                    },
+                                )
+                                .await;
+                            return Err(format!("Could not save project access: {error}"));
+                        }
+                    };
+                    if let Err(error) = self.upsert_project_home(ctx, &updated).await {
+                        tracing::warn!(%error, project_channel_id, "failed to refresh Project Home access");
                     }
                     return Ok(format!(
                         "✅ Revoked {mention} access from <#{project_channel_id}>."
@@ -2835,32 +3098,16 @@ impl Handler {
         chat_id: &str,
         title: &str,
     ) -> Result<String, String> {
-        let channel = channel_id
-            .to_channel(&ctx.http)
-            .await
-            .map_err(|error| format!("Could not inspect this Discord channel: {error}"))?;
-        let serenity::model::channel::Channel::Guild(channel) = channel else {
-            return Err("Attach a Cursor chat inside a managed project channel or thread.".into());
-        };
-        let parent_id = channel
-            .thread_metadata
-            .as_ref()
-            .and_then(|_| channel.parent_id.map(|id| id.get()));
-        let project_channel_id = parent_id.unwrap_or(channel_id.get());
-        let binding = self
-            .project_registry
-            .binding_for_channel(project_channel_id)
-            .ok_or_else(|| {
-                "Attach a Cursor chat inside a managed project channel or thread.".to_string()
-            })?;
+        let (binding, is_thread) = self.project_binding_for_channel(ctx, channel_id).await?;
+        let project_channel_id = binding.channel_id;
         let workspace = self
             .router
             .workspace_aliases()
             .get(&binding.workspace_alias)
             .cloned()
-            .ok_or_else(|| "The project workspace is no longer configured.".to_string())?;
+            .ok_or_else(|| "Project workspace 目前未設定。".to_string())?;
 
-        if parent_id.is_some() {
+        if is_thread {
             let checkpoint = crate::cursor_session::attach_cursor_chat(
                 self.router.pool().as_ref(),
                 chat_id,
@@ -2868,7 +3115,7 @@ impl Handler {
                 &channel_id.get().to_string(),
             )
             .await
-            .map_err(|error| error.to_string())?;
+            .map_err(|error| friendly_attach_error(&error.to_string()))?;
             let adapter = self
                 .adapter
                 .get_or_init(|| Arc::new(DiscordAdapter::new(ctx.http.clone())))
@@ -2880,7 +3127,7 @@ impl Handler {
                 parent_id: Some(project_channel_id.to_string()),
                 origin_event_id: None,
             };
-            adapter
+            if let Err(error) = adapter
                 .send_message(
                     &thread,
                     &format!(
@@ -2889,10 +3136,12 @@ impl Handler {
                     ),
                 )
                 .await
-                .map_err(|error| format!("Session attached, but confirmation failed: {error}"))?;
+            {
+                tracing::warn!(%error, %channel_id, "session attached but confirmation failed");
+            }
             return Ok(format!(
-                "✅ Cursor chat `{}` is now attached to <#{}>.",
-                checkpoint.session_id,
+                "✅ Cursor chat `{}` 已綁定到 <#{}>，請在該 thread 傳送下一則訊息繼續。",
+                checkpoint.session_id.get(..8).unwrap_or(&checkpoint.session_id),
                 channel_id.get()
             ));
         }
@@ -2910,9 +3159,9 @@ impl Handler {
             title,
         )
         .await
-        .map_err(|error| error.to_string())?;
+        .map_err(|error| friendly_attach_error(&error.to_string()))?;
         Ok(format!(
-            "✅ Cursor chat published to <#{}>. Continue there.",
+            "✅ Cursor chat 已發佈到 <#{}>，請到該 thread 繼續。",
             thread.channel_id
         ))
     }
@@ -2963,7 +3212,7 @@ impl Handler {
             let content = self
                 .attach_cursor_chat_request(ctx, cmd.channel_id, chat_id, title)
                 .await
-                .unwrap_or_else(|error| format!("⚠️ Could not attach Cursor chat: {error}"));
+                .unwrap_or_else(|error| format!("⚠️ 無法 attach Cursor chat：{error}"));
             if let Err(error) = cmd
                 .edit_response(&ctx.http, EditInteractionResponse::new().content(content))
                 .await
@@ -3180,28 +3429,54 @@ impl Handler {
             .strip_prefix("oab_project:")
             .unwrap_or("");
         if action == "attach" {
-            let modal = CreateModal::new("oab_project_attach", "Attach Cursor chat").components(
-                vec![
-                    CreateActionRow::InputText(
-                        CreateInputText::new(InputTextStyle::Short, "Cursor chat ID", "chat_id")
-                            .placeholder("xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx")
-                            .min_length(36)
-                            .max_length(36),
-                    ),
-                    CreateActionRow::InputText(
-                        CreateInputText::new(InputTextStyle::Short, "Thread title", "title")
-                            .placeholder("Cursor handoff")
-                            .max_length(100)
-                            .required(false),
-                    ),
-                ],
-            );
-            if let Err(error) = comp
-                .create_response(&ctx.http, CreateInteractionResponse::Modal(modal))
-                .await
-            {
-                tracing::error!(%error, "failed to open Cursor attach modal");
+            let chats = match self.available_cursor_chats(&binding, "").await {
+                Ok(chats) => chats,
+                Err(error) => {
+                    let response = CreateInteractionResponse::Message(
+                        CreateInteractionResponseMessage::new()
+                            .content(format!("⚠️ {error}"))
+                            .ephemeral(true),
+                    );
+                    let _ = comp.create_response(&ctx.http, response).await;
+                    return;
+                }
+            };
+            if chats.is_empty() {
+                let response = CreateInteractionResponse::Message(
+                    CreateInteractionResponseMessage::new()
+                        .content(
+                            "📤 這個 repository 沒有可接續的本機 chat。請先正常離開 Cursor UI；可在主機執行 `make session-publish-list` 檢查。",
+                        )
+                        .ephemeral(true),
+                );
+                let _ = comp.create_response(&ctx.http, response).await;
+                return;
             }
+            let options = chats
+                .into_iter()
+                .map(|chat| {
+                    CreateSelectMenuOption::new(
+                        cursor_chat_choice_label(&chat),
+                        chat.session_id.clone(),
+                    )
+                    .description(format!("Cursor chat {}", chat.session_id))
+                })
+                .collect();
+            let select = CreateSelectMenu::new(
+                "oab_attach_chat",
+                CreateSelectMenuKind::String { options },
+            )
+            .placeholder("選擇最近的 Cursor chat");
+            let response = CreateInteractionResponse::Message(
+                CreateInteractionResponseMessage::new()
+                    .content(format!(
+                        "📤 **Attach local chat to @{}**\n只顯示這個 repository 尚未綁定 Discord 的 chats。",
+                        binding.workspace_alias
+                    ))
+                    .components(vec![CreateActionRow::SelectMenu(select)])
+                    .ephemeral(true),
+            );
+            let _ = comp.create_response(&ctx.http, response).await;
             return;
         }
         let message = match action {
@@ -3247,7 +3522,11 @@ impl Handler {
             let _ = modal.create_response(&ctx.http, response).await;
             return;
         }
-        let chat_id = modal_input_value(modal, "chat_id").unwrap_or("");
+        let chat_id = modal
+            .data
+            .custom_id
+            .strip_prefix("oab_project_attach:")
+            .unwrap_or("");
         let title = modal_input_value(modal, "title")
             .filter(|value| !value.trim().is_empty())
             .unwrap_or("Cursor handoff");
@@ -3258,12 +3537,76 @@ impl Handler {
         let content = self
             .attach_cursor_chat_request(ctx, modal.channel_id, chat_id, title)
             .await
-            .unwrap_or_else(|error| format!("⚠️ Could not attach Cursor chat: {error}"));
+            .unwrap_or_else(|error| format!("⚠️ 無法 attach Cursor chat：{error}"));
         if let Err(error) = modal
             .edit_response(&ctx.http, EditInteractionResponse::new().content(content))
             .await
         {
             tracing::error!(%error, "failed to edit Cursor attach modal response");
+        }
+    }
+
+    async fn handle_attach_chat_select(
+        &self,
+        ctx: &Context,
+        comp: &serenity::model::application::ComponentInteraction,
+    ) {
+        if comp.user.bot
+            || is_denied_user(
+                false,
+                self.allow_all_users,
+                &self.allowed_users,
+                comp.user.id.get(),
+            )
+        {
+            let response = CreateInteractionResponse::Message(
+                CreateInteractionResponseMessage::new()
+                    .content("🚫 你沒有使用這個 Bot 的權限。")
+                    .ephemeral(true),
+            );
+            let _ = comp.create_response(&ctx.http, response).await;
+            return;
+        }
+        let chat_id = match &comp.data.kind {
+            ComponentInteractionDataKind::StringSelect { values } => {
+                values.first().map(String::as_str).unwrap_or("")
+            }
+            _ => "",
+        };
+        let valid = match self.project_binding_for_channel(ctx, comp.channel_id).await {
+            Ok((binding, _)) => self
+                .available_cursor_chats(&binding, chat_id)
+                .await
+                .unwrap_or_default()
+                .iter()
+                .any(|chat| chat.session_id == chat_id),
+            Err(_) => false,
+        };
+        if !valid {
+            let response = CreateInteractionResponse::Message(
+                CreateInteractionResponseMessage::new()
+                    .content("⚠️ 這個 chat 已不可用，請回到 Project Home 重新選擇。")
+                    .ephemeral(true),
+            );
+            let _ = comp.create_response(&ctx.http, response).await;
+            return;
+        }
+
+        let modal = CreateModal::new(
+            format!("oab_project_attach:{chat_id}"),
+            "Attach local Cursor chat",
+        )
+        .components(vec![CreateActionRow::InputText(
+            CreateInputText::new(InputTextStyle::Short, "Discord thread title", "title")
+                .placeholder("Cursor handoff")
+                .max_length(100)
+                .required(false),
+        )]);
+        if let Err(error) = comp
+            .create_response(&ctx.http, CreateInteractionResponse::Modal(modal))
+            .await
+        {
+            tracing::error!(%error, "failed to open Cursor attach title modal");
         }
     }
 
@@ -5134,26 +5477,26 @@ mod tests {
     }
 
     #[test]
-    fn session_states_have_distinct_control_panel_copy() {
+    fn session_states_have_expected_control_panel_copy() {
         assert_eq!(
             session_state_presentation(SessionState::Active, false).0,
-            "Active"
+            "執行中"
         );
         assert_eq!(
             session_state_presentation(SessionState::Suspended, false).0,
-            "Suspended"
+            "可在 Discord 接續"
         );
         assert_eq!(
             session_state_presentation(SessionState::Persisted, false).0,
-            "Saved"
+            "可在 Discord 接續"
         );
         assert_eq!(
             session_state_presentation(SessionState::None, false).0,
-            "Not started"
+            "尚未開始"
         );
         assert_eq!(
             session_state_presentation(SessionState::Persisted, true).0,
-            "Detached to Cursor"
+            "Cursor 接手中"
         );
     }
 
@@ -5167,6 +5510,7 @@ mod tests {
             access_role_id: None,
             access_user_ids: vec![4],
             access_role_ids: vec![5],
+            home_message_id: None,
             created_at: chrono::Utc::now(),
         };
 
