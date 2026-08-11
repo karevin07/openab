@@ -310,6 +310,15 @@ pub struct SenderContext {
     pub receiver_id: Option<String>,
 }
 
+/// Platform-neutral task lifecycle events emitted by the dispatcher.
+#[derive(Clone, Debug)]
+pub enum TaskLifecycleEvent {
+    Enqueued,
+    Started { batch_size: usize },
+    Finished,
+    Failed { message: String },
+}
+
 // --- ChatAdapter trait ---
 
 #[async_trait]
@@ -372,6 +381,15 @@ pub trait ChatAdapter: Send + Sync + 'static {
     /// Default: unsupported.
     async fn delete_channel(&self, _channel: &ChannelRef) -> Result<()> {
         Err(anyhow::anyhow!("delete_channel not supported"))
+    }
+
+    /// Update platform-specific task UI. Adapters without task cards ignore it.
+    async fn update_task_lifecycle(
+        &self,
+        _channel: &ChannelRef,
+        _event: TaskLifecycleEvent,
+    ) -> Result<()> {
+        Ok(())
     }
 
     /// Whether this adapter streams via a native streaming API (Slack

@@ -936,6 +936,16 @@ async fn main() -> anyhow::Result<()> {
         registry
     };
 
+    #[cfg(feature = "discord")]
+    let task_registry = {
+        let path = std::env::var("HOME")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_default()
+            .join(".openab")
+            .join("discord-tasks.json");
+        openab_core::task_registry::TaskRegistry::load(path)
+    };
+
     // Shutdown signal for Slack adapter
     let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
 
@@ -1797,6 +1807,7 @@ async fn main() -> anyhow::Result<()> {
             project_channels_enabled: discord_cfg.project_channels_enabled,
             project_category_id,
             project_registry,
+            task_registry,
         };
 
         let intents = GatewayIntents::GUILD_MESSAGES
