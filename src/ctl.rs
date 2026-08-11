@@ -4,11 +4,16 @@
 //! - `openab run` spawns a UnixListener at a well-known path.
 //! - `openab set key value` connects, sends a JSON request, reads the response.
 //!
-//! Phase 1 supported keys:
+//! Supported keys:
 //! - `thread.name` — rename the current Discord/Slack thread
+//! - `session.publish` — publish an exited Cursor chat to a Discord project
 
 #[cfg(unix)]
 use openab_core::adapter::{ChannelRef, ChatAdapter};
+#[cfg(all(unix, feature = "discord"))]
+use openab_core::acp::SessionPool;
+#[cfg(all(unix, feature = "discord"))]
+use openab_core::project_registry::{ProjectBinding, ProjectRegistry};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 #[cfg(unix)]
@@ -165,6 +170,38 @@ pub type ShardSlot = Arc<std::sync::OnceLock<serenity::gateway::ShardMessenger>>
 #[cfg(all(unix, not(feature = "discord")))]
 pub type ShardSlot = Arc<std::sync::OnceLock<()>>;
 
+#[cfg(all(unix, feature = "discord"))]
+#[derive(Clone)]
+pub struct SessionPublishContext {
+    pool: Arc<SessionPool>,
+    project_registry: ProjectRegistry,
+    workspace_aliases: std::collections::HashMap<String, String>,
+}
+
+#[cfg(all(unix, feature = "discord"))]
+impl SessionPublishContext {
+    pub fn new(
+        pool: Arc<SessionPool>,
+        project_registry: ProjectRegistry,
+        workspace_aliases: std::collections::HashMap<String, String>,
+    ) -> Self {
+        Self {
+            pool,
+            project_registry,
+            workspace_aliases,
+        }
+    }
+}
+
+#[cfg(all(unix, feature = "discord"))]
+#[derive(Debug, Deserialize)]
+struct SessionPublishRequest {
+    chat_id: String,
+    project: String,
+    #[serde(default)]
+    title: Option<String>,
+}
+
 /// Concrete handler for `openab run` — dispatches to platform adapters.
 #[cfg(unix)]
 pub struct RuntimeHandler {
@@ -173,6 +210,8 @@ pub struct RuntimeHandler {
     /// thread_id → platform mapping. Populated by `openab run` when it dispatches messages.
     registry: Arc<tokio::sync::RwLock<std::collections::HashMap<String, String>>>,
     shard: ShardSlot,
+    #[cfg(feature = "discord")]
+    session_publish: Option<SessionPublishContext>,
 }
 
 #[cfg(unix)]
@@ -181,8 +220,15 @@ impl RuntimeHandler {
         adapters: std::collections::HashMap<String, Arc<dyn ChatAdapter>>,
         registry: Arc<tokio::sync::RwLock<std::collections::HashMap<String, String>>>,
         shard: ShardSlot,
+        #[cfg(feature = "discord")] session_publish: Option<SessionPublishContext>,
     ) -> Self {
-        Self { adapters, registry, shard }
+        Self {
+            adapters,
+            registry,
+            shard,
+            #[cfg(feature = "discord")]
+            session_publish,
+        }
     }
 
     /// Resolve which adapter to use for a given thread_id.
@@ -195,6 +241,72 @@ impl RuntimeHandler {
         };
         let adapter = self.adapters.get(&platform)?.clone();
         Some((adapter, tid.to_string()))
+    }
+
+    #[cfg(feature = "discord")]
+    async fn publish_session(&self, value: &str) -> Response {
+        let result: anyhow::Result<String> = async {
+            let publisher = self
+                .session_publish
+                .as_ref()
+                .ok_or_else(|| anyhow::anyhow!("Discord session publishing is unavailable"))?;
+            let request: SessionPublishRequest = serde_json::from_str(value)
+                .map_err(|error| anyhow::anyhow!("invalid publish request: {error}"))?;
+            let binding = resolve_publish_project(&publisher.project_registry, &request.project)?;
+            let workspace = publisher
+                .workspace_aliases
+                .get(&binding.workspace_alias)
+                .ok_or_else(|| anyhow::anyhow!("project workspace is unavailable"))?;
+            let adapter = self
+                .adapters
+                .get("discord")
+                .ok_or_else(|| anyhow::anyhow!("Discord adapter is unavailable"))?;
+            let title = request.title.as_deref().unwrap_or("Cursor handoff");
+            let thread = openab_core::cursor_session::publish_cursor_chat(
+                adapter.as_ref(),
+                publisher.pool.as_ref(),
+                &binding,
+                std::path::Path::new(workspace),
+                &request.chat_id,
+                title,
+            )
+            .await?;
+            Ok(thread.channel_id)
+        }
+        .await;
+
+        match result {
+            Ok(thread_id) => Response {
+                ok: true,
+                message: format!("Cursor session published to Discord thread <#{thread_id}>"),
+                value: Some(thread_id),
+            },
+            Err(error) => Response {
+                ok: false,
+                message: format!("session publish failed: {error}"),
+                value: None,
+            },
+        }
+    }
+}
+
+#[cfg(all(unix, feature = "discord"))]
+fn resolve_publish_project(registry: &ProjectRegistry, value: &str) -> anyhow::Result<ProjectBinding> {
+    if let Ok(channel_id) = value.parse::<u64>() {
+        return registry
+            .binding_for_channel(channel_id)
+            .ok_or_else(|| anyhow::anyhow!("project channel is not registered"));
+    }
+    let alias = value.trim().trim_start_matches('@');
+    let matches: Vec<_> = registry
+        .all()
+        .into_iter()
+        .filter(|binding| binding.workspace_alias == alias)
+        .collect();
+    match matches.as_slice() {
+        [binding] => Ok(binding.clone()),
+        [] => anyhow::bail!("project alias @{alias} is not registered"),
+        _ => anyhow::bail!("project alias @{alias} exists in multiple servers; use its channel ID"),
     }
 }
 
@@ -230,6 +342,8 @@ fn resolve_platform(
 impl CtlHandler for RuntimeHandler {
     async fn handle_set(&self, thread_id: Option<&str>, key: &str, value: &str) -> Response {
         match key {
+            #[cfg(feature = "discord")]
+            "session.publish" => self.publish_session(value).await,
             "thread.name" => {
                 let Some((adapter, tid)) = self.resolve(thread_id).await else {
                     return Response {

@@ -12,15 +12,15 @@ use crate::trust::l3_gate_applies;
 use async_trait::async_trait;
 use serenity::builder::{
     CreateActionRow, CreateAttachment, CreateAutocompleteResponse, CreateButton, CreateChannel,
-    CreateCommand, CreateCommandOption, CreateEmbed, CreateEmbedFooter,
+    CreateCommand, CreateCommandOption, CreateEmbed, CreateEmbedFooter, CreateInputText,
     CreateInteractionResponse, CreateInteractionResponseFollowup, CreateInteractionResponseMessage,
-    CreateMessage, CreateSelectMenu, CreateSelectMenuKind, CreateSelectMenuOption, CreateThread,
-    EditChannel, EditInteractionResponse, EditMessage, GetMessages,
+    CreateMessage, CreateModal, CreateSelectMenu, CreateSelectMenuKind, CreateSelectMenuOption,
+    CreateThread, EditChannel, EditInteractionResponse, EditMessage, GetMessages,
 };
 use serenity::http::Http;
-use serenity::model::application::ButtonStyle;
 use serenity::model::application::{
-    Command, CommandOptionType, ComponentInteractionDataKind, Interaction,
+    ActionRowComponent, ButtonStyle, Command, CommandOptionType, ComponentInteractionDataKind,
+    InputTextStyle, Interaction,
 };
 use serenity::model::channel::{
     AutoArchiveDuration, ChannelType, Message, MessageType, PermissionOverwrite,
@@ -302,6 +302,11 @@ fn project_welcome_message(binding: &ProjectBinding) -> CreateMessage {
             "3 · Control",
             "Run `/session status` inside a thread for stop, Cursor handoff, and close controls.",
             false,
+        )
+        .field(
+            "Already working locally?",
+            "Exit the Cursor terminal UI, then attach that chat here to continue it from Discord.",
+            false,
         );
     CreateMessage::new().embed(embed).components(vec![
         CreateActionRow::Buttons(vec![
@@ -311,8 +316,28 @@ fn project_welcome_message(binding: &ProjectBinding) -> CreateMessage {
             CreateButton::new("oab_project:status")
                 .label("📁 Project info")
                 .style(ButtonStyle::Secondary),
+            CreateButton::new("oab_project:attach")
+                .label("📤 Attach Cursor chat")
+                .style(ButtonStyle::Secondary),
         ]),
     ])
+}
+
+fn modal_input_value<'a>(
+    modal: &'a serenity::model::application::ModalInteraction,
+    custom_id: &str,
+) -> Option<&'a str> {
+    modal
+        .data
+        .components
+        .iter()
+        .flat_map(|row| row.components.iter())
+        .find_map(|component| match component {
+            ActionRowComponent::InputText(input) if input.custom_id == custom_id => {
+                input.value.as_deref()
+            }
+            _ => None,
+        })
 }
 
 fn sanitize_project_channel_name(input: &str) -> String {
@@ -1774,12 +1799,32 @@ impl EventHandler for Handler {
                     "List configured workspace aliases",
                 )),
             CreateCommand::new("session")
-                .description("Inspect, detach, or close this conversation session")
+                .description("Attach, inspect, detach, or close a Cursor session")
                 .add_option(CreateCommandOption::new(
                     CommandOptionType::SubCommand,
                     "status",
                     "Show session lifecycle state and workspace",
                 ))
+                .add_option(
+                    CreateCommandOption::new(
+                        CommandOptionType::SubCommand,
+                        "attach",
+                        "Attach an exited local Cursor chat to this project or thread",
+                    )
+                    .add_sub_option(
+                        CreateCommandOption::new(
+                            CommandOptionType::String,
+                            "chat_id",
+                            "Cursor chat UUID from `make session-publish-list`",
+                        )
+                        .required(true),
+                    )
+                    .add_sub_option(CreateCommandOption::new(
+                        CommandOptionType::String,
+                        "title",
+                        "New thread title when run in a project channel",
+                    )),
+                )
                 .add_option(CreateCommandOption::new(
                     CommandOptionType::SubCommand,
                     "detach",
@@ -2022,6 +2067,9 @@ impl EventHandler for Handler {
             {
                 self.handle_project_component(&ctx, &comp).await;
             }
+            Interaction::Modal(modal) if modal.data.custom_id == "oab_project_attach" => {
+                self.handle_project_attach_modal(&ctx, &modal).await;
+            }
             Interaction::Component(comp) if comp.data.custom_id.starts_with("acp_config_") => {
                 self.handle_config_select(&ctx, &comp).await;
             }
@@ -2077,8 +2125,13 @@ impl Handler {
                 false,
             )
             .field(
+                "📤 從電腦發佈既有 Cursor chat",
+                "1. 正常離開本機 Cursor terminal UI。\n2. 在 Project Home 點 **Attach Cursor chat**，或執行 `/session attach`。\n3. 貼上 chat ID；OpenAB 會建立或綁定 task thread。",
+                false,
+            )
+            .field(
                 "常用指令",
-                "`/project list` 列出專案頻道\n`/workspace status` 確認當前 repository\n`/session status` 開啟 session 控制面板\n`/cancel` 中止當前任務\n`/help` 顯示這份指南",
+                "`/project list` 列出專案頻道\n`/workspace status` 確認當前 repository\n`/session status` 開啟 session 控制面板\n`/session attach` 綁定已退出的 Cursor chat\n`/cancel` 中止當前任務",
                 false,
             )
             .footer(CreateEmbedFooter::new(
@@ -2775,6 +2828,95 @@ impl Handler {
         }
     }
 
+    async fn attach_cursor_chat_request(
+        &self,
+        ctx: &Context,
+        channel_id: ChannelId,
+        chat_id: &str,
+        title: &str,
+    ) -> Result<String, String> {
+        let channel = channel_id
+            .to_channel(&ctx.http)
+            .await
+            .map_err(|error| format!("Could not inspect this Discord channel: {error}"))?;
+        let serenity::model::channel::Channel::Guild(channel) = channel else {
+            return Err("Attach a Cursor chat inside a managed project channel or thread.".into());
+        };
+        let parent_id = channel
+            .thread_metadata
+            .as_ref()
+            .and_then(|_| channel.parent_id.map(|id| id.get()));
+        let project_channel_id = parent_id.unwrap_or(channel_id.get());
+        let binding = self
+            .project_registry
+            .binding_for_channel(project_channel_id)
+            .ok_or_else(|| {
+                "Attach a Cursor chat inside a managed project channel or thread.".to_string()
+            })?;
+        let workspace = self
+            .router
+            .workspace_aliases()
+            .get(&binding.workspace_alias)
+            .cloned()
+            .ok_or_else(|| "The project workspace is no longer configured.".to_string())?;
+
+        if parent_id.is_some() {
+            let checkpoint = crate::cursor_session::attach_cursor_chat(
+                self.router.pool().as_ref(),
+                chat_id,
+                std::path::Path::new(&workspace),
+                &channel_id.get().to_string(),
+            )
+            .await
+            .map_err(|error| error.to_string())?;
+            let adapter = self
+                .adapter
+                .get_or_init(|| Arc::new(DiscordAdapter::new(ctx.http.clone())))
+                .clone();
+            let thread = ChannelRef {
+                platform: "discord".into(),
+                channel_id: channel_id.get().to_string(),
+                thread_id: None,
+                parent_id: Some(project_channel_id.to_string()),
+                origin_event_id: None,
+            };
+            adapter
+                .send_message(
+                    &thread,
+                    &format!(
+                        "✅ Cursor session `{}` is attached to **@{}**. Send the next message here to continue the same chat.",
+                        checkpoint.session_id, binding.workspace_alias
+                    ),
+                )
+                .await
+                .map_err(|error| format!("Session attached, but confirmation failed: {error}"))?;
+            return Ok(format!(
+                "✅ Cursor chat `{}` is now attached to <#{}>.",
+                checkpoint.session_id,
+                channel_id.get()
+            ));
+        }
+
+        let adapter = self
+            .adapter
+            .get_or_init(|| Arc::new(DiscordAdapter::new(ctx.http.clone())))
+            .clone();
+        let thread = crate::cursor_session::publish_cursor_chat(
+            adapter.as_ref(),
+            self.router.pool().as_ref(),
+            &binding,
+            std::path::Path::new(&workspace),
+            chat_id,
+            title,
+        )
+        .await
+        .map_err(|error| error.to_string())?;
+        Ok(format!(
+            "✅ Cursor chat published to <#{}>. Continue there.",
+            thread.channel_id
+        ))
+    }
+
     async fn handle_session_command(
         &self,
         ctx: &Context,
@@ -2793,12 +2935,43 @@ impl Handler {
             }
         };
 
-        let subcommand = cmd
-            .data
-            .options
-            .first()
-            .map(|option| option.name.as_str())
-            .unwrap_or("status");
+        let top = cmd.data.options.first();
+        let subcommand = top.map(|option| option.name.as_str()).unwrap_or("status");
+        let options = top
+            .and_then(|option| match &option.value {
+                serenity::model::application::CommandDataOptionValue::SubCommand(options) => {
+                    Some(options.as_slice())
+                }
+                _ => None,
+            })
+            .unwrap_or(&[]);
+        if subcommand == "attach" {
+            let chat_id = options
+                .iter()
+                .find(|option| option.name == "chat_id")
+                .and_then(|option| option.value.as_str())
+                .unwrap_or("");
+            let title = options
+                .iter()
+                .find(|option| option.name == "title")
+                .and_then(|option| option.value.as_str())
+                .unwrap_or("Cursor handoff");
+            if let Err(error) = cmd.defer_ephemeral(&ctx.http).await {
+                tracing::error!(%error, "failed to defer /session attach response");
+                return;
+            }
+            let content = self
+                .attach_cursor_chat_request(ctx, cmd.channel_id, chat_id, title)
+                .await
+                .unwrap_or_else(|error| format!("⚠️ Could not attach Cursor chat: {error}"));
+            if let Err(error) = cmd
+                .edit_response(&ctx.http, EditInteractionResponse::new().content(content))
+                .await
+            {
+                tracing::error!(%error, "failed to edit /session attach response");
+            }
+            return;
+        }
         if subcommand == "status" {
             let snapshot = self.router.pool().session_snapshot(&scope.session_key).await;
             let response = CreateInteractionResponse::Message(session_control_message(
@@ -3006,6 +3179,31 @@ impl Handler {
             .custom_id
             .strip_prefix("oab_project:")
             .unwrap_or("");
+        if action == "attach" {
+            let modal = CreateModal::new("oab_project_attach", "Attach Cursor chat").components(
+                vec![
+                    CreateActionRow::InputText(
+                        CreateInputText::new(InputTextStyle::Short, "Cursor chat ID", "chat_id")
+                            .placeholder("xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx")
+                            .min_length(36)
+                            .max_length(36),
+                    ),
+                    CreateActionRow::InputText(
+                        CreateInputText::new(InputTextStyle::Short, "Thread title", "title")
+                            .placeholder("Cursor handoff")
+                            .max_length(100)
+                            .required(false),
+                    ),
+                ],
+            );
+            if let Err(error) = comp
+                .create_response(&ctx.http, CreateInteractionResponse::Modal(modal))
+                .await
+            {
+                tracing::error!(%error, "failed to open Cursor attach modal");
+            }
+            return;
+        }
         let message = match action {
             "guide" => CreateInteractionResponseMessage::new()
                 .content(format!(
@@ -3025,6 +3223,47 @@ impl Handler {
             .await
         {
             tracing::error!(%error, action, "failed to respond to project control");
+        }
+    }
+
+    async fn handle_project_attach_modal(
+        &self,
+        ctx: &Context,
+        modal: &serenity::model::application::ModalInteraction,
+    ) {
+        if modal.user.bot
+            || is_denied_user(
+                false,
+                self.allow_all_users,
+                &self.allowed_users,
+                modal.user.id.get(),
+            )
+        {
+            let response = CreateInteractionResponse::Message(
+                CreateInteractionResponseMessage::new()
+                    .content("🚫 You are not allowed to attach Cursor chats.")
+                    .ephemeral(true),
+            );
+            let _ = modal.create_response(&ctx.http, response).await;
+            return;
+        }
+        let chat_id = modal_input_value(modal, "chat_id").unwrap_or("");
+        let title = modal_input_value(modal, "title")
+            .filter(|value| !value.trim().is_empty())
+            .unwrap_or("Cursor handoff");
+        if let Err(error) = modal.defer_ephemeral(&ctx.http).await {
+            tracing::error!(%error, "failed to defer Cursor attach modal response");
+            return;
+        }
+        let content = self
+            .attach_cursor_chat_request(ctx, modal.channel_id, chat_id, title)
+            .await
+            .unwrap_or_else(|error| format!("⚠️ Could not attach Cursor chat: {error}"));
+        if let Err(error) = modal
+            .edit_response(&ctx.http, EditInteractionResponse::new().content(content))
+            .await
+        {
+            tracing::error!(%error, "failed to edit Cursor attach modal response");
         }
     }
 

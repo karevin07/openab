@@ -456,6 +456,50 @@ impl SessionPool {
         }
     }
 
+    /// Reject a chat that already belongs to a Discord thread before creating UI for it.
+    pub async fn ensure_external_session_available(&self, session_id: &str) -> Result<()> {
+        let state = self.state.read().await;
+        if state.persisted.values().any(|current| current == session_id) {
+            return Err(anyhow!("Cursor chat is already attached to a Discord thread"));
+        }
+        Ok(())
+    }
+
+    /// Attach an existing external ACP session to an idle thread without spawning an agent.
+    /// The next message loads `session_id` through the normal `session/load` path.
+    pub async fn attach_external_session(
+        &self,
+        thread_id: &str,
+        session_id: &str,
+        working_dir: &str,
+    ) -> Result<()> {
+        if thread_id.is_empty() || session_id.is_empty() {
+            return Err(anyhow!("thread ID and session ID are required"));
+        }
+        let working_dir = Path::new(working_dir)
+            .canonicalize()
+            .map_err(|error| anyhow!("invalid session workspace: {error}"))?
+            .to_string_lossy()
+            .to_string();
+        let create_gate = {
+            let mut state = self.state.write().await;
+            get_or_insert_gate(&mut state.creating, thread_id)
+        };
+        let _create_guard = create_gate.lock().await;
+
+        let mut state = self.state.write().await;
+        attach_external_session_state(&mut state, thread_id, session_id, &working_dir)?;
+        self.save_mapping(&state.persisted);
+        self.save_meta(&state.session_workdirs);
+        let _ = std::fs::remove_file(self.handoff_marker_path(thread_id));
+        info!(
+            thread_id = %crate::redact::redact_session_ids(thread_id),
+            session_id = %crate::redact::redact_session_ids(session_id),
+            "external session attached"
+        );
+        Ok(())
+    }
+
     pub async fn get_or_create(
         &self,
         thread_id: &str,
@@ -1166,11 +1210,45 @@ impl SessionPool {
     }
 }
 
+fn attach_external_session_state(
+    state: &mut PoolState,
+    thread_id: &str,
+    session_id: &str,
+    working_dir: &str,
+) -> Result<()> {
+    if has_session_state(state, thread_id) {
+        let same_mapping = state.persisted.get(thread_id).map(String::as_str) == Some(session_id)
+            && state.session_workdirs.get(thread_id).map(String::as_str) == Some(working_dir);
+        if same_mapping {
+            return Ok(());
+        }
+        return Err(anyhow!("Discord thread already has a session"));
+    }
+    if state
+        .persisted
+        .iter()
+        .any(|(key, current)| key != thread_id && current == session_id)
+    {
+        return Err(anyhow!("Cursor chat is already attached to another thread"));
+    }
+    state
+        .persisted
+        .insert(thread_id.to_string(), session_id.to_string());
+    state
+        .suspended
+        .insert(thread_id.to_string(), session_id.to_string());
+    state
+        .session_workdirs
+        .insert(thread_id.to_string(), working_dir.to_string());
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
-        better_candidate, classify_hung, classify_idle, get_or_insert_gate, has_session_state,
-        purge_session_entries, remove_if_same_handle, session_state, PoolState, SessionState,
+        attach_external_session_state, better_candidate, classify_hung, classify_idle,
+        get_or_insert_gate, has_session_state, purge_session_entries, remove_if_same_handle,
+        session_state, PoolState, SessionState,
     };
     use crate::acp::connection::SessionActivity;
     use std::collections::HashMap;
@@ -1247,6 +1325,28 @@ mod tests {
 
         assert!(has_session_state(&state, "metadata-only"));
         assert!(!has_session_state(&state, "missing"));
+    }
+
+    #[test]
+    fn external_session_attach_is_idempotent_and_unique() {
+        let mut state = empty_pool_state();
+        attach_external_session_state(&mut state, "discord:1", "chat-a", "/tmp/repo").unwrap();
+        attach_external_session_state(&mut state, "discord:1", "chat-a", "/tmp/repo").unwrap();
+
+        assert_eq!(state.persisted.get("discord:1").map(String::as_str), Some("chat-a"));
+        assert_eq!(state.suspended.get("discord:1").map(String::as_str), Some("chat-a"));
+        assert_eq!(
+            state.session_workdirs.get("discord:1").map(String::as_str),
+            Some("/tmp/repo")
+        );
+        assert!(
+            attach_external_session_state(&mut state, "discord:2", "chat-a", "/tmp/repo")
+                .is_err()
+        );
+        assert!(
+            attach_external_session_state(&mut state, "discord:1", "chat-b", "/tmp/repo")
+                .is_err()
+        );
     }
 
     /// F3: replacing a hung predecessor's token revokes the predecessor's EXACT token and leaves
