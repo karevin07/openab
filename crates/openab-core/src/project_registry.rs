@@ -24,6 +24,8 @@ pub struct ProjectBinding {
     pub access_user_ids: Vec<u64>,
     #[serde(default)]
     pub access_role_ids: Vec<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub home_message_id: Option<u64>,
     pub created_at: DateTime<Utc>,
 }
 
@@ -197,6 +199,30 @@ impl ProjectRegistry {
         self.update_access(guild_id, channel_id, target, false)
     }
 
+    pub fn set_home_message_id(
+        &self,
+        guild_id: u64,
+        channel_id: u64,
+        message_id: u64,
+    ) -> anyhow::Result<ProjectBinding> {
+        let mut bindings = self
+            .bindings
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let binding = bindings
+            .get_mut(&channel_id)
+            .filter(|binding| binding.guild_id == guild_id)
+            .ok_or_else(|| anyhow::anyhow!("project channel is not registered in this server"))?;
+        let original = binding.clone();
+        binding.home_message_id = Some(message_id);
+        let updated = binding.clone();
+        if let Err(error) = self.persist_locked(&bindings) {
+            bindings.insert(channel_id, original);
+            return Err(error);
+        }
+        Ok(updated)
+    }
+
     fn update_access(
         &self,
         guild_id: u64,
@@ -270,6 +296,7 @@ mod tests {
             access_role_id: None,
             access_user_ids: Vec::new(),
             access_role_ids: Vec::new(),
+            home_message_id: None,
             created_at: Utc::now(),
         }
     }
@@ -311,6 +338,22 @@ mod tests {
     }
 
     #[test]
+    fn home_message_id_is_persisted() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("projects.json");
+        let registry = ProjectRegistry::load(path.clone());
+        registry.add(binding(1, 10, "openab")).unwrap();
+
+        registry.set_home_message_id(1, 10, 123).unwrap();
+
+        let restored = ProjectRegistry::load(path);
+        assert_eq!(
+            restored.binding_for_channel(10).unwrap().home_message_id,
+            Some(123)
+        );
+    }
+
+    #[test]
     fn legacy_role_is_migrated_and_access_can_be_updated() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("projects.json");
@@ -327,6 +370,7 @@ mod tests {
         let registry = ProjectRegistry::load(path);
         let migrated = registry.binding_for_channel(10).unwrap();
         assert_eq!(migrated.access_role_ids, vec![42]);
+        assert!(migrated.home_message_id.is_none());
         assert!(migrated.access_role_id.is_none());
 
         registry

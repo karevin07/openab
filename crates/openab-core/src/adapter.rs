@@ -368,6 +368,12 @@ pub trait ChatAdapter: Send + Sync + 'static {
         self.edit_message(msg, "\u{200b}").await
     }
 
+    /// Delete a channel or thread created during a failed transactional flow.
+    /// Default: unsupported.
+    async fn delete_channel(&self, _channel: &ChannelRef) -> Result<()> {
+        Err(anyhow::anyhow!("delete_channel not supported"))
+    }
+
     /// Whether this adapter streams via a native streaming API (Slack
     /// chat.startStream) rather than the post+edit loop. Default: false.
     /// `other_bot_present` lets adapters fall back to send-once in multi-bot

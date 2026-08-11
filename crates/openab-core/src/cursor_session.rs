@@ -17,6 +17,13 @@ pub struct CursorChatCheckpoint {
     pub working_dir: PathBuf,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CursorChatSummary {
+    pub session_id: String,
+    pub working_dir: PathBuf,
+    pub updated_at_ms: u64,
+}
+
 pub fn cursor_chat_root() -> PathBuf {
     std::env::var("HOME")
         .map(PathBuf::from)
@@ -82,6 +89,93 @@ pub fn load_cursor_chat_from(root: &Path, session_id: &str) -> Result<CursorChat
         session_id,
         working_dir,
     })
+}
+
+pub fn list_cursor_chats_for_workspace(
+    expected_workspace: &Path,
+) -> Result<Vec<CursorChatSummary>> {
+    list_cursor_chats_from(&cursor_chat_root(), expected_workspace)
+}
+
+pub fn list_cursor_chats_from(
+    root: &Path,
+    expected_workspace: &Path,
+) -> Result<Vec<CursorChatSummary>> {
+    let expected_workspace = expected_workspace.canonicalize().with_context(|| {
+        format!(
+            "project workspace is unavailable: {}",
+            expected_workspace.display()
+        )
+    })?;
+    let mut chats = Vec::new();
+    for workspace_entry in std::fs::read_dir(root)
+        .with_context(|| format!("Cursor chat store is unavailable: {}", root.display()))?
+    {
+        let Ok(workspace_entry) = workspace_entry else {
+            continue;
+        };
+        let Ok(chat_entries) = std::fs::read_dir(workspace_entry.path()) else {
+            continue;
+        };
+        for chat_entry in chat_entries.filter_map(Result::ok) {
+            let Some(raw_id) = chat_entry.file_name().to_str().map(str::to_owned) else {
+                continue;
+            };
+            let Ok(session_id) = validate_cursor_chat_id(&raw_id) else {
+                continue;
+            };
+            let chat_dir = chat_entry.path();
+            if !chat_dir.join("store.db").is_file() {
+                continue;
+            }
+            let Ok(metadata_text) = std::fs::read_to_string(chat_dir.join("meta.json")) else {
+                continue;
+            };
+            let Ok(metadata) = serde_json::from_str::<Value>(&metadata_text) else {
+                continue;
+            };
+            if metadata.get("hasConversation").and_then(Value::as_bool) == Some(false) {
+                continue;
+            }
+            let Some(working_dir) = metadata
+                .get("cwd")
+                .and_then(Value::as_str)
+                .filter(|value| Path::new(value).is_absolute())
+                .and_then(|value| Path::new(value).canonicalize().ok())
+            else {
+                continue;
+            };
+            if working_dir != expected_workspace {
+                continue;
+            }
+            let updated_at_ms = metadata
+                .get("updatedAtMs")
+                .and_then(Value::as_u64)
+                .or_else(|| {
+                    chat_dir
+                        .join("store.db")
+                        .metadata()
+                        .ok()?
+                        .modified()
+                        .ok()?
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .ok()
+                        .map(|duration| duration.as_millis() as u64)
+                })
+                .unwrap_or_default();
+            chats.push(CursorChatSummary {
+                session_id,
+                working_dir,
+                updated_at_ms,
+            });
+        }
+    }
+    chats.sort_by(|a, b| {
+        b.updated_at_ms
+            .cmp(&a.updated_at_ms)
+            .then_with(|| a.session_id.cmp(&b.session_id))
+    });
+    Ok(chats)
 }
 
 pub fn require_workspace(checkpoint: &CursorChatCheckpoint, expected: &Path) -> Result<PathBuf> {
@@ -190,23 +284,33 @@ pub async fn publish_cursor_chat(
     )
     .await
     {
-        let _ = adapter
-            .send_message(
-                &thread,
-                &format!("⚠️ Cursor session attach failed: {error}"),
-            )
-            .await;
+        if let Err(cleanup_error) = adapter.delete_channel(&thread).await {
+            tracing::warn!(%cleanup_error, "failed to roll back Cursor publish thread");
+            let _ = adapter
+                .send_message(
+                    &thread,
+                    &format!("⚠️ Cursor session attach failed: {error}"),
+                )
+                .await;
+        }
+        if let Err(cleanup_error) = adapter.delete_message(&trigger).await {
+            tracing::warn!(%cleanup_error, "failed to roll back Cursor publish trigger");
+        }
         return Err(error);
     }
-    adapter
+    if let Err(error) = adapter
         .send_message(
             &thread,
             &format!(
-                "✅ Cursor session `{}` is attached to **@{}**. Send the next message here to continue the same chat.",
-                checkpoint.session_id, binding.workspace_alias
+                "✅ **Session ready in Discord**\nWorkspace: `@{}`\nSource: Local Cursor\nCursor chat: `{}`\nState: **Ready**\n\nSend the next message here to continue the same context. Use `/session status` for lifecycle controls.",
+                binding.workspace_alias,
+                checkpoint.session_id.get(..8).unwrap_or(&checkpoint.session_id)
             ),
         )
-        .await?;
+        .await
+    {
+        tracing::warn!(%error, "Cursor session attached but confirmation failed");
+    }
     Ok(thread)
 }
 
@@ -260,6 +364,48 @@ mod tests {
         };
 
         assert!(require_workspace(&checkpoint, second.path()).is_err());
+    }
+
+    #[test]
+    fn lists_recent_chats_for_only_the_expected_workspace() {
+        let root = tempfile::tempdir().unwrap();
+        let expected = tempfile::tempdir().unwrap();
+        let other = tempfile::tempdir().unwrap();
+        for (hash, id, workspace, updated) in [
+            ("one", CHAT_ID, expected.path(), 10),
+            (
+                "two",
+                "11111111-1111-1111-1111-111111111111",
+                expected.path(),
+                20,
+            ),
+            (
+                "three",
+                "22222222-2222-2222-2222-222222222222",
+                other.path(),
+                30,
+            ),
+        ] {
+            let chat_dir = root.path().join(hash).join(id);
+            std::fs::create_dir_all(&chat_dir).unwrap();
+            std::fs::write(chat_dir.join("store.db"), b"sqlite").unwrap();
+            std::fs::write(
+                chat_dir.join("meta.json"),
+                serde_json::json!({
+                    "cwd": workspace,
+                    "hasConversation": true,
+                    "updatedAtMs": updated,
+                })
+                .to_string(),
+            )
+            .unwrap();
+        }
+
+        let chats = list_cursor_chats_from(root.path(), expected.path()).unwrap();
+
+        assert_eq!(chats.len(), 2);
+        assert_eq!(chats[0].updated_at_ms, 20);
+        assert_eq!(chats[1].updated_at_ms, 10);
     }
 
     #[cfg(feature = "discord")]

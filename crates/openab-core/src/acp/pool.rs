@@ -458,11 +458,15 @@ impl SessionPool {
 
     /// Reject a chat that already belongs to a Discord thread before creating UI for it.
     pub async fn ensure_external_session_available(&self, session_id: &str) -> Result<()> {
-        let state = self.state.read().await;
-        if state.persisted.values().any(|current| current == session_id) {
+        if !self.external_session_is_available(session_id).await {
             return Err(anyhow!("Cursor chat is already attached to a Discord thread"));
         }
         Ok(())
+    }
+
+    pub async fn external_session_is_available(&self, session_id: &str) -> bool {
+        let state = self.state.read().await;
+        !state.persisted.values().any(|current| current == session_id)
     }
 
     /// Attach an existing external ACP session to an idle thread without spawning an agent.
