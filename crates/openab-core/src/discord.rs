@@ -252,6 +252,9 @@ fn session_control_message(
             .label("✕ Close")
             .style(ButtonStyle::Danger)
             .disabled(!has_session),
+        CreateButton::new("oab_help:open")
+            .label("? Help")
+            .style(ButtonStyle::Secondary),
     ]);
     let mut message = CreateInteractionResponseMessage::new()
         .embed(embed)
@@ -323,6 +326,16 @@ fn task_status_embed(task: &TaskRecord) -> CreateEmbed {
     if let Some(error) = task.last_error.as_deref() {
         embed = embed.field("Last error", truncate_for_discord(error, 900), false);
     }
+    if task.state == TaskState::Cursor {
+        embed = embed.field(
+            "在電腦執行",
+            format!(
+                "```bash\nmake session-resume THREAD_ID={}\n```\n正常離開 Cursor 後，回到這個 thread 傳送下一則訊息。",
+                task.thread_id
+            ),
+            false,
+        );
+    }
     embed.footer(CreateEmbedFooter::new(format!(
         "Updated {} UTC",
         task.updated_at.format("%Y-%m-%d %H:%M")
@@ -330,26 +343,87 @@ fn task_status_embed(task: &TaskRecord) -> CreateEmbed {
 }
 
 fn task_control_rows(task: &TaskRecord) -> Vec<CreateActionRow> {
-    vec![CreateActionRow::Buttons(vec![
-        CreateButton::new("oab_session:refresh")
-            .label("↻ Refresh")
-            .style(ButtonStyle::Secondary),
-        CreateButton::new("oab_session:cancel")
-            .label("■ Stop")
+    let help = || {
+        CreateButton::new("oab_help:open")
+            .label("? Help")
             .style(ButtonStyle::Secondary)
-            .disabled(task.state != TaskState::Running),
-        CreateButton::new("oab_session:detach")
-            .label("↗ Prepare for Cursor")
-            .style(ButtonStyle::Primary)
-            .disabled(matches!(
-                task.state,
-                TaskState::Queued | TaskState::Cursor | TaskState::Closed
-            )),
-        CreateButton::new("oab_session:close")
-            .label("✕ Close")
-            .style(ButtonStyle::Danger)
-            .disabled(task.state == TaskState::Closed),
-    ])]
+    };
+    let project = || {
+        CreateButton::new_link(format!(
+            "https://discord.com/channels/{}/{}",
+            task.guild_id, task.project_channel_id
+        ))
+        .label("← Project")
+    };
+    let buttons = match task.state {
+        TaskState::Queued => vec![
+            CreateButton::new("oab_session:refresh")
+                .label("↻ Check status")
+                .style(ButtonStyle::Secondary),
+            help(),
+        ],
+        TaskState::Running => vec![
+            CreateButton::new("oab_session:cancel")
+                .label("■ Stop")
+                .style(ButtonStyle::Danger),
+            CreateButton::new("oab_session:refresh")
+                .label("↻ Refresh")
+                .style(ButtonStyle::Secondary),
+            help(),
+        ],
+        TaskState::Ready => vec![
+            CreateButton::new("oab_task:continue")
+                .label("💬 Continue")
+                .style(ButtonStyle::Primary),
+            CreateButton::new("oab_session:detach")
+                .label("🖥️ Continue on computer")
+                .style(ButtonStyle::Secondary),
+            CreateButton::new("oab_session:close")
+                .label("✕ Close")
+                .style(ButtonStyle::Danger),
+            help(),
+        ],
+        TaskState::Cursor => vec![
+            CreateButton::new("oab_session:refresh")
+                .label("↻ Check status")
+                .style(ButtonStyle::Secondary),
+            project(),
+            help(),
+        ],
+        TaskState::Failed => {
+            let mut buttons = Vec::new();
+            if task.last_prompt.is_some() {
+                buttons.push(
+                    CreateButton::new("oab_task:retry")
+                        .label("↻ Retry")
+                        .style(ButtonStyle::Primary),
+                );
+                buttons.push(
+                    CreateButton::new("oab_task:edit")
+                        .label("✏️ Edit and retry")
+                        .style(ButtonStyle::Secondary),
+                );
+            }
+            buttons.extend([
+                CreateButton::new("oab_task:error")
+                    .label("🔍 Error details")
+                    .style(ButtonStyle::Secondary),
+                CreateButton::new("oab_session:detach")
+                    .label("🖥️ Use Cursor")
+                    .style(ButtonStyle::Secondary),
+                CreateButton::new("oab_session:close")
+                    .label("✕ Close")
+                    .style(ButtonStyle::Danger),
+            ]);
+            buttons
+        }
+        TaskState::Closed => vec![project(), help()],
+    };
+    let mut rows = vec![CreateActionRow::Buttons(buttons)];
+    if task.state == TaskState::Failed && task.last_prompt.is_some() {
+        rows.push(CreateActionRow::Buttons(vec![project(), help()]));
+    }
+    rows
 }
 
 fn task_status_message(task: &TaskRecord) -> CreateMessage {
@@ -424,6 +498,9 @@ fn project_welcome_components(tasks: &[TaskRecord]) -> Vec<CreateActionRow> {
         CreateButton::new("oab_project:status")
             .label("📁 Project info")
             .style(ButtonStyle::Secondary),
+        CreateButton::new("oab_help:open")
+            .label("? Help")
+            .style(ButtonStyle::Secondary),
     ])];
     if !tasks.is_empty() {
         let options = tasks
@@ -493,6 +570,159 @@ fn project_welcome_edit(binding: &ProjectBinding, tasks: &[TaskRecord]) -> EditM
     EditMessage::new()
         .embed(embed)
         .components(project_welcome_components(tasks))
+}
+
+fn help_action_center(image_url: Option<&str>) -> CreateInteractionResponseMessage {
+    let mut embed = CreateEmbed::new()
+        .title("🧭 OpenAB · What do you want to do?")
+        .description("不需要記 Slash Commands。選擇現在的情境，OpenAB 只會顯示下一步。")
+        .colour(0x5865F2)
+        .field(
+            "工作方式",
+            "Project channel = repository\nTask thread = Cursor session",
+            false,
+        )
+        .footer(CreateEmbedFooter::new(
+            "Discord 與 Cursor terminal 不要同時操作同一個 session",
+        ));
+    if let Some(url) = image_url {
+        embed = embed.thumbnail(url);
+    }
+    CreateInteractionResponseMessage::new()
+        .embed(embed)
+        .components(vec![CreateActionRow::Buttons(vec![
+            CreateButton::new("oab_help:discord")
+                .label("📱 Start on Discord")
+                .style(ButtonStyle::Primary),
+            CreateButton::new("oab_help:cursor")
+                .label("🖥️ Continue on computer")
+                .style(ButtonStyle::Secondary),
+            CreateButton::new("oab_help:attach")
+                .label("📤 Publish local chat")
+                .style(ButtonStyle::Secondary),
+            CreateButton::new("oab_help:troubleshoot")
+                .label("🛠️ Troubleshoot")
+                .style(ButtonStyle::Secondary),
+        ])])
+}
+
+fn project_link_button(binding: &ProjectBinding) -> CreateButton {
+    CreateButton::new_link(format!(
+        "https://discord.com/channels/{}/{}",
+        binding.guild_id, binding.channel_id
+    ))
+    .label("← Open Project")
+}
+
+fn help_topic_message(
+    topic: &str,
+    current_channel_id: u64,
+    task: Option<&TaskRecord>,
+    binding: Option<&ProjectBinding>,
+) -> CreateInteractionResponseMessage {
+    let (title, description) = match topic {
+        "discord" => (
+            "📱 在 Discord 開始開發",
+            "1. 開啟 repository 的 Project Home。\n2. 點 **New task**，輸入標題與需求。\n3. 之後直接在 task thread 回覆，即可保留同一個 context。",
+        ),
+        "cursor" => (
+            "🖥️ 回到電腦接續",
+            "1. 等目前的 Discord 回覆完成。\n2. 點 **Continue on computer**。\n3. 複製卡片顯示的 `make session-resume ...` 到主機執行。\n4. 正常離開 Cursor 後，再回同一個 thread。",
+        ),
+        "attach" => (
+            "📤 將本機 Cursor chat 發佈到 Discord",
+            "1. 先正常離開 Cursor terminal。\n2. 回到相同 repository 的 Project Home。\n3. 點 **Attach local chat**，選擇 chat 並輸入 thread title。",
+        ),
+        _ => (
+            "🛠️ 快速排除問題",
+            "• 卡片狀態未更新：點 **Refresh**。\n• Cursor handoff 顯示 busy：等待回覆完成或先 **Stop**。\n• Attach 找不到 chat：先正常離開 Cursor UI。\n• Workspace 不符：回到正確的 Project Home。",
+        ),
+    };
+    let mut buttons = Vec::new();
+    match topic {
+        "discord" => {
+            if let Some(binding) = binding {
+                if binding.channel_id == current_channel_id {
+                    buttons.push(
+                        CreateButton::new("oab_project:new")
+                            .label("▶ New task")
+                            .style(ButtonStyle::Primary),
+                    );
+                } else {
+                    buttons.push(project_link_button(binding));
+                }
+            }
+        }
+        "cursor" => {
+            if task.is_some_and(|task| matches!(task.state, TaskState::Ready | TaskState::Failed)) {
+                buttons.push(
+                    CreateButton::new("oab_session:detach")
+                        .label("🖥️ Continue on computer")
+                        .style(ButtonStyle::Primary),
+                );
+            }
+        }
+        "attach" => {
+            if let Some(binding) = binding {
+                if binding.channel_id == current_channel_id {
+                    buttons.push(
+                        CreateButton::new("oab_project:attach")
+                            .label("📤 Attach local chat")
+                            .style(ButtonStyle::Primary),
+                    );
+                } else {
+                    buttons.push(project_link_button(binding));
+                }
+            }
+        }
+        _ => {
+            if task.is_some() {
+                buttons.push(
+                    CreateButton::new("oab_session:refresh")
+                        .label("↻ Refresh status")
+                        .style(ButtonStyle::Primary),
+                );
+            }
+        }
+    }
+    buttons.push(
+        CreateButton::new("oab_help:back")
+            .label("← Back")
+            .style(ButtonStyle::Secondary),
+    );
+    CreateInteractionResponseMessage::new()
+        .embed(
+            CreateEmbed::new()
+                .title(title)
+                .description(description)
+                .colour(0x5865F2),
+        )
+        .components(vec![CreateActionRow::Buttons(buttons)])
+}
+
+fn task_prompt_modal(action: &str, initial_prompt: Option<&str>) -> CreateModal {
+    let (title, label, placeholder) = if action == "edit" {
+        (
+            "Edit and retry",
+            "Update the request before retrying",
+            "Adjust the outcome, constraints, or verification steps",
+        )
+    } else {
+        (
+            "Continue this task",
+            "What should Cursor do next?",
+            "Describe the next outcome and how to verify it",
+        )
+    };
+    let mut input = CreateInputText::new(InputTextStyle::Paragraph, label, "prompt")
+        .placeholder(placeholder)
+        .min_length(1)
+        .max_length(4000);
+    if let Some(prompt) = initial_prompt {
+        input = input.value(truncate_for_discord(prompt, 4000));
+    }
+    CreateModal::new(format!("oab_task_prompt:{action}"), title)
+        .components(vec![CreateActionRow::InputText(input)])
 }
 
 fn modal_input_value<'a>(
@@ -1775,6 +2005,15 @@ impl EventHandler for Handler {
                 }
             }
         }
+        if !prompt.trim().is_empty() {
+            if let Ok(thread_id) = thread_channel.channel_id.parse::<u64>() {
+                if self.task_registry.task_for_thread(thread_id).is_some() {
+                    if let Err(error) = self.task_registry.record_prompt(thread_id, &prompt) {
+                        tracing::warn!(%error, thread_id, "failed to save retryable Discord prompt");
+                    }
+                }
+            }
+        }
 
         // Notify user if any images couldn't be processed.
         if !failed_image_files.is_empty() {
@@ -2445,6 +2684,12 @@ impl EventHandler for Handler {
             Interaction::Component(comp) if comp.data.custom_id.starts_with("oab_session:") => {
                 self.handle_session_control(&ctx, &comp).await;
             }
+            Interaction::Component(comp) if comp.data.custom_id.starts_with("oab_task:") => {
+                self.handle_task_control(&ctx, &comp).await;
+            }
+            Interaction::Component(comp) if comp.data.custom_id.starts_with("oab_help:") => {
+                self.handle_help_component(&ctx, &comp).await;
+            }
             Interaction::Component(comp) if comp.data.custom_id.starts_with("oab_project:") => {
                 self.handle_project_component(&ctx, &comp).await;
             }
@@ -2461,6 +2706,9 @@ impl EventHandler for Handler {
                 if modal.data.custom_id.starts_with("oab_project_attach:") =>
             {
                 self.handle_project_attach_modal(&ctx, &modal).await;
+            }
+            Interaction::Modal(modal) if modal.data.custom_id.starts_with("oab_task_prompt:") => {
+                self.handle_task_prompt_modal(&ctx, &modal).await;
             }
             Interaction::Component(comp) if comp.data.custom_id.starts_with("acp_config_") => {
                 self.handle_config_select(&ctx, &comp).await;
@@ -2481,7 +2729,7 @@ impl Handler {
         ctx: &Context,
         cmd: &serenity::model::application::CommandInteraction,
     ) {
-        let scope = match self.resolve_command_scope(ctx, cmd).await {
+        let _scope = match self.resolve_command_scope(ctx, cmd).await {
             Ok(scope) => scope,
             Err(message) => {
                 let response = CreateInteractionResponse::Message(
@@ -2493,49 +2741,78 @@ impl Handler {
                 return;
             }
         };
-        let resume_id = if scope.channel_ref.parent_id.is_some() {
-            cmd.channel_id.to_string()
-        } else {
-            "<THREAD_ID>".to_string()
-        };
-        let embed = CreateEmbed::new()
-            .title("🧭 OpenAB 使用指南")
-            .description(
-                "Project channel 對應一個 repository；每個 task thread 保留一個 Cursor session 與 context。",
-            )
-            .colour(0x5865F2)
-            .field(
-                "📱 在外面 · 用 Discord 開發",
-                "1. 進入 repository 的 Project Home。\n2. 點 **New task**，填寫標題與需求。\n3. 到新 thread 查看 Task Status 並持續回覆。\n4. Project Home 的 **Recent tasks** 可快速找回任務。",
-                false,
-            )
-            .field(
-                "🖥️ 回到家 · 在 Cursor CLI 接續",
-                format!(
-                    "1. 在 task thread 開啟 `/session status`。\n2. 點選 **Prepare for Cursor**。\n3. 在主機執行 `make session-resume THREAD_ID={resume_id}`。\n4. 正常離開 Cursor，再回同一 Discord thread 接續。"
-                ),
-                false,
-            )
-            .field(
-                "📤 從電腦發佈既有 Cursor chat",
-                "1. 正常離開本機 Cursor terminal UI。\n2. 在 Project Home 點 **Attach local chat**，從最近清單選擇。\n3. 輸入 thread title；OpenAB 會建立或綁定 task thread。",
-                false,
-            )
-            .field(
-                "常用指令",
-                "`/project list` 列出專案頻道\n`/workspace status` 確認當前 repository\n`/session status` 開啟 session 控制面板\n`/session attach` 綁定已退出的 Cursor chat\n`/cancel` 中止當前任務",
-                false,
-            )
-            .footer(CreateEmbedFooter::new(
-                "不要同時用 Discord 與 Cursor 操作同一個 session",
-            ));
+        let avatar_url = ctx.cache.current_user().avatar_url();
         let response = CreateInteractionResponse::Message(
-            CreateInteractionResponseMessage::new()
-                .embed(embed)
-                .ephemeral(true),
+            help_action_center(avatar_url.as_deref()).ephemeral(true),
         );
         if let Err(error) = cmd.create_response(&ctx.http, response).await {
             tracing::error!(%error, "failed to respond to /help command");
+        }
+    }
+
+    async fn handle_help_component(
+        &self,
+        ctx: &Context,
+        comp: &serenity::model::application::ComponentInteraction,
+    ) {
+        if comp.user.bot
+            || is_denied_user(
+                false,
+                self.allow_all_users,
+                &self.allowed_users,
+                comp.user.id.get(),
+            )
+        {
+            let response = CreateInteractionResponse::Message(
+                CreateInteractionResponseMessage::new()
+                    .content("🚫 你沒有使用這個 Bot 的權限。")
+                    .ephemeral(true),
+            );
+            let _ = comp.create_response(&ctx.http, response).await;
+            return;
+        }
+        let topic = comp
+            .data
+            .custom_id
+            .strip_prefix("oab_help:")
+            .unwrap_or("open");
+        if matches!(topic, "open" | "back") {
+            let avatar_url = ctx.cache.current_user().avatar_url();
+            let response = if topic == "back" {
+                CreateInteractionResponse::UpdateMessage(help_action_center(avatar_url.as_deref()))
+            } else {
+                CreateInteractionResponse::Message(
+                    help_action_center(avatar_url.as_deref()).ephemeral(true),
+                )
+            };
+            if let Err(error) = comp.create_response(&ctx.http, response).await {
+                tracing::error!(%error, "failed to open help action center");
+            }
+            return;
+        }
+
+        let task = self.task_registry.task_for_thread(comp.channel_id.get());
+        let binding = task
+            .as_ref()
+            .and_then(|task| {
+                self.project_registry
+                    .binding_for_channel(task.project_channel_id)
+            })
+            .or_else(|| {
+                self.project_registry
+                    .binding_for_channel(comp.channel_id.get())
+            });
+        let message = help_topic_message(
+            topic,
+            comp.channel_id.get(),
+            task.as_ref(),
+            binding.as_ref(),
+        );
+        if let Err(error) = comp
+            .create_response(&ctx.http, CreateInteractionResponse::UpdateMessage(message))
+            .await
+        {
+            tracing::error!(%error, topic, "failed to update help action center");
         }
     }
 
@@ -2719,6 +2996,7 @@ impl Handler {
                 state: TaskState::Ready,
                 queued_messages: 0,
                 last_error: None,
+                last_prompt: None,
                 created_at: now,
                 updated_at: now,
             })
@@ -3865,6 +4143,275 @@ impl Handler {
         }
     }
 
+    async fn submit_task_prompt(
+        &self,
+        ctx: &Context,
+        task: &TaskRecord,
+        expected_state: TaskState,
+        user: &serenity::model::user::User,
+        prompt: String,
+    ) -> Result<(), String> {
+        let current = self
+            .task_registry
+            .task_for_thread(task.thread_id)
+            .ok_or_else(|| "Task metadata is no longer available.".to_string())?;
+        if current.state != expected_state {
+            return Err("Task state changed. Refresh the card and try again.".to_string());
+        }
+        self.task_registry
+            .record_prompt(task.thread_id, &prompt)
+            .map_err(|error| format!("Could not save retry request: {error}"))?;
+        let preview = suppress_mentions(&truncate_for_discord(&prompt, 1800));
+        let user_id = user.id.get();
+        let trigger = ChannelId::new(task.thread_id)
+            .send_message(
+                &ctx.http,
+                CreateMessage::new()
+                    .content(format!("👤 **Request from <@{user_id}>**\n{preview}")),
+            )
+            .await
+            .map_err(|error| format!("Could not post request to the task thread: {error}"))?;
+        let thread_channel = ChannelRef {
+            platform: "discord".into(),
+            channel_id: task.thread_id.to_string(),
+            thread_id: None,
+            parent_id: Some(task.project_channel_id.to_string()),
+            origin_event_id: None,
+        };
+        let trigger_ref = MessageRef {
+            channel: thread_channel.clone(),
+            message_id: trigger.id.to_string(),
+        };
+        let sender = build_sender_context(
+            &user_id.to_string(),
+            &user.name,
+            user.global_name.as_deref().unwrap_or(&user.name),
+            &task.thread_id.to_string(),
+            Some(&task.project_channel_id.to_string()),
+            false,
+            &chrono::Utc::now().to_rfc3339(),
+            &trigger.id.to_string(),
+            &ctx.cache.current_user().id.to_string(),
+        );
+        let dispatcher = self.dispatcher.clone();
+        let adapter = self.discord_adapter(ctx);
+        tokio::spawn(async move {
+            let _ = adapter
+                .update_task_lifecycle(&thread_channel, TaskLifecycleEvent::Enqueued)
+                .await;
+            let thread_key =
+                dispatcher.key("discord", &thread_channel.channel_id, &sender.sender_id);
+            let buf_msg = crate::dispatch::BufferedMessage {
+                sender_json: serde_json::to_string(&sender).unwrap_or_default(),
+                sender_name: sender.sender_name,
+                estimated_tokens: crate::dispatch::estimate_tokens(&prompt, &[]),
+                prompt,
+                extra_blocks: Vec::new(),
+                trigger_msg: trigger_ref,
+                arrived_at: std::time::Instant::now(),
+                other_bot_present: false,
+                recipient: None,
+            };
+            if let Err(error) = dispatcher
+                .submit(thread_key, thread_channel.clone(), adapter.clone(), buf_msg)
+                .await
+            {
+                let _ = adapter
+                    .update_task_lifecycle(
+                        &thread_channel,
+                        TaskLifecycleEvent::Failed {
+                            message: error.to_string(),
+                        },
+                    )
+                    .await;
+            }
+        });
+        Ok(())
+    }
+
+    async fn handle_task_control(
+        &self,
+        ctx: &Context,
+        comp: &serenity::model::application::ComponentInteraction,
+    ) {
+        if comp.user.bot
+            || is_denied_user(
+                false,
+                self.allow_all_users,
+                &self.allowed_users,
+                comp.user.id.get(),
+            )
+        {
+            let response = CreateInteractionResponse::Message(
+                CreateInteractionResponseMessage::new()
+                    .content("🚫 你沒有操作這個 task 的權限。")
+                    .ephemeral(true),
+            );
+            let _ = comp.create_response(&ctx.http, response).await;
+            return;
+        }
+        let Some(task) = self.task_registry.task_for_thread(comp.channel_id.get()) else {
+            let response = CreateInteractionResponse::Message(
+                CreateInteractionResponseMessage::new()
+                    .content("⚠️ Task metadata is unavailable. Refresh Project Home.")
+                    .ephemeral(true),
+            );
+            let _ = comp.create_response(&ctx.http, response).await;
+            return;
+        };
+        let action = comp.data.custom_id.strip_prefix("oab_task:").unwrap_or("");
+        if action == "continue" || action == "edit" {
+            let expected = if action == "edit" {
+                TaskState::Failed
+            } else {
+                TaskState::Ready
+            };
+            if task.state != expected {
+                let response = CreateInteractionResponse::Message(
+                    CreateInteractionResponseMessage::new()
+                        .content("⚠️ Task state changed. Refresh the card and try again.")
+                        .ephemeral(true),
+                );
+                let _ = comp.create_response(&ctx.http, response).await;
+                return;
+            }
+            let modal = task_prompt_modal(
+                action,
+                (action == "edit")
+                    .then_some(task.last_prompt.as_deref())
+                    .flatten(),
+            );
+            if let Err(error) = comp
+                .create_response(&ctx.http, CreateInteractionResponse::Modal(modal))
+                .await
+            {
+                tracing::error!(%error, action, "failed to open task prompt modal");
+            }
+            return;
+        }
+        if action == "error" {
+            let error = task
+                .last_error
+                .as_deref()
+                .unwrap_or("No error details were recorded for this task.");
+            let response = CreateInteractionResponse::Message(
+                CreateInteractionResponseMessage::new()
+                    .embed(
+                        CreateEmbed::new()
+                            .title("🔍 Error details")
+                            .description(truncate_for_discord(error, 3900))
+                            .colour(0xE74C3C)
+                            .footer(CreateEmbedFooter::new(
+                                "Retry, edit the request, or continue in Cursor",
+                            )),
+                    )
+                    .ephemeral(true),
+            );
+            let _ = comp.create_response(&ctx.http, response).await;
+            return;
+        }
+        if action != "retry" || task.state != TaskState::Failed {
+            let response = CreateInteractionResponse::Message(
+                CreateInteractionResponseMessage::new()
+                    .content("⚠️ This task control is no longer available.")
+                    .ephemeral(true),
+            );
+            let _ = comp.create_response(&ctx.http, response).await;
+            return;
+        }
+        let Some(prompt) = task.last_prompt.clone() else {
+            let response = CreateInteractionResponse::Message(
+                CreateInteractionResponseMessage::new()
+                    .content("⚠️ No retryable text request was recorded. Use Edit and retry.")
+                    .ephemeral(true),
+            );
+            let _ = comp.create_response(&ctx.http, response).await;
+            return;
+        };
+        if let Err(error) = comp.defer_ephemeral(&ctx.http).await {
+            tracing::error!(%error, "failed to defer task retry");
+            return;
+        }
+        let result = self
+            .submit_task_prompt(ctx, &task, TaskState::Failed, &comp.user, prompt)
+            .await;
+        let content = result.map_or_else(
+            |error| format!("⚠️ Could not retry: {error}"),
+            |()| format!("✅ Retry queued in <#{}>.", task.thread_id),
+        );
+        let _ = comp
+            .edit_response(&ctx.http, EditInteractionResponse::new().content(content))
+            .await;
+    }
+
+    async fn handle_task_prompt_modal(
+        &self,
+        ctx: &Context,
+        modal: &serenity::model::application::ModalInteraction,
+    ) {
+        if modal.user.bot
+            || is_denied_user(
+                false,
+                self.allow_all_users,
+                &self.allowed_users,
+                modal.user.id.get(),
+            )
+        {
+            let response = CreateInteractionResponse::Message(
+                CreateInteractionResponseMessage::new()
+                    .content("🚫 你沒有操作這個 task 的權限。")
+                    .ephemeral(true),
+            );
+            let _ = modal.create_response(&ctx.http, response).await;
+            return;
+        }
+        let action = modal
+            .data
+            .custom_id
+            .strip_prefix("oab_task_prompt:")
+            .unwrap_or("");
+        let expected_state = if action == "edit" {
+            TaskState::Failed
+        } else {
+            TaskState::Ready
+        };
+        let Some(task) = self.task_registry.task_for_thread(modal.channel_id.get()) else {
+            let response = CreateInteractionResponse::Message(
+                CreateInteractionResponseMessage::new()
+                    .content("⚠️ Task metadata is unavailable.")
+                    .ephemeral(true),
+            );
+            let _ = modal.create_response(&ctx.http, response).await;
+            return;
+        };
+        let prompt = modal_input_value(modal, "prompt")
+            .map(str::trim)
+            .unwrap_or("");
+        if prompt.is_empty() {
+            let response = CreateInteractionResponse::Message(
+                CreateInteractionResponseMessage::new()
+                    .content("⚠️ Request cannot be empty.")
+                    .ephemeral(true),
+            );
+            let _ = modal.create_response(&ctx.http, response).await;
+            return;
+        }
+        if let Err(error) = modal.defer_ephemeral(&ctx.http).await {
+            tracing::error!(%error, "failed to defer task prompt modal");
+            return;
+        }
+        let result = self
+            .submit_task_prompt(ctx, &task, expected_state, &modal.user, prompt.to_string())
+            .await;
+        let content = result.map_or_else(
+            |error| format!("⚠️ Could not submit request: {error}"),
+            |()| format!("✅ Request queued in <#{}>.", task.thread_id),
+        );
+        let _ = modal
+            .edit_response(&ctx.http, EditInteractionResponse::new().content(content))
+            .await;
+    }
+
     async fn handle_project_component(
         &self,
         ctx: &Context,
@@ -4108,7 +4655,7 @@ impl Handler {
                 &ctx.http,
                 CreateMessage::new().content(format!(
                     "🧵 **{}**\nStarted by <@{}> via Project Home",
-                    suppress_mentions(&title.replace('*', "").replace('`', "")),
+                    suppress_mentions(&title.replace(['*', '`'], "")),
                     modal.user.id
                 )),
             )
@@ -4164,6 +4711,9 @@ impl Handler {
                 return;
             }
         };
+        if let Err(error) = self.task_registry.record_prompt(task.thread_id, prompt) {
+            tracing::warn!(%error, thread_id = task.thread_id, "failed to save retryable task prompt");
+        }
         let request_preview = suppress_mentions(&truncate_for_discord(prompt, 1800));
         if let Err(error) = thread
             .id
@@ -6309,6 +6859,55 @@ mod tests {
             session_state_presentation(SessionState::Persisted, true).0,
             "Cursor 接手中"
         );
+    }
+
+    fn ui_task(state: TaskState, last_prompt: Option<&str>) -> TaskRecord {
+        let now = chrono::Utc::now();
+        TaskRecord {
+            guild_id: 1,
+            project_channel_id: 2,
+            workspace_alias: "api".into(),
+            thread_id: 3,
+            title: "Fix API".into(),
+            created_by: 4,
+            status_message_id: Some(5),
+            state,
+            queued_messages: 0,
+            last_error: (state == TaskState::Failed).then(|| "agent exited".into()),
+            last_prompt: last_prompt.map(str::to_string),
+            created_at: now,
+            updated_at: now,
+        }
+    }
+
+    #[test]
+    fn task_controls_are_contextual_instead_of_disabled() {
+        let ready =
+            serde_json::to_string(&task_control_rows(&ui_task(TaskState::Ready, None))).unwrap();
+        assert!(ready.contains("oab_task:continue"));
+        assert!(ready.contains("oab_session:detach"));
+        assert!(!ready.contains("oab_task:retry"));
+
+        let running =
+            serde_json::to_string(&task_control_rows(&ui_task(TaskState::Running, None))).unwrap();
+        assert!(running.contains("oab_session:cancel"));
+        assert!(!running.contains("oab_session:detach"));
+
+        let failed = serde_json::to_string(&task_control_rows(&ui_task(
+            TaskState::Failed,
+            Some("retry me"),
+        )))
+        .unwrap();
+        assert!(failed.contains("oab_task:retry"));
+        assert!(failed.contains("oab_task:edit"));
+        assert!(failed.contains("oab_task:error"));
+    }
+
+    #[test]
+    fn cursor_task_card_contains_copyable_resume_command() {
+        let embed =
+            serde_json::to_string(&task_status_embed(&ui_task(TaskState::Cursor, None))).unwrap();
+        assert!(embed.contains("make session-resume THREAD_ID=3"));
     }
 
     #[test]
