@@ -220,6 +220,89 @@ class CursorCliAcpTest(unittest.TestCase):
         self.assertEqual(len(output.getvalue().splitlines()), 1)
         self.assertEqual(state["streamed_text"], text)
 
+    def test_delayed_long_adjacent_duplicate_is_removed(self):
+        text = "從正文歸納世界觀，先開 session 並掃讀現有設定與關鍵規則。"
+        state = {
+            "sent_text": False,
+            "streamed_text": "",
+            "result_seen": False,
+            "is_error": False,
+        }
+        output = io.StringIO()
+        event = {
+            "type": "assistant",
+            "timestamp_ms": 1_000,
+            "model_call_id": "model-call-1",
+            "message": {"content": [{"type": "text", "text": text}]},
+        }
+        with mock.patch.object(bridge.sys, "stdout", output):
+            bridge.emit_stream_event(self.chat_id, event, state)
+            bridge.emit_stream_event(
+                self.chat_id,
+                {
+                    **event,
+                    "timestamp_ms": (
+                        1_000 + bridge.PARTIAL_DUPLICATE_WINDOW_MS + 10_000
+                    ),
+                },
+                state,
+            )
+
+        self.assertEqual(len(output.getvalue().splitlines()), 1)
+        self.assertEqual(state["streamed_text"], text)
+
+    def test_delayed_long_duplicate_after_tool_event_is_removed(self):
+        text = "Inspect the workspace before changing the implementation."
+        state = {
+            "sent_text": False,
+            "streamed_text": "",
+            "result_seen": False,
+            "is_error": False,
+        }
+        output = io.StringIO()
+        with mock.patch.object(bridge.sys, "stdout", output):
+            bridge.emit_stream_event(
+                self.chat_id,
+                {
+                    "type": "assistant",
+                    "timestamp_ms": 1_000,
+                    "model_call_id": "model-call-1",
+                    "message": {"content": [{"type": "text", "text": text}]},
+                },
+                state,
+            )
+            bridge.emit_stream_event(
+                self.chat_id,
+                {
+                    "type": "tool_call",
+                    "subtype": "started",
+                    "call_id": "tool-1",
+                    "tool_call": {"readToolCall": {}},
+                },
+                state,
+            )
+            bridge.emit_stream_event(
+                self.chat_id,
+                {
+                    "type": "assistant",
+                    "timestamp_ms": (
+                        1_000 + bridge.PARTIAL_DUPLICATE_WINDOW_MS + 10_000
+                    ),
+                    "model_call_id": "model-call-2",
+                    "message": {"content": [{"type": "text", "text": text}]},
+                },
+                state,
+            )
+
+        text_messages = [
+            json.loads(line)
+            for line in output.getvalue().splitlines()
+            if json.loads(line)["params"]["update"]["sessionUpdate"]
+            == "agent_message_chunk"
+        ]
+        self.assertEqual(len(text_messages), 1)
+        self.assertEqual(state["streamed_text"], text)
+
     def test_per_tool_phase_snapshot_does_not_repeat_current_segment(self):
         first = "first progress sentence"
         second = "second progress sentence"
