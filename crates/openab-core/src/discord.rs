@@ -5972,14 +5972,21 @@ impl Handler {
             return;
         }
 
-        let auth_cmd = match std::env::var("OPENAB_AGENT_AUTH_COMMAND") {
-            Ok(val) if !val.is_empty() => val,
-            _ => {
+        let auth_cmd = ["OPENAB_AGENT_LOGIN_COMMAND", "OPENAB_AGENT_AUTH_COMMAND"]
+            .into_iter()
+            .find_map(|key| {
+                std::env::var(key)
+                    .ok()
+                    .filter(|value| !value.trim().is_empty())
+            });
+        let auth_cmd = match auth_cmd {
+            Some(command) => command,
+            None => {
                 AUTH_IN_PROGRESS.store(false, std::sync::atomic::Ordering::Release);
                 let response = CreateInteractionResponse::Message(
                     CreateInteractionResponseMessage::new()
                         .content(
-                            "⚠️ No auth command configured (`OPENAB_AGENT_AUTH_COMMAND` not set).",
+                            "⚠️ No login command configured (`OPENAB_AGENT_LOGIN_COMMAND` or legacy `OPENAB_AGENT_AUTH_COMMAND` not set).",
                         )
                         .ephemeral(true),
                 );
@@ -6149,7 +6156,7 @@ impl Handler {
                 let _ = http.create_followup_message(
                     &token,
                     &CreateInteractionResponseFollowup::new()
-                        .content("⚠️ Auth command produced no output within 30 seconds. Verify `OPENAB_AGENT_AUTH_COMMAND` is set and prints a login URL to stdout/stderr.")
+                        .content("⚠️ Login command produced no output within 30 seconds. Verify `OPENAB_AGENT_LOGIN_COMMAND` (or legacy `OPENAB_AGENT_AUTH_COMMAND`) is set and prints a login URL to stdout/stderr.")
                         .ephemeral(true),
                     Vec::new(),
                 ).await;

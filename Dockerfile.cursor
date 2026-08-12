@@ -56,7 +56,9 @@ USER agent
 HEALTHCHECK --interval=30s --timeout=5s --retries=3 \
   CMD pgrep -x openab || exit 1
 ENV OPENAB_AGENT_COMMAND="cursor-cli-acp"
-ENV OPENAB_AGENT_AUTH_COMMAND="cursor-agent login"
+# Login command only; credentials remain in the runtime-mounted Cursor auth store.
+# LOGIN avoids BuildKit treating this non-secret command as a baked-in credential.
+ENV OPENAB_AGENT_LOGIN_COMMAND="cursor-agent login"
 
 ENTRYPOINT ["tini", "--"]
 CMD ["openab", "run", "-c", "/etc/openab/config.toml"]
