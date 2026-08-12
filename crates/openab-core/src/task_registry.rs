@@ -177,6 +177,26 @@ impl TaskRegistry {
         tasks
     }
 
+    /// Remove one task from the Discord UI registry.
+    ///
+    /// Session state must be closed separately before calling this method. Keeping
+    /// the two operations explicit prevents a UI cleanup from silently destroying
+    /// a resumable Cursor session.
+    pub fn remove_task(&self, thread_id: u64) -> anyhow::Result<Option<TaskRecord>> {
+        let mut tasks = self
+            .tasks
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let Some(task) = tasks.remove(&thread_id) else {
+            return Ok(None);
+        };
+        if let Err(error) = self.persist_locked(&tasks) {
+            tasks.insert(thread_id, task);
+            return Err(error);
+        }
+        Ok(Some(task))
+    }
+
     pub fn remove_project(&self, project_channel_id: u64) -> anyhow::Result<usize> {
         let mut tasks = self
             .tasks
@@ -307,5 +327,24 @@ mod tests {
 
         let restored = TaskRegistry::load(path);
         assert_eq!(restored.task_for_thread(20).unwrap(), updated);
+    }
+
+    #[test]
+    fn remove_task_only_removes_the_selected_record_and_persists() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("tasks.json");
+        let registry = TaskRegistry::load(path.clone());
+        registry.ensure(task(20)).unwrap();
+        registry.ensure(task(21)).unwrap();
+
+        let removed = registry.remove_task(20).unwrap().unwrap();
+        assert_eq!(removed.thread_id, 20);
+        assert!(registry.task_for_thread(20).is_none());
+        assert!(registry.task_for_thread(21).is_some());
+
+        let restored = TaskRegistry::load(path);
+        assert!(restored.task_for_thread(20).is_none());
+        assert!(restored.task_for_thread(21).is_some());
+        assert!(restored.remove_task(999).unwrap().is_none());
     }
 }
