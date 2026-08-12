@@ -208,12 +208,47 @@ fn session_state_presentation(
     }
 }
 
-fn session_control_message(
+const SESSION_CLOSE_CONFIRMATION: &str = "⚠️ **Close this session?** This stops current work, drops buffered messages, and removes the OpenAB session mapping. The repository, Discord thread, and Cursor checkpoint are kept; the next message starts a new session context.";
+
+fn session_closed_note(dropped: usize) -> String {
+    if dropped > 0 {
+        format!(
+            "✅ Session closed and {dropped} buffered message(s) dropped. Cursor checkpoint was kept; send a new message to start a fresh session context."
+        )
+    } else {
+        "✅ Session closed. Cursor checkpoint was kept; send a new message to start a fresh session context."
+            .to_string()
+    }
+}
+
+struct InteractionCard {
+    content: String,
+    embed: CreateEmbed,
+    components: Vec<CreateActionRow>,
+}
+
+impl InteractionCard {
+    fn into_message(self) -> CreateInteractionResponseMessage {
+        CreateInteractionResponseMessage::new()
+            .content(self.content)
+            .embed(self.embed)
+            .components(self.components)
+    }
+
+    fn into_edit(self) -> EditInteractionResponse {
+        EditInteractionResponse::new()
+            .content(self.content)
+            .embed(self.embed)
+            .components(self.components)
+    }
+}
+
+fn session_control_card(
     snapshot: &SessionSnapshot,
     aliases: &HashMap<String, String>,
     channel_id: u64,
     note: Option<String>,
-) -> CreateInteractionResponseMessage {
+) -> InteractionCard {
     let (state, colour, guidance) =
         session_state_presentation(snapshot.state, snapshot.externally_detached);
     let workspace = snapshot
@@ -256,13 +291,31 @@ fn session_control_message(
             .label("? Help")
             .style(ButtonStyle::Secondary),
     ]);
-    let mut message = CreateInteractionResponseMessage::new()
-        .embed(embed)
-        .components(vec![buttons]);
-    if let Some(note) = note {
-        message = message.content(truncate_for_discord(&note, 1900));
+    InteractionCard {
+        content: note
+            .map(|value| truncate_for_discord(&value, 1900))
+            .unwrap_or_default(),
+        embed,
+        components: vec![buttons],
     }
-    message
+}
+
+fn session_control_message(
+    snapshot: &SessionSnapshot,
+    aliases: &HashMap<String, String>,
+    channel_id: u64,
+    note: Option<String>,
+) -> CreateInteractionResponseMessage {
+    session_control_card(snapshot, aliases, channel_id, note).into_message()
+}
+
+fn session_control_edit(
+    snapshot: &SessionSnapshot,
+    aliases: &HashMap<String, String>,
+    channel_id: u64,
+    note: Option<String>,
+) -> EditInteractionResponse {
+    session_control_card(snapshot, aliases, channel_id, note).into_edit()
 }
 
 fn project_access_display(binding: &ProjectBinding) -> String {
@@ -439,17 +492,17 @@ fn task_status_edit(task: &TaskRecord) -> EditMessage {
         .components(task_control_rows(task))
 }
 
-fn task_status_interaction_message(
+fn task_status_interaction_edit(
     task: &TaskRecord,
     note: Option<String>,
-) -> CreateInteractionResponseMessage {
-    let mut message = CreateInteractionResponseMessage::new()
+) -> EditInteractionResponse {
+    EditInteractionResponse::new()
+        .content(
+            note.map(|value| truncate_for_discord(&value, 1900))
+                .unwrap_or_default(),
+        )
         .embed(task_status_embed(task))
-        .components(task_control_rows(task));
-    if let Some(note) = note {
-        message = message.content(truncate_for_discord(&note, 1900));
-    }
-    message
+        .components(task_control_rows(task))
 }
 
 fn project_recent_tasks(tasks: &[TaskRecord]) -> String {
@@ -728,12 +781,26 @@ fn managed_session_presentation(entry: &ManagedSessionEntry) -> (&'static str, &
     }
 }
 
-fn session_manager_message(
+fn reconciled_handoff_task_state(
+    task_state: TaskState,
+    snapshot: &SessionSnapshot,
+) -> Option<TaskState> {
+    if task_state != TaskState::Cursor || snapshot.externally_detached {
+        return None;
+    }
+    Some(if snapshot.state == SessionState::None {
+        TaskState::Closed
+    } else {
+        TaskState::Ready
+    })
+}
+
+fn session_manager_card(
     binding: &ProjectBinding,
     entries: &[ManagedSessionEntry],
     selected_thread_id: Option<u64>,
     note: Option<String>,
-) -> CreateInteractionResponseMessage {
+) -> InteractionCard {
     let selected = selected_thread_id.and_then(|thread_id| {
         entries
             .iter()
@@ -919,13 +986,32 @@ fn session_manager_message(
     );
     rows.push(CreateActionRow::Buttons(buttons));
 
-    let mut message = CreateInteractionResponseMessage::new()
-        .embed(embed)
-        .components(rows);
-    if let Some(note) = note {
-        message = message.content(truncate_for_discord(&note, 1900));
+    InteractionCard {
+        content: note
+            .map(|value| truncate_for_discord(&value, 1900))
+            .unwrap_or_default(),
+        embed,
+        components: rows,
     }
-    message
+}
+
+#[cfg(test)]
+fn session_manager_message(
+    binding: &ProjectBinding,
+    entries: &[ManagedSessionEntry],
+    selected_thread_id: Option<u64>,
+    note: Option<String>,
+) -> CreateInteractionResponseMessage {
+    session_manager_card(binding, entries, selected_thread_id, note).into_message()
+}
+
+fn session_manager_edit(
+    binding: &ProjectBinding,
+    entries: &[ManagedSessionEntry],
+    selected_thread_id: Option<u64>,
+    note: Option<String>,
+) -> EditInteractionResponse {
+    session_manager_card(binding, entries, selected_thread_id, note).into_edit()
 }
 
 fn task_prompt_modal(action: &str, initial_prompt: Option<&str>) -> CreateModal {
@@ -2963,12 +3049,17 @@ impl Handler {
             .task_registry
             .recent_for_project(project_channel_id, SELECT_MENU_PAGE_SIZE);
         let mut entries = Vec::with_capacity(tasks.len());
-        for task in tasks {
+        for mut task in tasks {
             let snapshot = self
                 .router
                 .pool()
                 .session_snapshot(&format!("discord:{}", task.thread_id))
                 .await;
+            if let Some(state) = reconciled_handoff_task_state(task.state, &snapshot) {
+                if let Ok(updated) = self.task_registry.set_state(task.thread_id, state) {
+                    task = updated;
+                }
+            }
             entries.push(ManagedSessionEntry { task, snapshot });
         }
         entries
@@ -3068,10 +3159,16 @@ impl Handler {
                     .await;
                 return;
             };
+            if let Err(error) = comp.defer(&ctx.http).await {
+                tracing::error!(%error, "failed to defer session manager from help");
+                return;
+            }
             let entries = self.managed_sessions_for_project(binding.channel_id).await;
-            let message = session_manager_message(&binding, &entries, None, None);
             if let Err(error) = comp
-                .create_response(&ctx.http, CreateInteractionResponse::UpdateMessage(message))
+                .edit_response(
+                    &ctx.http,
+                    session_manager_edit(&binding, &entries, None, None),
+                )
                 .await
             {
                 tracing::error!(%error, "failed to open session manager from help");
@@ -3132,15 +3229,25 @@ impl Handler {
             return;
         };
 
+        if let Err(error) = comp.defer(&ctx.http).await {
+            tracing::error!(%error, action, "failed to defer Session Manager interaction");
+            return;
+        }
+
         let binding = match self.project_binding_for_channel(ctx, comp.channel_id).await {
             Ok((binding, _)) if binding.channel_id == project_channel_id => binding,
             _ => {
-                let response = CreateInteractionResponse::Message(
-                    CreateInteractionResponseMessage::new()
-                        .content("🚫 This Session Manager does not belong to the current project.")
-                        .ephemeral(true),
-                );
-                let _ = comp.create_response(&ctx.http, response).await;
+                let _ = comp
+                    .edit_response(
+                        &ctx.http,
+                        EditInteractionResponse::new()
+                            .content(
+                                "🚫 This Session Manager does not belong to the current project.",
+                            )
+                            .embeds(Vec::new())
+                            .components(Vec::new()),
+                    )
+                    .await;
                 return;
             }
         };
@@ -3158,22 +3265,28 @@ impl Handler {
 
         if action == "open" {
             let entries = self.managed_sessions_for_project(project_channel_id).await;
-            let response = CreateInteractionResponse::UpdateMessage(session_manager_message(
-                &binding, &entries, None, None,
-            ));
-            let _ = comp.create_response(&ctx.http, response).await;
+            let _ = comp
+                .edit_response(
+                    &ctx.http,
+                    session_manager_edit(&binding, &entries, None, None),
+                )
+                .await;
             return;
         }
 
         let Some(thread_id) = selected_thread_id else {
             let entries = self.managed_sessions_for_project(project_channel_id).await;
-            let response = CreateInteractionResponse::UpdateMessage(session_manager_message(
-                &binding,
-                &entries,
-                None,
-                Some("⚠️ 請重新選擇一個 session。".to_string()),
-            ));
-            let _ = comp.create_response(&ctx.http, response).await;
+            let _ = comp
+                .edit_response(
+                    &ctx.http,
+                    session_manager_edit(
+                        &binding,
+                        &entries,
+                        None,
+                        Some("⚠️ 請重新選擇一個 session。".to_string()),
+                    ),
+                )
+                .await;
             return;
         };
         let Some(task) = self
@@ -3182,25 +3295,28 @@ impl Handler {
             .filter(|task| task.project_channel_id == project_channel_id)
         else {
             let entries = self.managed_sessions_for_project(project_channel_id).await;
-            let response = CreateInteractionResponse::UpdateMessage(session_manager_message(
-                &binding,
-                &entries,
-                None,
-                Some("⚠️ 這筆 task 已不存在，清單已更新。".to_string()),
-            ));
-            let _ = comp.create_response(&ctx.http, response).await;
+            let _ = comp
+                .edit_response(
+                    &ctx.http,
+                    session_manager_edit(
+                        &binding,
+                        &entries,
+                        None,
+                        Some("⚠️ 這筆 task 已不存在，清單已更新。".to_string()),
+                    ),
+                )
+                .await;
             return;
         };
 
         if matches!(action, "select" | "view") {
             let entries = self.managed_sessions_for_project(project_channel_id).await;
-            let response = CreateInteractionResponse::UpdateMessage(session_manager_message(
-                &binding,
-                &entries,
-                Some(thread_id),
-                None,
-            ));
-            let _ = comp.create_response(&ctx.http, response).await;
+            let _ = comp
+                .edit_response(
+                    &ctx.http,
+                    session_manager_edit(&binding, &entries, Some(thread_id), None),
+                )
+                .await;
             return;
         }
 
@@ -3212,19 +3328,24 @@ impl Handler {
                 .await;
             if snapshot.externally_detached {
                 let entries = self.managed_sessions_for_project(project_channel_id).await;
-                let response = CreateInteractionResponse::UpdateMessage(session_manager_message(
-                    &binding,
-                    &entries,
-                    Some(thread_id),
-                    Some(
-                        "⚠️ Cursor 正在電腦上使用這個 session。請先正常離開 terminal 再關閉。"
-                            .to_string(),
-                    ),
-                ));
-                let _ = comp.create_response(&ctx.http, response).await;
+                let _ = comp
+                    .edit_response(
+                        &ctx.http,
+                        session_manager_edit(
+                            &binding,
+                            &entries,
+                            Some(thread_id),
+                            Some(
+                                "⚠️ Cursor 正在電腦上使用這個 session。請先正常離開 terminal 再關閉。"
+                                    .to_string(),
+                            ),
+                        ),
+                    )
+                    .await;
                 return;
             }
-            let confirmation = CreateInteractionResponseMessage::new()
+            let confirmation = EditInteractionResponse::new()
+                .content("")
                 .embed(
                     CreateEmbed::new()
                         .title("⚠️ Close Cursor session?")
@@ -3246,12 +3367,7 @@ impl Handler {
                     .label("Keep session")
                     .style(ButtonStyle::Secondary),
                 ])]);
-            let _ = comp
-                .create_response(
-                    &ctx.http,
-                    CreateInteractionResponse::UpdateMessage(confirmation),
-                )
-                .await;
+            let _ = comp.edit_response(&ctx.http, confirmation).await;
             return;
         }
 
@@ -3284,13 +3400,12 @@ impl Handler {
                 }
             };
             let entries = self.managed_sessions_for_project(project_channel_id).await;
-            let response = CreateInteractionResponse::UpdateMessage(session_manager_message(
-                &binding,
-                &entries,
-                Some(thread_id),
-                Some(note),
-            ));
-            let _ = comp.create_response(&ctx.http, response).await;
+            let _ = comp
+                .edit_response(
+                    &ctx.http,
+                    session_manager_edit(&binding, &entries, Some(thread_id), Some(note)),
+                )
+                .await;
 
             if let Some(updated) = self.task_registry.task_for_thread(thread_id) {
                 if let Some(message_id) = updated.status_message_id {
@@ -3334,13 +3449,12 @@ impl Handler {
                 }
             };
             let entries = self.managed_sessions_for_project(project_channel_id).await;
-            let response = CreateInteractionResponse::UpdateMessage(session_manager_message(
-                &binding,
-                &entries,
-                None,
-                Some(note),
-            ));
-            let _ = comp.create_response(&ctx.http, response).await;
+            let _ = comp
+                .edit_response(
+                    &ctx.http,
+                    session_manager_edit(&binding, &entries, None, Some(note)),
+                )
+                .await;
             if let Err(error) = self.upsert_project_home(ctx, &binding).await {
                 tracing::warn!(%error, "failed to refresh Project Home after task removal");
             }
@@ -3348,13 +3462,17 @@ impl Handler {
         }
 
         let entries = self.managed_sessions_for_project(project_channel_id).await;
-        let response = CreateInteractionResponse::UpdateMessage(session_manager_message(
-            &binding,
-            &entries,
-            Some(thread_id),
-            Some("⚠️ This Session Manager action is no longer available.".to_string()),
-        ));
-        let _ = comp.create_response(&ctx.http, response).await;
+        let _ = comp
+            .edit_response(
+                &ctx.http,
+                session_manager_edit(
+                    &binding,
+                    &entries,
+                    Some(thread_id),
+                    Some("⚠️ This Session Manager action is no longer available.".to_string()),
+                ),
+            )
+            .await;
     }
 
     async fn handle_project_autocomplete(
@@ -4471,6 +4589,11 @@ impl Handler {
             return;
         }
 
+        if let Err(error) = cmd.defer_ephemeral(&ctx.http).await {
+            tracing::error!(%error, subcommand, "failed to defer /session command");
+            return;
+        }
+
         let mut task_state_update = None;
         let content = if subcommand == "close" {
             let dropped = self
@@ -4479,13 +4602,11 @@ impl Handler {
             match self.router.pool().reset_session(&scope.session_key).await {
                 Ok(()) if dropped > 0 => {
                     task_state_update = Some(TaskState::Closed);
-                    format!(
-                        "✅ Session closed and {dropped} buffered message(s) dropped. The next message starts a fresh session."
-                    )
+                    session_closed_note(dropped)
                 }
                 Ok(()) => {
                     task_state_update = Some(TaskState::Closed);
-                    "✅ Session closed. The next message starts a fresh session.".to_string()
+                    session_closed_note(0)
                 }
                 Err(_) if dropped > 0 => {
                     format!("🧹 Dropped {dropped} buffered message(s). No session state was open.")
@@ -4520,12 +4641,10 @@ impl Handler {
             }
         }
 
-        let response = CreateInteractionResponse::Message(
-            CreateInteractionResponseMessage::new()
-                .content(content)
-                .ephemeral(true),
-        );
-        if let Err(error) = cmd.create_response(&ctx.http, response).await {
+        if let Err(error) = cmd
+            .edit_response(&ctx.http, EditInteractionResponse::new().content(content))
+            .await
+        {
             tracing::error!(%error, "failed to respond to /session command");
         }
     }
@@ -4558,9 +4677,7 @@ impl Handler {
 
         if action == "close" {
             let confirmation = CreateInteractionResponseMessage::new()
-                .content(
-                    "⚠️ **Close this session?** This clears its saved conversation and buffered messages. The next message starts a new Cursor session.",
-                )
+                .content(SESSION_CLOSE_CONFIRMATION)
                 .components(vec![CreateActionRow::Buttons(vec![
                     CreateButton::new("oab_session:confirm_close")
                         .label("Close session")
@@ -4576,6 +4693,11 @@ impl Handler {
             {
                 tracing::error!(%error, "failed to show session close confirmation");
             }
+            return;
+        }
+
+        if let Err(error) = comp.defer(&ctx.http).await {
+            tracing::error!(%error, action, "failed to defer session control");
             return;
         }
 
@@ -4608,13 +4730,11 @@ impl Handler {
                     match self.router.pool().reset_session(&scope.session_key).await {
                         Ok(()) if dropped > 0 => {
                             task_state_update = Some(TaskState::Closed);
-                            format!(
-                            "✅ Session closed and {dropped} buffered message(s) dropped. Send a new message to start fresh."
-                        )
+                            session_closed_note(dropped)
                         }
                         Ok(()) => {
                             task_state_update = Some(TaskState::Closed);
-                            "✅ Session closed. Send a new message to start fresh.".to_string()
+                            session_closed_note(0)
                         }
                         Err(_) if dropped > 0 => format!(
                             "🧹 Dropped {dropped} buffered message(s). No session state was open."
@@ -4634,12 +4754,19 @@ impl Handler {
             .pool()
             .session_snapshot(&scope.session_key)
             .await;
-        let task = if let Some(state) = task_state_update {
-            self.task_registry
+        let current_task = self.task_registry.task_for_thread(comp.channel_id.get());
+        if task_state_update.is_none() {
+            task_state_update = current_task
+                .as_ref()
+                .and_then(|task| reconciled_handoff_task_state(task.state, &snapshot));
+        }
+        let task = match task_state_update {
+            Some(state) => self
+                .task_registry
                 .set_state(comp.channel_id.get(), state)
                 .ok()
-        } else {
-            self.task_registry.task_for_thread(comp.channel_id.get())
+                .or(current_task),
+            None => current_task,
         };
         if task_state_update.is_some() {
             if let Some(task) = task.as_ref() {
@@ -4668,8 +4795,8 @@ impl Handler {
             }
         }
         let message = match task {
-            Some(task) => task_status_interaction_message(&task, note),
-            None => session_control_message(
+            Some(task) => task_status_interaction_edit(&task, note),
+            None => session_control_edit(
                 &snapshot,
                 &self.router.workspace_aliases(),
                 comp.channel_id.get(),
@@ -4677,7 +4804,7 @@ impl Handler {
             ),
         };
         if let Err(error) = comp
-            .create_response(&ctx.http, CreateInteractionResponse::UpdateMessage(message))
+            .edit_response(&ctx.http, message)
             .await
         {
             tracing::error!(%error, action, "failed to update session control");
@@ -4998,11 +5125,18 @@ impl Handler {
             .strip_prefix("oab_project:")
             .unwrap_or("");
         if action == "sessions" {
+            if let Err(error) = comp.defer_ephemeral(&ctx.http).await {
+                tracing::error!(%error, "failed to defer project Session Manager");
+                return;
+            }
             let entries = self.managed_sessions_for_project(binding.channel_id).await;
-            let response = CreateInteractionResponse::Message(
-                session_manager_message(&binding, &entries, None, None).ephemeral(true),
-            );
-            if let Err(error) = comp.create_response(&ctx.http, response).await {
+            if let Err(error) = comp
+                .edit_response(
+                    &ctx.http,
+                    session_manager_edit(&binding, &entries, None, None),
+                )
+                .await
+            {
                 tracing::error!(%error, "failed to open project Session Manager");
             }
             return;
@@ -7417,6 +7551,50 @@ mod tests {
             session_state_presentation(SessionState::Persisted, true).0,
             "Cursor 接手中"
         );
+    }
+
+    #[test]
+    fn cursor_handoff_state_reconciles_after_terminal_exit() {
+        let resumable = SessionSnapshot {
+            state: SessionState::Persisted,
+            working_dir: Some("/work/api".into()),
+            externally_detached: false,
+        };
+        assert_eq!(
+            reconciled_handoff_task_state(TaskState::Cursor, &resumable),
+            Some(TaskState::Ready)
+        );
+
+        let missing = SessionSnapshot {
+            state: SessionState::None,
+            working_dir: None,
+            externally_detached: false,
+        };
+        assert_eq!(
+            reconciled_handoff_task_state(TaskState::Cursor, &missing),
+            Some(TaskState::Closed)
+        );
+
+        let detached = SessionSnapshot {
+            externally_detached: true,
+            ..resumable
+        };
+        assert_eq!(
+            reconciled_handoff_task_state(TaskState::Cursor, &detached),
+            None
+        );
+        assert_eq!(
+            reconciled_handoff_task_state(TaskState::Ready, &detached),
+            None
+        );
+    }
+
+    #[test]
+    fn close_copy_states_what_is_removed_and_retained() {
+        assert!(SESSION_CLOSE_CONFIRMATION.contains("OpenAB session mapping"));
+        assert!(SESSION_CLOSE_CONFIRMATION.contains("Cursor checkpoint are kept"));
+        assert!(session_closed_note(0).contains("Cursor checkpoint was kept"));
+        assert!(session_closed_note(2).contains("2 buffered message(s) dropped"));
     }
 
     fn ui_task(state: TaskState, last_prompt: Option<&str>) -> TaskRecord {
