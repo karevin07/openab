@@ -270,6 +270,22 @@ def is_duplicate_partial_chunk(
     if not isinstance(model_call_id, str):
         model_call_id = None
 
+    # Cursor can replay a completed partial chunk after a slow tool call or a
+    # delayed stream event. In that case the duplicate may arrive well outside
+    # the short event-form window below. Remember the immediately preceding
+    # timestamped chunk for the whole turn (tool events intentionally do not
+    # clear it) and suppress exact, non-trivial replays. Short repeated deltas
+    # such as "ha" remain untouched.
+    previous = state.get("last_partial_chunk")
+    state["last_partial_chunk"] = (timestamp, model_call_id, text)
+    if (
+        isinstance(previous, tuple)
+        and len(previous) == 3
+        and previous[2] == text
+        and len(text.strip()) >= MIN_AMBIGUOUS_DUPLICATE_CHARS
+    ):
+        return True
+
     recent = state.setdefault("recent_partial_chunks", [])
     cutoff = timestamp - PARTIAL_DUPLICATE_WINDOW_MS
     recent[:] = [item for item in recent if item[0] >= cutoff]
