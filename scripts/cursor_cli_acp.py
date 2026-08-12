@@ -28,6 +28,9 @@ ACTIVE_LOCK = threading.Lock()
 SESSIONS: dict[str, str] = {}
 ACTIVE: "ActivePrompt | None" = None
 MAX_IMAGE_BYTES = 10 * 1024 * 1024
+PARTIAL_DUPLICATE_WINDOW_MS = 2_000
+MAX_RECENT_PARTIAL_CHUNKS = 32
+MIN_AMBIGUOUS_DUPLICATE_CHARS = 12
 IMAGE_ROOT = Path(
     os.environ.get(
         "OPENAB_CURSOR_IMAGE_DIR",
@@ -256,6 +259,38 @@ def tool_title(value: Any) -> str:
     return str(value.get("name") or value.get("tool_name") or "Cursor tool")
 
 
+def is_duplicate_partial_chunk(
+    event: dict[str, Any], text: str, state: dict[str, Any]
+) -> bool:
+    """Detect Cursor's duplicate partial event forms without dropping real deltas."""
+    timestamp = event.get("timestamp_ms")
+    if not isinstance(timestamp, int):
+        return False
+    model_call_id = event.get("model_call_id")
+    if not isinstance(model_call_id, str):
+        model_call_id = None
+
+    recent = state.setdefault("recent_partial_chunks", [])
+    cutoff = timestamp - PARTIAL_DUPLICATE_WINDOW_MS
+    recent[:] = [item for item in recent if item[0] >= cutoff]
+    duplicate = any(
+        previous_text == text
+        and abs(timestamp - previous_timestamp) <= PARTIAL_DUPLICATE_WINDOW_MS
+        and (
+            (
+                previous_timestamp == timestamp
+                and previous_model_call_id == model_call_id
+            )
+            or ((previous_model_call_id is None) != (model_call_id is None))
+            or len(text.strip()) >= MIN_AMBIGUOUS_DUPLICATE_CHARS
+        )
+        for previous_timestamp, previous_model_call_id, previous_text in recent
+    )
+    recent.append((timestamp, model_call_id, text))
+    del recent[:-MAX_RECENT_PARTIAL_CHUNKS]
+    return duplicate
+
+
 def emit_stream_event(
     session_id: str, event: dict[str, Any], state: dict[str, Any]
 ) -> None:
@@ -277,13 +312,29 @@ def emit_stream_event(
             if block.get("type") == "text" and isinstance(block.get("text"), str):
                 text = block["text"]
                 streamed = state.get("streamed_text", "")
+                # `--stream-partial-output` can emit the same timestamped delta
+                # twice: first without model_call_id and then with it. Forward
+                # exactly one copy while preserving intentional repeated deltas.
+                if is_duplicate_partial_chunk(event, text, state):
+                    continue
+                segment = state.get("partial_segment_text", "")
+                if "timestamp_ms" in event:
+                    if state.pop("tool_boundary_since_partial", False):
+                        segment = ""
+                    state["partial_segment_text"] = segment + text
                 # With --stream-partial-output Cursor emits timestamped deltas,
-                # followed by one untimestamped assistant event containing the
-                # complete response. Only forward the part not already streamed.
+                # followed by untimestamped assistant snapshots. Cursor can emit
+                # one snapshot per tool phase, not just one for the whole turn.
+                # Compare against the current segment before the turn aggregate.
                 if "timestamp_ms" not in event and streamed:
-                    if text == streamed:
+                    state["partial_segment_text"] = ""
+                    if segment and text == segment:
                         continue
-                    if text.startswith(streamed):
+                    if segment and text.startswith(segment):
+                        text = text[len(segment) :]
+                    elif text == streamed:
+                        continue
+                    elif text.startswith(streamed):
                         text = text[len(streamed) :]
                 if text:
                     state["sent_text"] = True
@@ -296,6 +347,7 @@ def emit_stream_event(
                         },
                     )
     elif event_type == "tool_call":
+        state["tool_boundary_since_partial"] = True
         call_id = event.get("call_id") or event.get("tool_call_id") or event.get("id")
         if not isinstance(call_id, str) or not call_id:
             return
