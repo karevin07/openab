@@ -628,7 +628,58 @@ fn project_welcome_edit(binding: &ProjectBinding, tasks: &[TaskRecord]) -> EditM
         .components(project_welcome_components(tasks))
 }
 
-fn help_action_center(image_url: Option<&str>) -> CreateInteractionResponseMessage {
+fn project_is_visible_to(
+    binding: &ProjectBinding,
+    user_id: u64,
+    role_ids: &HashSet<u64>,
+    permissions: Option<Permissions>,
+) -> bool {
+    let elevated = permissions.is_some_and(|permissions| {
+        permissions.contains(Permissions::ADMINISTRATOR)
+            || permissions.contains(Permissions::MANAGE_CHANNELS)
+    });
+    elevated
+        || binding.created_by == user_id
+        || binding.access_user_ids.contains(&user_id)
+        || binding
+            .access_role_ids
+            .iter()
+            .any(|role_id| role_ids.contains(role_id))
+}
+
+fn project_selector_row(projects: &[ProjectBinding]) -> Option<CreateActionRow> {
+    if projects.is_empty() {
+        return None;
+    }
+    let options = projects
+        .iter()
+        .take(SELECT_MENU_PAGE_SIZE)
+        .map(|binding| {
+            CreateSelectMenuOption::new(
+                truncate_for_discord(
+                    &format!("📁 @{}", binding.workspace_alias),
+                    SELECT_OPTION_TEXT_MAX,
+                ),
+                binding.channel_id.to_string(),
+            )
+            .description("Open this repository's Project Home")
+        })
+        .collect();
+    let placeholder = if projects.len() > SELECT_MENU_PAGE_SIZE {
+        format!("Choose a repository (first {SELECT_MENU_PAGE_SIZE})")
+    } else {
+        "Choose a repository project".to_string()
+    };
+    Some(CreateActionRow::SelectMenu(
+        CreateSelectMenu::new("oab_help_project", CreateSelectMenuKind::String { options })
+            .placeholder(placeholder),
+    ))
+}
+
+fn help_action_center(
+    image_url: Option<&str>,
+    projects: &[ProjectBinding],
+) -> CreateInteractionResponseMessage {
     let mut embed = CreateEmbed::new()
         .title("🧭 OpenAB · What do you want to do?")
         .description("不需要記 Slash Commands。選擇現在的情境，OpenAB 只會顯示下一步。")
@@ -644,25 +695,38 @@ fn help_action_center(image_url: Option<&str>) -> CreateInteractionResponseMessa
     if let Some(url) = image_url {
         embed = embed.thumbnail(url);
     }
+    if projects.len() > SELECT_MENU_PAGE_SIZE {
+        embed = embed.field(
+            "Repository projects",
+            format!(
+                "顯示前 {SELECT_MENU_PAGE_SIZE} 個可存取 projects；其餘仍可從 Discord channel list 開啟。"
+            ),
+            false,
+        );
+    }
+    let mut components = vec![CreateActionRow::Buttons(vec![
+        CreateButton::new("oab_help:discord")
+            .label("📱 Start on Discord")
+            .style(ButtonStyle::Primary),
+        CreateButton::new("oab_help:cursor")
+            .label("🖥️ Continue on computer")
+            .style(ButtonStyle::Secondary),
+        CreateButton::new("oab_help:attach")
+            .label("📤 Publish local chat")
+            .style(ButtonStyle::Secondary),
+        CreateButton::new("oab_help:sessions")
+            .label("🧠 Manage sessions")
+            .style(ButtonStyle::Secondary),
+        CreateButton::new("oab_help:troubleshoot")
+            .label("🛠️ Troubleshoot")
+            .style(ButtonStyle::Secondary),
+    ])];
+    if let Some(row) = project_selector_row(projects) {
+        components.push(row);
+    }
     CreateInteractionResponseMessage::new()
         .embed(embed)
-        .components(vec![CreateActionRow::Buttons(vec![
-            CreateButton::new("oab_help:discord")
-                .label("📱 Start on Discord")
-                .style(ButtonStyle::Primary),
-            CreateButton::new("oab_help:cursor")
-                .label("🖥️ Continue on computer")
-                .style(ButtonStyle::Secondary),
-            CreateButton::new("oab_help:attach")
-                .label("📤 Publish local chat")
-                .style(ButtonStyle::Secondary),
-            CreateButton::new("oab_help:sessions")
-                .label("🧠 Manage sessions")
-                .style(ButtonStyle::Secondary),
-            CreateButton::new("oab_help:troubleshoot")
-                .label("🛠️ Troubleshoot")
-                .style(ButtonStyle::Secondary),
-        ])])
+        .components(components)
 }
 
 fn project_link_button(binding: &ProjectBinding) -> CreateButton {
@@ -678,6 +742,7 @@ fn help_topic_message(
     current_channel_id: u64,
     task: Option<&TaskRecord>,
     binding: Option<&ProjectBinding>,
+    projects: &[ProjectBinding],
 ) -> CreateInteractionResponseMessage {
     let (title, description) = match topic {
         "discord" => (
@@ -753,12 +818,58 @@ fn help_topic_message(
             .label("← Back")
             .style(ButtonStyle::Secondary),
     );
+    let mut rows = vec![CreateActionRow::Buttons(buttons)];
+    if topic == "discord" {
+        if let Some(row) = project_selector_row(projects) {
+            rows.push(row);
+        }
+    }
     CreateInteractionResponseMessage::new()
         .embed(
             CreateEmbed::new()
                 .title(title)
                 .description(description)
                 .colour(0x5865F2),
+        )
+        .components(rows)
+}
+
+fn help_project_message(
+    binding: &ProjectBinding,
+    current_channel_id: u64,
+) -> CreateInteractionResponseMessage {
+    let mut buttons = Vec::new();
+    if binding.channel_id == current_channel_id {
+        buttons.push(
+            CreateButton::new("oab_project:new")
+                .label("▶ New task")
+                .style(ButtonStyle::Primary),
+        );
+        buttons.push(
+            CreateButton::new("oab_project:attach")
+                .label("📤 Attach local chat")
+                .style(ButtonStyle::Secondary),
+        );
+    } else {
+        buttons.push(project_link_button(binding));
+    }
+    buttons.push(
+        CreateButton::new("oab_help:back")
+            .label("← Back")
+            .style(ButtonStyle::Secondary),
+    );
+    CreateInteractionResponseMessage::new()
+        .embed(
+            CreateEmbed::new()
+                .title(format!("📁 @{}", binding.workspace_alias))
+                .description("已選擇這個 repository project。開啟 Project Home 後點 **New task**，即可建立獨立的 Discord thread 與 Cursor session。")
+                .colour(0x5865F2)
+                .field("Project channel", format!("<#{}>", binding.channel_id), true)
+                .field(
+                    "Workspace",
+                    inline_code(&format!("@{}", binding.workspace_alias)),
+                    true,
+                ),
         )
         .components(vec![CreateActionRow::Buttons(buttons)])
 }
@@ -3004,6 +3115,9 @@ impl EventHandler for Handler {
             Interaction::Component(comp) if comp.data.custom_id.starts_with("oab_help:") => {
                 self.handle_help_component(&ctx, &comp).await;
             }
+            Interaction::Component(comp) if comp.data.custom_id == "oab_help_project" => {
+                self.handle_help_project_select(&ctx, &comp).await;
+            }
             Interaction::Component(comp) if comp.data.custom_id.starts_with("oab_sessions:") => {
                 self.handle_session_manager_component(&ctx, &comp).await;
             }
@@ -3041,6 +3155,23 @@ impl EventHandler for Handler {
 // --- Slash command & interaction handlers ---
 
 impl Handler {
+    fn visible_projects(
+        &self,
+        guild_id: Option<u64>,
+        user_id: u64,
+        role_ids: &HashSet<u64>,
+        permissions: Option<Permissions>,
+    ) -> Vec<ProjectBinding> {
+        let Some(guild_id) = guild_id else {
+            return Vec::new();
+        };
+        self.project_registry
+            .list_guild(guild_id)
+            .into_iter()
+            .filter(|binding| project_is_visible_to(binding, user_id, role_ids, permissions))
+            .collect()
+    }
+
     async fn managed_sessions_for_project(
         &self,
         project_channel_id: u64,
@@ -3083,8 +3214,20 @@ impl Handler {
             }
         };
         let avatar_url = ctx.cache.current_user().avatar_url();
+        let role_ids = cmd
+            .member
+            .as_ref()
+            .map(|member| member.roles.iter().map(|role_id| role_id.get()).collect())
+            .unwrap_or_default();
+        let permissions = cmd.member.as_ref().and_then(|member| member.permissions);
+        let projects = self.visible_projects(
+            cmd.guild_id.map(|guild_id| guild_id.get()),
+            cmd.user.id.get(),
+            &role_ids,
+            permissions,
+        );
         let response = CreateInteractionResponse::Message(
-            help_action_center(avatar_url.as_deref()).ephemeral(true),
+            help_action_center(avatar_url.as_deref(), &projects).ephemeral(true),
         );
         if let Err(error) = cmd.create_response(&ctx.http, response).await {
             tracing::error!(%error, "failed to respond to /help command");
@@ -3117,13 +3260,28 @@ impl Handler {
             .custom_id
             .strip_prefix("oab_help:")
             .unwrap_or("open");
+        let role_ids = comp
+            .member
+            .as_ref()
+            .map(|member| member.roles.iter().map(|role_id| role_id.get()).collect())
+            .unwrap_or_default();
+        let permissions = comp.member.as_ref().and_then(|member| member.permissions);
+        let projects = self.visible_projects(
+            comp.guild_id.map(|guild_id| guild_id.get()),
+            comp.user.id.get(),
+            &role_ids,
+            permissions,
+        );
         if matches!(topic, "open" | "back") {
             let avatar_url = ctx.cache.current_user().avatar_url();
             let response = if topic == "back" {
-                CreateInteractionResponse::UpdateMessage(help_action_center(avatar_url.as_deref()))
+                CreateInteractionResponse::UpdateMessage(help_action_center(
+                    avatar_url.as_deref(),
+                    &projects,
+                ))
             } else {
                 CreateInteractionResponse::Message(
-                    help_action_center(avatar_url.as_deref()).ephemeral(true),
+                    help_action_center(avatar_url.as_deref(), &projects).ephemeral(true),
                 )
             };
             if let Err(error) = comp.create_response(&ctx.http, response).await {
@@ -3153,7 +3311,13 @@ impl Handler {
         };
         if topic == "sessions" {
             let Some(binding) = binding else {
-                let message = help_topic_message(topic, comp.channel_id.get(), task.as_ref(), None);
+                let message = help_topic_message(
+                    topic,
+                    comp.channel_id.get(),
+                    task.as_ref(),
+                    None,
+                    &projects,
+                );
                 let _ = comp
                     .create_response(&ctx.http, CreateInteractionResponse::UpdateMessage(message))
                     .await;
@@ -3180,12 +3344,74 @@ impl Handler {
             comp.channel_id.get(),
             task.as_ref(),
             binding.as_ref(),
+            &projects,
         );
         if let Err(error) = comp
             .create_response(&ctx.http, CreateInteractionResponse::UpdateMessage(message))
             .await
         {
             tracing::error!(%error, topic, "failed to update help action center");
+        }
+    }
+
+    async fn handle_help_project_select(
+        &self,
+        ctx: &Context,
+        comp: &serenity::model::application::ComponentInteraction,
+    ) {
+        if comp.user.bot
+            || is_denied_user(
+                false,
+                self.allow_all_users,
+                &self.allowed_users,
+                comp.user.id.get(),
+            )
+        {
+            let response = CreateInteractionResponse::Message(
+                CreateInteractionResponseMessage::new()
+                    .content("🚫 你沒有使用這個 Bot 的權限。")
+                    .ephemeral(true),
+            );
+            let _ = comp.create_response(&ctx.http, response).await;
+            return;
+        }
+
+        let role_ids = comp
+            .member
+            .as_ref()
+            .map(|member| member.roles.iter().map(|role_id| role_id.get()).collect())
+            .unwrap_or_default();
+        let permissions = comp.member.as_ref().and_then(|member| member.permissions);
+        let projects = self.visible_projects(
+            comp.guild_id.map(|guild_id| guild_id.get()),
+            comp.user.id.get(),
+            &role_ids,
+            permissions,
+        );
+        let selected_channel_id = match &comp.data.kind {
+            ComponentInteractionDataKind::StringSelect { values } => {
+                values.first().and_then(|value| value.parse::<u64>().ok())
+            }
+            _ => None,
+        };
+        let selected = selected_channel_id.and_then(|channel_id| {
+            projects
+                .iter()
+                .find(|binding| binding.channel_id == channel_id)
+        });
+        let message = selected.map_or_else(
+            || {
+                let avatar_url = ctx.cache.current_user().avatar_url();
+                help_action_center(avatar_url.as_deref(), &projects)
+                    .content("⚠️ 這個 project 已移除或你已沒有存取權限，清單已重新整理。")
+            },
+            |binding| help_project_message(binding, comp.channel_id.get()),
+        );
+        if let Err(error) = comp
+            .create_response(&ctx.http, CreateInteractionResponse::UpdateMessage(message))
+            .await
+        {
+            tracing::error!(%error, "failed to open selected project from help");
         }
     }
 
@@ -7698,11 +7924,72 @@ mod tests {
 
     #[test]
     fn help_and_project_home_expose_session_manager() {
-        let help = serde_json::to_string(&help_action_center(None)).unwrap();
+        let help = serde_json::to_string(&help_action_center(None, &[])).unwrap();
         assert!(help.contains("oab_help:sessions"));
 
         let project = serde_json::to_string(&project_welcome_components(&[])).unwrap();
         assert!(project.contains("oab_project:sessions"));
+    }
+
+    #[test]
+    fn help_project_selector_caps_options_at_discord_limit() {
+        let projects = (1..=30)
+            .map(|channel_id| {
+                let mut binding = ui_binding();
+                binding.channel_id = channel_id;
+                binding.workspace_alias = format!("repo-{channel_id}");
+                binding
+            })
+            .collect::<Vec<_>>();
+        let value = serde_json::to_value(help_action_center(None, &projects)).unwrap();
+        let select = component_with_custom_id(&value, "oab_help_project").unwrap();
+
+        assert_eq!(
+            select["options"].as_array().unwrap().len(),
+            SELECT_MENU_PAGE_SIZE
+        );
+        assert!(value.to_string().contains("Discord channel list"));
+    }
+
+    #[test]
+    fn project_selector_visibility_honors_registered_access() {
+        let mut binding = ui_binding();
+        binding.created_by = 10;
+        binding.access_user_ids = vec![20];
+        binding.access_role_ids = vec![30];
+
+        assert!(project_is_visible_to(&binding, 10, &HashSet::new(), None));
+        assert!(project_is_visible_to(&binding, 20, &HashSet::new(), None));
+        assert!(project_is_visible_to(
+            &binding,
+            40,
+            &HashSet::from([30]),
+            None
+        ));
+        assert!(project_is_visible_to(
+            &binding,
+            40,
+            &HashSet::new(),
+            Some(Permissions::MANAGE_CHANNELS)
+        ));
+        assert!(!project_is_visible_to(
+            &binding,
+            40,
+            &HashSet::new(),
+            Some(Permissions::empty())
+        ));
+    }
+
+    #[test]
+    fn selected_project_card_uses_contextual_action() {
+        let binding = ui_binding();
+        let local = serde_json::to_string(&help_project_message(&binding, 2)).unwrap();
+        assert!(local.contains("oab_project:new"));
+        assert!(local.contains("oab_project:attach"));
+
+        let remote = serde_json::to_string(&help_project_message(&binding, 99)).unwrap();
+        assert!(remote.contains("https://discord.com/channels/1/2"));
+        assert!(!remote.contains("oab_project:new"));
     }
 
     #[test]
