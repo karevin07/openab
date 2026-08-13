@@ -13,6 +13,8 @@ use crate::reactions::StatusReactionController;
 
 // --- Output directive parsing ---
 
+const MAX_OUTPUT_ATTACHMENTS: usize = 4;
+
 /// Parsed directives from agent output header block.
 /// Consecutive `[[key:value]]` lines at the start of output are directives.
 #[derive(Default, Debug)]
@@ -29,7 +31,7 @@ impl OutputDirectives {
             self.reply_to = other.reply_to;
         }
         for path in other.attachments {
-            if self.attachments.len() >= 5 {
+            if self.attachments.len() >= MAX_OUTPUT_ATTACHMENTS {
                 break;
             }
             if !self.attachments.contains(&path) {
@@ -107,7 +109,7 @@ pub fn parse_output_directives(content: &str) -> (OutputDirectives, String) {
                             if !path.is_empty()
                                 && path.len() <= 512
                                 && !path.chars().any(char::is_control)
-                                && directives.attachments.len() < 5
+                                && directives.attachments.len() < MAX_OUTPUT_ATTACHMENTS
                                 && !directives.attachments.iter().any(|item| item == path)
                             {
                                 directives.attachments.push(path.to_string());
@@ -164,6 +166,110 @@ pub fn parse_output_directives(content: &str) -> (OutputDirectives, String) {
         String::new()
     };
     (directives, remaining)
+}
+
+/// Recover a multi-image attachment block that an agent placed after a short
+/// introduction instead of in the output header. Requiring at least two unique
+/// PNG paths and ignoring fenced code keeps documentation examples inert.
+fn recover_embedded_attachment_directives(content: &str) -> Option<(OutputDirectives, String)> {
+    let mut ranges = Vec::new();
+    let mut paths = Vec::new();
+    let mut offset = 0usize;
+    let mut in_fence = false;
+    let mut last_attachment_line = None;
+
+    for (line_number, line_with_ending) in content.split_inclusive('\n').enumerate() {
+        let line = line_with_ending
+            .strip_suffix('\n')
+            .unwrap_or(line_with_ending);
+        let line = line.strip_suffix('\r').unwrap_or(line);
+        let trimmed = line.trim_start();
+        if trimmed.starts_with("```") || trimmed.starts_with("~~~") {
+            in_fence = !in_fence;
+            offset += line_with_ending.len();
+            continue;
+        }
+        if !in_fence {
+            let mut search_start = 0usize;
+            let mut line_ranges = Vec::new();
+            while let Some(relative_start) = line[search_start..].find("[[attach:") {
+                let start = search_start + relative_start;
+                let value_start = start + "[[attach:".len();
+                let Some(relative_end) = line[value_start..].find("]]") else {
+                    break;
+                };
+                let end = value_start + relative_end + 2;
+                let path = line[value_start..value_start + relative_end].trim();
+                let valid_png = !path.is_empty()
+                    && path.len() <= 512
+                    && !path.chars().any(char::is_control)
+                    && std::path::Path::new(path)
+                        .extension()
+                        .and_then(|extension| extension.to_str())
+                        .is_some_and(|extension| extension.eq_ignore_ascii_case("png"));
+                if valid_png {
+                    line_ranges.push((start, end));
+                    if !paths.iter().any(|existing| existing == path) {
+                        paths.push(path.to_string());
+                    }
+                }
+                search_start = end;
+            }
+            if !line_ranges.is_empty() {
+                if last_attachment_line.is_some_and(|last| line_number != last + 1) {
+                    return None;
+                }
+                let first_start = line_ranges.first().unwrap().0;
+                let last_end = line_ranges.last().unwrap().1;
+                if !line[last_end..].trim().is_empty()
+                    || (last_attachment_line.is_some() && !line[..first_start].trim().is_empty())
+                    || (last_attachment_line.is_none() && line[..first_start].chars().count() > 200)
+                    || line_ranges
+                        .windows(2)
+                        .any(|pair| !line[pair[0].1..pair[1].0].trim().is_empty())
+                {
+                    return None;
+                }
+                let mut remainder = String::new();
+                let mut copied_until = 0usize;
+                for (start, end) in &line_ranges {
+                    remainder.push_str(&line[copied_until..*start]);
+                    copied_until = *end;
+                }
+                remainder.push_str(&line[copied_until..]);
+                if remainder.trim().is_empty() {
+                    ranges.push((offset, offset + line_with_ending.len()));
+                } else {
+                    ranges.extend(
+                        line_ranges
+                            .into_iter()
+                            .map(|(start, end)| (offset + start, offset + end)),
+                    );
+                }
+                last_attachment_line = Some(line_number);
+            }
+        }
+        offset += line_with_ending.len();
+    }
+
+    if paths.len() < 2 || paths.len() > MAX_OUTPUT_ATTACHMENTS {
+        return None;
+    }
+
+    let mut body = String::with_capacity(content.len());
+    let mut copied_until = 0usize;
+    for (start, end) in ranges {
+        body.push_str(&content[copied_until..start]);
+        copied_until = end;
+    }
+    body.push_str(&content[copied_until..]);
+    Some((
+        OutputDirectives {
+            reply_to: None,
+            attachments: paths,
+        },
+        body,
+    ))
 }
 
 /// Select the answer text to deliver from the turn's accumulated agent-message
@@ -227,7 +333,11 @@ pub fn split_delivery(
     // their tool calls. Parse the delivered slice as well as the full stream,
     // then merge without duplicating directives in streaming mode. Preserve
     // post-tool bracketed reply content unless an attachment was actually found.
-    let (delivered_directives, body) = parse_output_directives(delivered);
+    let (mut delivered_directives, mut body) = parse_output_directives(delivered);
+    if let Some((recovered, recovered_body)) = recover_embedded_attachment_directives(&body) {
+        delivered_directives.merge(recovered);
+        body = recovered_body;
+    }
     if answer_start > 0 && !keep_full && delivered_directives.attachments.is_empty() {
         return (directives, delivered.to_owned());
     }
@@ -2033,6 +2143,54 @@ mod tests {
 
         assert_eq!(directives.attachments, vec!["artifacts/preview.png"]);
         assert_eq!(body, "Here it is.");
+    }
+
+    #[test]
+    fn split_delivery_recovers_embedded_multi_image_block() {
+        let full = "試傳 4 張：[[attach:art/one.png]]\n[[attach:art/two.png]]\n[[attach:art/three.png]]\n[[attach:art/four.png]]\n四張圖片已附上。";
+
+        let (directives, body) = split_delivery(full, 0, false);
+
+        assert_eq!(
+            directives.attachments,
+            vec![
+                "art/one.png",
+                "art/two.png",
+                "art/three.png",
+                "art/four.png"
+            ]
+        );
+        assert_eq!(body, "試傳 4 張：\n四張圖片已附上。");
+    }
+
+    #[test]
+    fn split_delivery_does_not_recover_single_embedded_example() {
+        let full = "例如 [[attach:art/example.png]] 會附上一張圖片。";
+
+        let (directives, body) = split_delivery(full, 0, false);
+
+        assert!(directives.attachments.is_empty());
+        assert_eq!(body, full);
+    }
+
+    #[test]
+    fn split_delivery_ignores_attachment_examples_in_code_fence() {
+        let full = "Example:\n```text\n[[attach:art/one.png]]\n[[attach:art/two.png]]\n```";
+
+        let (directives, body) = split_delivery(full, 0, false);
+
+        assert!(directives.attachments.is_empty());
+        assert_eq!(body, full);
+    }
+
+    #[test]
+    fn split_delivery_does_not_recover_scattered_attachment_examples() {
+        let full = "First example: [[attach:art/one.png]]\nSome explanation.\nSecond example: [[attach:art/two.png]]";
+
+        let (directives, body) = split_delivery(full, 0, false);
+
+        assert!(directives.attachments.is_empty());
+        assert_eq!(body, full);
     }
 
     #[test]

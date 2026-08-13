@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import base64
 import binascii
+import difflib
 import hashlib
 import json
 import os
@@ -31,6 +32,7 @@ MAX_IMAGE_BYTES = 10 * 1024 * 1024
 PARTIAL_DUPLICATE_WINDOW_MS = 2_000
 MAX_RECENT_PARTIAL_CHUNKS = 32
 MIN_AMBIGUOUS_DUPLICATE_CHARS = 12
+MAX_SNAPSHOT_COMPARE_CHARS = 16_384
 IMAGE_ROOT = Path(
     os.environ.get(
         "OPENAB_CURSOR_IMAGE_DIR",
@@ -318,6 +320,27 @@ def is_duplicate_partial_chunk(
     return duplicate
 
 
+def significant_suffix_prefix_overlap(previous: str, current: str) -> int:
+    """Return a long overlap where a cumulative Cursor chunk repeats prior text."""
+    max_overlap = min(len(previous), len(current), MAX_SNAPSHOT_COMPARE_CHARS)
+    for size in range(max_overlap, MIN_AMBIGUOUS_DUPLICATE_CHARS - 1, -1):
+        if previous.endswith(current[:size]):
+            return size
+    return 0
+
+
+def is_near_duplicate_snapshot(previous: str, current: str) -> bool:
+    """Detect a revised Cursor snapshot that cannot replace the ACP delta stream."""
+    if min(len(previous.strip()), len(current.strip())) < MIN_AMBIGUOUS_DUPLICATE_CHARS:
+        return False
+    previous = previous[-MAX_SNAPSHOT_COMPARE_CHARS:]
+    current = current[-MAX_SNAPSHOT_COMPARE_CHARS:]
+    length_ratio = min(len(previous), len(current)) / max(len(previous), len(current))
+    if length_ratio < 0.75:
+        return False
+    return difflib.SequenceMatcher(None, previous, current).ratio() >= 0.85
+
+
 def emit_stream_event(
     session_id: str, event: dict[str, Any], state: dict[str, Any]
 ) -> None:
@@ -348,6 +371,9 @@ def emit_stream_event(
                 if "timestamp_ms" in event:
                     if state.pop("tool_boundary_since_partial", False):
                         segment = ""
+                    overlap = significant_suffix_prefix_overlap(segment, text)
+                    if overlap:
+                        text = text[overlap:]
                     state["partial_segment_text"] = segment + text
                 # With --stream-partial-output Cursor emits timestamped deltas,
                 # followed by untimestamped assistant snapshots. Cursor can emit
@@ -363,6 +389,14 @@ def emit_stream_event(
                         continue
                     elif text.startswith(streamed):
                         text = text[len(streamed) :]
+                    elif is_near_duplicate_snapshot(segment, text) or is_near_duplicate_snapshot(
+                        streamed, text
+                    ):
+                        continue
+                    else:
+                        overlap = significant_suffix_prefix_overlap(streamed, text)
+                        if overlap:
+                            text = text[overlap:]
                 if text:
                     state["sent_text"] = True
                     state["streamed_text"] = streamed + text

@@ -337,6 +337,58 @@ class CursorCliAcpTest(unittest.TestCase):
         self.assertEqual(len(text_messages), 1)
         self.assertEqual(state["streamed_text"], text)
 
+    def test_cumulative_partial_and_revised_snapshot_emit_one_answer(self):
+        intro = "試傳 4 張確認一次上傳是否正常："
+        directives = (
+            "[[attach:art/one.png]]\n"
+            "[[attach:art/two.png]]\n"
+            "[[attach:art/three.png]]\n"
+            "[[attach:art/four.png]]\n"
+        )
+        first = intro + directives + "這則一次附四張：夏、林、張淺、蘇。\n請確認是否到齊。"
+        revised = directives + "這則一次附四張：夏、林、張淺淺、蘇。\n請確認是否到齊。"
+        state = {
+            "sent_text": False,
+            "streamed_text": "",
+            "result_seen": False,
+            "is_error": False,
+        }
+        output = io.StringIO()
+        with mock.patch.object(bridge.sys, "stdout", output):
+            bridge.emit_stream_event(
+                self.chat_id,
+                {
+                    "type": "assistant",
+                    "timestamp_ms": 1_000,
+                    "message": {"content": [{"type": "text", "text": intro}]},
+                },
+                state,
+            )
+            bridge.emit_stream_event(
+                self.chat_id,
+                {
+                    "type": "assistant",
+                    "timestamp_ms": 1_100,
+                    "message": {"content": [{"type": "text", "text": first}]},
+                },
+                state,
+            )
+            bridge.emit_stream_event(
+                self.chat_id,
+                {
+                    "type": "assistant",
+                    "message": {"content": [{"type": "text", "text": revised}]},
+                },
+                state,
+            )
+
+        chunks = [
+            json.loads(line)["params"]["update"]["content"]["text"]
+            for line in output.getvalue().splitlines()
+        ]
+        self.assertEqual("".join(chunks), first)
+        self.assertEqual(state["streamed_text"], first)
+
     def test_per_tool_phase_snapshot_does_not_repeat_current_segment(self):
         first = "first progress sentence"
         second = "second progress sentence"
