@@ -517,6 +517,9 @@ fn default_echo_transcript() -> bool {
 #[derive(Debug, Deserialize)]
 pub struct DiscordConfig {
     pub bot_token: String,
+    /// Optional private control plane for the dedicated Discord Admin Bot.
+    /// The bearer token is loaded from `token_file`, never embedded in TOML.
+    pub admin_control: Option<DiscordAdminControlConfig>,
     /// Allow administrators with Manage Channels to provision private project
     /// channels through `/project`. Disabled by default.
     #[serde(default)]
@@ -577,6 +580,17 @@ pub struct DiscordConfig {
     /// Batched mode only: soft token cap for greedy drain. Default: 24000.
     #[serde(default = "default_max_batch_tokens")]
     pub max_batch_tokens: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct DiscordAdminControlConfig {
+    /// Base URL reachable only from the worker's private network.
+    pub url: String,
+    /// Read-only file containing the service-to-service bearer token.
+    pub token_file: Option<String>,
+    /// Environment variable read by the broker process. Agent subprocesses
+    /// cannot inherit it because ACP spawning uses `env_clear()`.
+    pub token_env: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
@@ -660,6 +674,39 @@ fn validate_discord_project_actions(actions: &[DiscordProjectActionConfig]) -> a
             action.id
         );
     }
+    Ok(())
+}
+
+fn validate_discord_admin_control(
+    config: Option<&DiscordAdminControlConfig>,
+) -> anyhow::Result<()> {
+    let Some(config) = config else {
+        return Ok(());
+    };
+    let url = reqwest::Url::parse(config.url.trim())
+        .map_err(|error| anyhow::anyhow!("invalid discord.admin_control.url: {error}"))?;
+    anyhow::ensure!(
+        matches!(url.scheme(), "http" | "https"),
+        "discord.admin_control.url must use http or https"
+    );
+    anyhow::ensure!(
+        url.username().is_empty() && url.password().is_none(),
+        "discord.admin_control.url must not contain credentials"
+    );
+    let token_file = config
+        .token_file
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    let token_env = config
+        .token_env
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    anyhow::ensure!(
+        token_file.is_some() ^ token_env.is_some(),
+        "discord.admin_control must set exactly one of token_file or token_env"
+    );
     Ok(())
 }
 
@@ -2318,6 +2365,7 @@ fn parse_config_inner(expanded: &str, source: &str) -> anyhow::Result<Config> {
 
     if let Some(discord) = &config.discord {
         validate_discord_project_actions(&discord.project_actions)?;
+        validate_discord_admin_control(discord.admin_control.as_ref())?;
     }
 
     // Resolve Discord shortcodes in reactions.mapping keys.
@@ -2645,6 +2693,7 @@ bot_token = "token"
         .unwrap();
         assert!(!defaults.project_channels_enabled);
         assert!(defaults.project_category_id.is_none());
+        assert!(defaults.admin_control.is_none());
 
         let cfg = parse_config_str(
             r#"
@@ -2660,6 +2709,71 @@ project_category_id = "123456789"
         let discord = cfg.discord.unwrap();
         assert!(discord.project_channels_enabled);
         assert_eq!(discord.project_category_id.as_deref(), Some("123456789"));
+    }
+
+    #[test]
+    fn discord_admin_control_uses_a_token_file() {
+        let cfg = parse_config_str(
+            r#"
+[discord]
+bot_token = "token"
+
+[discord.admin_control]
+url = "http://discord-admin:8787"
+token_file = "/run/secrets/discord-admin-control-token"
+"#,
+            "test",
+        )
+        .expect("admin control settings should parse");
+
+        let control = cfg.discord.unwrap().admin_control.unwrap();
+        assert_eq!(control.url, "http://discord-admin:8787");
+        assert_eq!(
+            control.token_file.as_deref(),
+            Some("/run/secrets/discord-admin-control-token")
+        );
+        assert!(control.token_env.is_none());
+    }
+
+    #[test]
+    fn discord_admin_control_rejects_url_credentials() {
+        let error = parse_config_str(
+            r#"
+[discord]
+bot_token = "token"
+
+[discord.admin_control]
+url = "http://user:password@discord-admin:8787"
+token_file = "/run/secrets/token"
+"#,
+            "test",
+        )
+        .expect_err("URL credentials must be rejected");
+
+        assert!(error.to_string().contains("must not contain credentials"));
+    }
+
+    #[test]
+    fn discord_admin_control_accepts_token_environment_name() {
+        let cfg = parse_config_str(
+            r#"
+[discord]
+bot_token = "token"
+
+[discord.admin_control]
+url = "http://discord-admin:8787"
+token_env = "DISCORD_ADMIN_CONTROL_TOKEN"
+"#,
+            "test",
+        )
+        .expect("token environment name should parse");
+
+        let control = cfg.discord.unwrap().admin_control.unwrap();
+        assert_eq!(
+            control.token_env.as_deref(),
+            Some("DISCORD_ADMIN_CONTROL_TOKEN")
+        );
+        assert!(control.token_file.is_none());
     }
 
     #[test]
