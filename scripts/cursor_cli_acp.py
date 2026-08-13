@@ -278,18 +278,29 @@ def is_duplicate_partial_chunk(
     # such as "ha" remain untouched.
     previous = state.get("last_partial_chunk")
     state["last_partial_chunk"] = (timestamp, model_call_id, text)
-    if (
-        isinstance(previous, tuple)
-        and len(previous) == 3
-        and previous[2] == text
-        and len(text.strip()) >= MIN_AMBIGUOUS_DUPLICATE_CHARS
-    ):
-        return True
+    if isinstance(previous, tuple) and len(previous) == 3 and previous[2] == text:
+        previous_timestamp, previous_model_call_id, _ = previous
+        is_long_chunk = len(text.strip()) >= MIN_AMBIGUOUS_DUPLICATE_CHARS
+        is_same_event = (
+            previous_timestamp == timestamp
+            and previous_model_call_id == model_call_id
+        )
+        is_adjacent_form_pair = (
+            abs(timestamp - previous_timestamp) <= PARTIAL_DUPLICATE_WINDOW_MS
+            and ((previous_model_call_id is None) != (model_call_id is None))
+        )
+        # Short deltas such as `/` legitimately recur within a path. Treat the
+        # two Cursor event forms as duplicates only when they are adjacent;
+        # matching an older opposite-form entry can otherwise erase a later
+        # path separator. Long chunks remain safe to suppress when replayed
+        # after tools or other delayed events.
+        if is_long_chunk or is_same_event or is_adjacent_form_pair:
+            return True
 
     recent = state.setdefault("recent_partial_chunks", [])
     cutoff = timestamp - PARTIAL_DUPLICATE_WINDOW_MS
     recent[:] = [item for item in recent if item[0] >= cutoff]
-    duplicate = any(
+    duplicate = len(text.strip()) >= MIN_AMBIGUOUS_DUPLICATE_CHARS and any(
         previous_text == text
         and abs(timestamp - previous_timestamp) <= PARTIAL_DUPLICATE_WINDOW_MS
         and (

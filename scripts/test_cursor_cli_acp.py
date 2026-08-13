@@ -196,6 +196,40 @@ class CursorCliAcpTest(unittest.TestCase):
         self.assertEqual(len(messages), 2)
         self.assertEqual(state["streamed_text"], "haha")
 
+    def test_repeated_short_delta_does_not_drop_later_path_separator(self):
+        state = {
+            "sent_text": False,
+            "streamed_text": "",
+            "result_seen": False,
+            "is_error": False,
+        }
+        output = io.StringIO()
+
+        def partial(text, timestamp, model_call_id=None):
+            event = {
+                "type": "assistant",
+                "timestamp_ms": timestamp,
+                "message": {"content": [{"type": "text", "text": text}]},
+            }
+            if model_call_id is not None:
+                event["model_call_id"] = model_call_id
+            bridge.emit_stream_event(self.chat_id, event, state)
+
+        with mock.patch.object(bridge.sys, "stdout", output):
+            partial("/", 1_000)
+            partial("/", 1_010, "model-call-1")
+            partial("art", 1_020)
+            partial("/", 1_030)
+            partial("/", 1_040, "model-call-1")
+            partial("portraits", 1_050)
+
+        self.assertEqual(state["streamed_text"], "/art/portraits")
+        chunks = [
+            json.loads(line)["params"]["update"]["content"]["text"]
+            for line in output.getvalue().splitlines()
+        ]
+        self.assertEqual(chunks, ["/", "art", "/", "portraits"])
+
     def test_long_duplicate_delta_from_same_model_call_is_removed(self):
         state = {
             "sent_text": False,
