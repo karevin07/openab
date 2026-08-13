@@ -1698,6 +1698,11 @@ async fn main() -> anyhow::Result<()> {
     // Run Discord adapter (foreground, blocking) or wait for ctrl_c
     #[cfg(feature = "discord")]
     if let Some(discord_cfg) = cfg.discord {
+        let admin_control = discord_cfg
+            .admin_control
+            .as_ref()
+            .map(openab_core::discord_admin::DiscordAdminClient::from_config)
+            .transpose()?;
         let project_category_id = discord_cfg
             .project_category_id
             .as_deref()
@@ -1738,6 +1743,7 @@ async fn main() -> anyhow::Result<()> {
             project_channels_enabled = discord_cfg.project_channels_enabled,
             project_category_id,
             project_actions = discord_cfg.project_actions.len(),
+            admin_control_enabled = admin_control.is_some(),
             "starting discord adapter"
         );
 
@@ -1810,6 +1816,7 @@ async fn main() -> anyhow::Result<()> {
             project_registry,
             task_registry,
             project_actions: discord_cfg.project_actions,
+            admin_control,
         };
 
         let intents = GatewayIntents::GUILD_MESSAGES
