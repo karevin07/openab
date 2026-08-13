@@ -164,6 +164,7 @@ mod tests {
             id: "test".into(),
             label: "Test".into(),
             description: String::new(),
+            runner: crate::config::DiscordProjectCommandRunner::Local,
             program: program.into(),
             args: args.iter().map(|value| (*value).into()).collect(),
             timeout_seconds: 5,

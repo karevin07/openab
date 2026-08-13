@@ -520,6 +520,9 @@ pub struct DiscordConfig {
     /// Optional private control plane for the dedicated Discord Admin Bot.
     /// The bearer token is loaded from `token_file`, never embedded in TOML.
     pub admin_control: Option<DiscordAdminControlConfig>,
+    /// Optional private service that owns Git credentials and performs only
+    /// validated, non-force pushes for allowlisted workspace aliases.
+    pub git_push_broker: Option<DiscordGitPushBrokerConfig>,
     /// Allow administrators with Manage Channels to provision private project
     /// channels through `/project`. Disabled by default.
     #[serde(default)]
@@ -598,6 +601,17 @@ pub struct DiscordAdminControlConfig {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct DiscordGitPushBrokerConfig {
+    /// Base URL reachable only from the worker's private network.
+    pub url: String,
+    /// Read-only file containing the service-to-service bearer token.
+    pub token_file: Option<String>,
+    /// Environment variable read only by OpenAB itself. Repository command
+    /// children cannot inherit it because their environment is cleared.
+    pub token_env: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 pub struct DiscordProjectActionConfig {
     /// Workspace alias exactly as registered in `[workspace.aliases]` or by
     /// repository discovery. Use `*` for every workspace. Do not include the
@@ -630,6 +644,10 @@ pub struct DiscordProjectCommandConfig {
     /// Optional one-line explanation shown in the select menu.
     #[serde(default)]
     pub description: String,
+    /// Execution boundary for this command. Local is the default; the Git
+    /// push broker accepts only the exact `git push` operation.
+    #[serde(default)]
+    pub runner: DiscordProjectCommandRunner,
     /// Executable basename resolved through OpenAB's fixed safe PATH.
     pub program: String,
     /// Literal arguments passed directly to the executable without shell parsing.
@@ -641,6 +659,14 @@ pub struct DiscordProjectCommandConfig {
     /// Require an explicit Discord confirmation before execution.
     #[serde(default)]
     pub requires_confirmation: bool,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum DiscordProjectCommandRunner {
+    #[default]
+    Local,
+    GitPushBroker,
 }
 
 fn default_max_bot_turns() -> u32 {
@@ -796,6 +822,20 @@ fn validate_discord_project_commands(
             command.workspace_alias,
             command.id
         );
+        if command.runner == DiscordProjectCommandRunner::GitPushBroker {
+            anyhow::ensure!(
+                command.program == "git" && command.args == ["push"],
+                "discord.project_commands broker command '{}:{}' must be exactly `git push`",
+                command.workspace_alias,
+                command.id
+            );
+            anyhow::ensure!(
+                command.requires_confirmation,
+                "discord.project_commands broker command '{}:{}' must require confirmation",
+                command.workspace_alias,
+                command.id
+            );
+        }
     }
     Ok(())
 }
@@ -829,6 +869,39 @@ fn validate_discord_admin_control(
     anyhow::ensure!(
         token_file.is_some() ^ token_env.is_some(),
         "discord.admin_control must set exactly one of token_file or token_env"
+    );
+    Ok(())
+}
+
+fn validate_discord_git_push_broker(
+    config: Option<&DiscordGitPushBrokerConfig>,
+) -> anyhow::Result<()> {
+    let Some(config) = config else {
+        return Ok(());
+    };
+    let url = reqwest::Url::parse(config.url.trim())
+        .map_err(|error| anyhow::anyhow!("invalid discord.git_push_broker.url: {error}"))?;
+    anyhow::ensure!(
+        matches!(url.scheme(), "http" | "https"),
+        "discord.git_push_broker.url must use http or https"
+    );
+    anyhow::ensure!(
+        url.username().is_empty() && url.password().is_none(),
+        "discord.git_push_broker.url must not contain credentials"
+    );
+    let token_file = config
+        .token_file
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    let token_env = config
+        .token_env
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    anyhow::ensure!(
+        token_file.is_some() ^ token_env.is_some(),
+        "discord.git_push_broker must set exactly one of token_file or token_env"
     );
     Ok(())
 }
@@ -2490,6 +2563,14 @@ fn parse_config_inner(expanded: &str, source: &str) -> anyhow::Result<Config> {
         validate_discord_project_actions(&discord.project_actions)?;
         validate_discord_project_commands(&discord.project_commands)?;
         validate_discord_admin_control(discord.admin_control.as_ref())?;
+        validate_discord_git_push_broker(discord.git_push_broker.as_ref())?;
+        anyhow::ensure!(
+            discord.git_push_broker.is_some()
+                || !discord.project_commands.iter().any(|command| {
+                    command.runner == DiscordProjectCommandRunner::GitPushBroker
+                }),
+            "discord.git_push_broker is required by a git-push-broker project command"
+        );
     }
 
     // Resolve Discord shortcodes in reactions.mapping keys.
@@ -3023,6 +3104,74 @@ requires_confirmation = true
         assert_eq!(commands[0].args, ["status", "--short", "--branch"]);
         assert_eq!(commands[0].timeout_seconds, 30);
         assert!(commands[0].requires_confirmation);
+        assert_eq!(commands[0].runner, DiscordProjectCommandRunner::Local);
+    }
+
+    #[test]
+    fn discord_project_commands_accept_valid_git_push_broker() {
+        let cfg = parse_config_str(
+            r#"
+[discord]
+bot_token = "token"
+
+[discord.git_push_broker]
+url = "http://git-push-broker:8790"
+token_env = "GIT_PUSH_BROKER_TOKEN"
+
+[[discord.project_commands]]
+workspace_alias = "*"
+id = "git_push"
+label = "Git push"
+runner = "git-push-broker"
+program = "git"
+args = ["push"]
+requires_confirmation = true
+"#,
+            "test",
+        )
+        .expect("brokered git push should parse");
+
+        let discord = cfg.discord.unwrap();
+        assert!(discord.git_push_broker.is_some());
+        assert_eq!(
+            discord.project_commands[0].runner,
+            DiscordProjectCommandRunner::GitPushBroker
+        );
+    }
+
+    #[test]
+    fn discord_project_commands_reject_unsafe_broker_operations() {
+        for (program, args, confirm) in [
+            ("git", "[\"push\", \"--force\"]", true),
+            ("git", "[\"fetch\"]", true),
+            ("git", "[\"push\"]", false),
+        ] {
+            let error = parse_config_str(
+                &format!(
+                    r#"
+[discord]
+bot_token = "token"
+[discord.git_push_broker]
+url = "http://git-push-broker:8790"
+token_env = "GIT_PUSH_BROKER_TOKEN"
+[[discord.project_commands]]
+workspace_alias = "*"
+id = "push"
+label = "Push"
+runner = "git-push-broker"
+program = "{program}"
+args = {args}
+requires_confirmation = {confirm}
+"#
+                ),
+                "test",
+            )
+            .unwrap_err();
+            assert!(
+                error.to_string().contains("must be exactly `git push`")
+                    || error.to_string().contains("must require confirmation")
+            );
+        }
     }
 
     #[test]
