@@ -23,6 +23,11 @@ Paths must be workspace-relative. The Discord adapter validates the canonical
 workspace boundary, file size, PNG signature, and dimensions before uploading
 with OpenAB's own bot connection. The agent does not need a Discord token.
 
+The canonical form above is preferred. To recover from common agent formatting,
+OpenAB also accepts a leading `:` / `：` or a short image/attachment label on the
+first directive, such as `圖片：[[attach:artifacts/preview.png]]`. Other prose
+prefixes are left untouched so documentation examples are not uploaded by accident.
+
 The direct Discord API approach below remains a fallback for non-PNG files or
 deployments that do not include native workspace attachment relay.
 
