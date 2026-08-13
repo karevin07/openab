@@ -103,8 +103,9 @@ On startup, OpenAB reconciles bindings with Discord: deleted or invalid channels
 moved channels are retained with a warning, and transient API failures never delete mappings.
 
 New project channels receive an interactive **Project Home** embed with onboarding and project
-information buttons. **Quick actions** opens repository-specific prompt shortcuts configured with
-`[[discord.project_actions]]`; the selected title and prompt remain editable before a normal task
+information buttons. **Quick actions** opens repository prompt shortcuts configured with
+`[[discord.project_actions]]`; use `workspace_alias = "*"` for shortcuts shared by every repository.
+The selected title and prompt remain editable before a normal task
 is created, and are never executed as raw shell. Run `/project home` in an existing managed channel
 to post the current card.
 Inside a session thread, `/session status` opens a control panel with refresh, stop, detach-for-Cursor,

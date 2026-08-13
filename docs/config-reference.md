@@ -76,6 +76,7 @@ Discord adapter. Requires a Discord bot token.
 | `project_channels_enabled` | bool | `false` | Enable administrator-only `/project` commands for private workspace channels. Existing persisted bindings remain routable when disabled. |
 | `project_category_id` | string \| omit | none | Discord category ID used by `/project create`. Required when project channels are enabled. |
 | `project_actions` | table[] | `[]` | Trusted per-workspace Agent prompt shortcuts shown from Project Home. See below. |
+| `project_commands` | table[] | `[]` | Trusted per-workspace executable shortcuts shown from Project Home. See below. |
 | `allow_all_channels` | bool \| omit | auto-detect | `true` = all channels; `false` = only `allowed_channels`. Omitted = inferred from list (non-empty → false, empty → true). |
 | `allowed_channels` | string[] | `[]` | Channel IDs to allow. Only checked when `allow_all_channels` resolves to false. |
 | `allow_all_users` | bool \| omit | auto-detect | `true` = any user; `false` = only `allowed_users`. Omitted = inferred from list. |
@@ -91,9 +92,9 @@ Discord adapter. Requires a Discord bot token.
 
 ### `[[discord.project_actions]]`
 
-Adds repository-specific **Quick actions** to managed Discord Project Home cards. Selecting an
-action opens the normal editable New Task modal with `title` and `prompt` pre-filled. OpenAB does
-not execute the configured value as a raw shell command.
+Adds **Quick actions** to managed Discord Project Home cards. Selecting an action opens the normal
+editable New Task modal with `title` and `prompt` pre-filled. OpenAB does not execute the configured
+value as a raw shell command. Set `workspace_alias = "*"` to share an action across every repository.
 
 ```toml
 [[discord.project_actions]]
@@ -107,7 +108,7 @@ prompt = "Run `cargo test` without changing files, then summarize failures."
 
 | Key | Required | Constraints |
 |---|---|---|
-| `workspace_alias` | yes | Exact workspace alias without the leading `@`. |
+| `workspace_alias` | yes | Exact workspace alias without the leading `@`, or `*` for every workspace. A repository-specific item overrides a global item with the same `id`. |
 | `id` | yes | Unique per workspace; ASCII letters, numbers, `-`, `_`; maximum 40 characters. |
 | `label` | yes | Select option label; 1–100 characters. |
 | `description` | no | Select option description; maximum 100 characters. |
@@ -117,6 +118,42 @@ prompt = "Run `cargo test` without changing files, then summarize failures."
 Discord renders at most the first 25 configured actions for one workspace. Keep this config in a
 trusted operator-controlled file: repository content that an Agent can edit must not grant itself
 new direct-execution privileges.
+
+### `[[discord.project_commands]]`
+
+Adds **Repository commands** to managed Discord Project Home cards. OpenAB executes the configured
+executable directly in the bound Git repository without a shell or Cursor session. Discord users
+select only the preconfigured ID and cannot add arguments. Set `workspace_alias = "*"` to share a
+command across every repository.
+
+```toml
+[[discord.project_commands]]
+workspace_alias = "openab"
+id = "git_status"
+label = "Git status"
+description = "Inspect branch and working tree state"
+program = "git"
+args = ["status", "--short", "--branch"]
+timeout_seconds = 30
+requires_confirmation = false
+```
+
+| Key | Required | Constraints |
+|---|---|---|
+| `workspace_alias` | yes | Exact workspace alias without the leading `@`, or `*` for every workspace. A repository-specific item overrides a global item with the same `id`. |
+| `id` | yes | Unique per workspace; ASCII letters, numbers, `-`, `_`; maximum 40 characters. |
+| `label` | yes | Select option label; 1–100 characters. |
+| `description` | no | Select option description; maximum 100 characters. |
+| `program` | yes | Executable basename only; paths and common shell programs are rejected. |
+| `args` | no | Literal arguments; maximum 32 entries and 512 bytes per entry. |
+| `timeout_seconds` | no | `1`–`1800`; default `300`. |
+| `requires_confirmation` | no | Show the exact command and require a second click; default `false`. |
+
+The child starts with a cleared environment and receives only baseline home, path, user, and locale
+variables. Output is capped at 32 KiB per stream, duplicate concurrent runs of the same command are
+rejected, and timeout termination targets the command process group on Unix. Commands that mutate
+data, run migrations, or publish changes should require confirmation. The executable must already
+exist in the worker image.
 
 ---
 

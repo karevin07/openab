@@ -533,6 +533,10 @@ pub struct DiscordConfig {
     /// raw shell commands.
     #[serde(default)]
     pub project_actions: Vec<DiscordProjectActionConfig>,
+    /// Trusted, repository-specific executable shortcuts. Each command is
+    /// launched directly (never through a shell) inside the bound workspace.
+    #[serde(default)]
+    pub project_commands: Vec<DiscordProjectCommandConfig>,
     /// Explicit flag: true = allow all channels, false = check allowed_channels list.
     /// When not set, auto-detected: non-empty list → false, empty list → true.
     pub allow_all_channels: Option<bool>,
@@ -596,7 +600,8 @@ pub struct DiscordAdminControlConfig {
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 pub struct DiscordProjectActionConfig {
     /// Workspace alias exactly as registered in `[workspace.aliases]` or by
-    /// repository discovery. Do not include the leading `@`.
+    /// repository discovery. Use `*` for every workspace. Do not include the
+    /// leading `@`.
     pub workspace_alias: String,
     /// Stable component-safe identifier, unique within one workspace.
     pub id: String,
@@ -612,6 +617,32 @@ pub struct DiscordProjectActionConfig {
     pub prompt: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct DiscordProjectCommandConfig {
+    /// Workspace alias exactly as registered in `[workspace.aliases]` or by
+    /// repository discovery. Use `*` for every workspace. Do not include the
+    /// leading `@`.
+    pub workspace_alias: String,
+    /// Stable component-safe identifier, unique within one workspace.
+    pub id: String,
+    /// Discord select-menu label (maximum 100 characters).
+    pub label: String,
+    /// Optional one-line explanation shown in the select menu.
+    #[serde(default)]
+    pub description: String,
+    /// Executable basename resolved through OpenAB's fixed safe PATH.
+    pub program: String,
+    /// Literal arguments passed directly to the executable without shell parsing.
+    #[serde(default)]
+    pub args: Vec<String>,
+    /// Kill the command after this many seconds.
+    #[serde(default = "default_project_command_timeout_seconds")]
+    pub timeout_seconds: u64,
+    /// Require an explicit Discord confirmation before execution.
+    #[serde(default)]
+    pub requires_confirmation: bool,
+}
+
 fn default_max_bot_turns() -> u32 {
     100
 }
@@ -621,6 +652,9 @@ fn default_max_buffered_messages() -> usize {
 fn default_max_batch_tokens() -> usize {
     24_000
 }
+fn default_project_command_timeout_seconds() -> u64 {
+    300
+}
 
 fn validate_discord_project_actions(actions: &[DiscordProjectActionConfig]) -> anyhow::Result<()> {
     let mut seen = std::collections::HashSet::new();
@@ -629,7 +663,7 @@ fn validate_discord_project_actions(actions: &[DiscordProjectActionConfig]) -> a
             !action.workspace_alias.trim().is_empty()
                 && action.workspace_alias == action.workspace_alias.trim()
                 && !action.workspace_alias.starts_with('@'),
-            "discord.project_actions workspace_alias must be non-empty, trimmed, and omit the leading @"
+            "discord.project_actions workspace_alias must be '*', or a non-empty trimmed alias without the leading @"
         );
         anyhow::ensure!(
             !action.id.is_empty()
@@ -672,6 +706,95 @@ fn validate_discord_project_actions(actions: &[DiscordProjectActionConfig]) -> a
             "discord.project_actions prompt for '{}:{}' must be 1 to 4000 characters",
             action.workspace_alias,
             action.id
+        );
+    }
+    Ok(())
+}
+
+fn validate_discord_project_commands(
+    commands: &[DiscordProjectCommandConfig],
+) -> anyhow::Result<()> {
+    let mut seen = std::collections::HashSet::new();
+    const BLOCKED_SHELLS: &[&str] = &[
+        "sh",
+        "bash",
+        "zsh",
+        "dash",
+        "ksh",
+        "fish",
+        "csh",
+        "tcsh",
+        "pwsh",
+        "powershell",
+        "cmd",
+        "cmd.exe",
+    ];
+    for command in commands {
+        anyhow::ensure!(
+            !command.workspace_alias.trim().is_empty()
+                && command.workspace_alias == command.workspace_alias.trim()
+                && !command.workspace_alias.starts_with('@'),
+            "discord.project_commands workspace_alias must be '*', or a non-empty trimmed alias without the leading @"
+        );
+        anyhow::ensure!(
+            !command.id.is_empty()
+                && command.id.len() <= 40
+                && command
+                    .id
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-')),
+            "discord.project_commands id '{}' must contain only ASCII letters, numbers, '-' or '_' and be at most 40 characters",
+            command.id
+        );
+        anyhow::ensure!(
+            seen.insert((command.workspace_alias.clone(), command.id.clone())),
+            "duplicate discord.project_commands id '{}' for workspace '{}'",
+            command.id,
+            command.workspace_alias
+        );
+        let label_len = command.label.trim().chars().count();
+        anyhow::ensure!(
+            (1..=100).contains(&label_len),
+            "discord.project_commands label for '{}:{}' must be 1 to 100 characters",
+            command.workspace_alias,
+            command.id
+        );
+        anyhow::ensure!(
+            command.description.chars().count() <= 100,
+            "discord.project_commands description for '{}:{}' must be at most 100 characters",
+            command.workspace_alias,
+            command.id
+        );
+        anyhow::ensure!(
+            !command.program.is_empty()
+                && command.program.len() <= 128
+                && command.program.bytes().all(|byte| {
+                    byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'+' | b'.')
+                }),
+            "discord.project_commands program for '{}:{}' must be a basename containing only ASCII letters, numbers, '.', '-', '_' or '+'",
+            command.workspace_alias,
+            command.id
+        );
+        anyhow::ensure!(
+            !BLOCKED_SHELLS.contains(&command.program.to_ascii_lowercase().as_str()),
+            "discord.project_commands program for '{}:{}' cannot invoke a shell",
+            command.workspace_alias,
+            command.id
+        );
+        anyhow::ensure!(
+            command.args.len() <= 32
+                && command.args.iter().all(|arg| {
+                    arg.len() <= 512 && !arg.is_empty() && !arg.chars().any(char::is_control)
+                }),
+            "discord.project_commands args for '{}:{}' must contain at most 32 non-empty arguments of at most 512 bytes without control characters",
+            command.workspace_alias,
+            command.id
+        );
+        anyhow::ensure!(
+            (1..=1800).contains(&command.timeout_seconds),
+            "discord.project_commands timeout_seconds for '{}:{}' must be between 1 and 1800",
+            command.workspace_alias,
+            command.id
         );
     }
     Ok(())
@@ -2365,6 +2488,7 @@ fn parse_config_inner(expanded: &str, source: &str) -> anyhow::Result<Config> {
 
     if let Some(discord) = &config.discord {
         validate_discord_project_actions(&discord.project_actions)?;
+        validate_discord_project_commands(&discord.project_commands)?;
         validate_discord_admin_control(discord.admin_control.as_ref())?;
     }
 
@@ -2803,6 +2927,36 @@ prompt = "Run cargo test without changing files."
     }
 
     #[test]
+    fn discord_project_shortcuts_accept_global_workspace_alias() {
+        let cfg = parse_config_str(
+            r#"
+[discord]
+bot_token = "token"
+
+[[discord.project_actions]]
+workspace_alias = "*"
+id = "commit"
+label = "Commit"
+prompt = "Commit the current changes."
+
+[[discord.project_commands]]
+workspace_alias = "*"
+id = "push"
+label = "Push"
+program = "git"
+args = ["push"]
+requires_confirmation = true
+"#,
+            "test",
+        )
+        .expect("global project shortcuts should parse");
+
+        let discord = cfg.discord.unwrap();
+        assert_eq!(discord.project_actions[0].workspace_alias, "*");
+        assert_eq!(discord.project_commands[0].workspace_alias, "*");
+    }
+
+    #[test]
     fn discord_project_actions_reject_ambiguous_or_unsafe_ids() {
         let duplicate = parse_config_str(
             r#"
@@ -2840,6 +2994,63 @@ prompt = "Run tests"
         )
         .unwrap_err();
         assert!(unsafe_id.to_string().contains("must contain only ASCII"));
+    }
+
+    #[test]
+    fn discord_project_commands_parse_safe_argv() {
+        let cfg = parse_config_str(
+            r#"
+[discord]
+bot_token = "token"
+
+[[discord.project_commands]]
+workspace_alias = "openab"
+id = "git_status"
+label = "Git status"
+description = "Inspect the repository"
+program = "git"
+args = ["status", "--short", "--branch"]
+timeout_seconds = 30
+requires_confirmation = true
+"#,
+            "test",
+        )
+        .expect("project commands should parse");
+
+        let commands = cfg.discord.unwrap().project_commands;
+        assert_eq!(commands.len(), 1);
+        assert_eq!(commands[0].program, "git");
+        assert_eq!(commands[0].args, ["status", "--short", "--branch"]);
+        assert_eq!(commands[0].timeout_seconds, 30);
+        assert!(commands[0].requires_confirmation);
+    }
+
+    #[test]
+    fn discord_project_commands_reject_shells_and_paths() {
+        for program in ["bash", "/usr/bin/git"] {
+            let error = parse_config_str(
+                &format!(
+                    r#"
+[discord]
+bot_token = "token"
+[[discord.project_commands]]
+workspace_alias = "openab"
+id = "unsafe"
+label = "Unsafe"
+program = "{program}"
+args = ["status"]
+"#
+                ),
+                "test",
+            )
+            .unwrap_err();
+            let message = error.to_string();
+            assert!(
+                message.contains("cannot invoke a shell")
+                    || message.contains("must be a basename"),
+                "unexpected validation error: {message}"
+            );
+        }
     }
 
     #[test]

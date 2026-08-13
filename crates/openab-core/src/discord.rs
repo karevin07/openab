@@ -4,14 +4,18 @@ use crate::adapter::{
     AdapterRouter, ChannelRef, ChatAdapter, MessageRef, SenderContext, TaskLifecycleEvent,
 };
 use crate::bot_turns::{BotTurnTracker, TurnAction, TurnSeverity, BOT_TURN_LIMIT_WARNING_PREFIX};
-use crate::config::{AllowBots, AllowUsers, DiscordProjectActionConfig, SttConfig};
+use crate::config::{
+    AllowBots, AllowUsers, DiscordProjectActionConfig, DiscordProjectCommandConfig, SttConfig,
+};
 use crate::discord_admin::{
     AdminInventory, AdminStatus, CategoryPlan, ChannelPlan, CleanupCandidates, CreatedCategory,
     CreatedTextChannel, DeletedResource, DeletionPlan, DiscordAdminClient,
 };
 use crate::dispatch::DispatchTarget;
+use crate::directives::resolve_workspace;
 use crate::format;
 use crate::media;
+use crate::project_command::{run_project_command, ProjectCommandOutput};
 use crate::project_registry::{ProjectAccessTarget, ProjectBinding, ProjectRegistry};
 use crate::remind::{self, ReminderStore};
 use crate::task_registry::{TaskRecord, TaskRegistry, TaskState};
@@ -563,6 +567,11 @@ fn project_welcome_components(tasks: &[TaskRecord]) -> Vec<CreateActionRow> {
             .label("? Help")
             .style(ButtonStyle::Secondary),
     ])];
+    rows.push(CreateActionRow::Buttons(vec![
+        CreateButton::new("oab_project:commands")
+            .label("⌨ Repository commands")
+            .style(ButtonStyle::Secondary),
+    ]));
     if !tasks.is_empty() {
         let options = tasks
             .iter()
@@ -643,6 +652,156 @@ fn project_actions_message(
         .ephemeral(true)
 }
 
+fn project_command_display(command: &DiscordProjectCommandConfig) -> String {
+    let display = std::iter::once(command.program.as_str())
+        .chain(command.args.iter().map(String::as_str))
+        .map(|value| {
+            if value.chars().any(char::is_whitespace) {
+                format!("{:?}", value)
+            } else {
+                value.to_string()
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" ");
+    truncate_for_discord(&display, 400)
+}
+
+fn project_commands_message(
+    binding: &ProjectBinding,
+    commands: &[&DiscordProjectCommandConfig],
+) -> CreateInteractionResponseMessage {
+    let mut embed = CreateEmbed::new()
+        .title(format!(
+            "⌨ @{} · Repository commands",
+            binding.workspace_alias
+        ))
+        .description(
+            "選擇管理者預先允許的固定指令。OpenAB 會直接在 repository 執行，不建立 Cursor session，也不接受任意 shell 輸入。",
+        )
+        .colour(0x2ECC71)
+        .field(
+            "Repository",
+            inline_code(&format!("@{}", binding.workspace_alias)),
+            true,
+        );
+    if commands.is_empty() {
+        return CreateInteractionResponseMessage::new()
+            .embed(embed.field(
+                "尚未設定",
+                "請由管理者在 `[[discord.project_commands]]` 加入這個 workspace 的固定指令。",
+                false,
+            ))
+            .ephemeral(true);
+    }
+
+    let options = commands
+        .iter()
+        .take(SELECT_MENU_PAGE_SIZE)
+        .map(|command| {
+            let mut option = CreateSelectMenuOption::new(command.label.trim(), &command.id);
+            if !command.description.trim().is_empty() {
+                option = option.description(command.description.trim());
+            }
+            option
+        })
+        .collect();
+    let placeholder = if commands.len() > SELECT_MENU_PAGE_SIZE {
+        embed = embed.footer(CreateEmbedFooter::new(format!(
+            "顯示前 {SELECT_MENU_PAGE_SIZE} 個，共 {} 個 commands",
+            commands.len()
+        )));
+        format!("選擇固定指令（前 {SELECT_MENU_PAGE_SIZE} 個）")
+    } else {
+        "選擇固定指令".to_string()
+    };
+    let select = CreateSelectMenu::new(
+        "oab_project_commands",
+        CreateSelectMenuKind::String { options },
+    )
+    .placeholder(placeholder);
+    CreateInteractionResponseMessage::new()
+        .embed(embed)
+        .components(vec![CreateActionRow::SelectMenu(select)])
+        .ephemeral(true)
+}
+
+fn project_command_confirmation_message(
+    binding: &ProjectBinding,
+    command: &DiscordProjectCommandConfig,
+) -> CreateInteractionResponseMessage {
+    CreateInteractionResponseMessage::new()
+        .embed(
+            CreateEmbed::new()
+                .title("⚠️ Confirm repository command")
+                .description("這個固定指令被標記為需要確認。確認後會直接在 repository 執行。")
+                .colour(0xE67E22)
+                .field(
+                    "Repository",
+                    inline_code(&format!("@{}", binding.workspace_alias)),
+                    true,
+                )
+                .field("Command", inline_code(&project_command_display(command)), false)
+                .field("Timeout", format!("{} seconds", command.timeout_seconds), true),
+        )
+        .components(vec![CreateActionRow::Buttons(vec![
+            CreateButton::new(format!("oab_project_command:run:{}", command.id))
+                .label("Run command")
+                .style(ButtonStyle::Danger),
+            CreateButton::new("oab_project_command:cancel")
+                .label("Cancel")
+                .style(ButtonStyle::Secondary),
+        ])])
+        .ephemeral(true)
+}
+
+fn project_command_result_content(
+    binding: &ProjectBinding,
+    command: &DiscordProjectCommandConfig,
+    output: &ProjectCommandOutput,
+) -> String {
+    let state = if output.timed_out {
+        format!("⏱️ Timed out after {} seconds", command.timeout_seconds)
+    } else if output.exit_code == Some(0) {
+        "✅ Completed · exit 0".to_string()
+    } else {
+        format!(
+            "❌ Failed · exit {}",
+            output
+                .exit_code
+                .map_or_else(|| "unknown".to_string(), |code| code.to_string())
+        )
+    };
+    let mut captured = String::new();
+    if !output.stdout.trim().is_empty() {
+        captured.push_str("[stdout]\n");
+        captured.push_str(output.stdout.trim_end());
+    }
+    if !output.stderr.trim().is_empty() {
+        if !captured.is_empty() {
+            captured.push('\n');
+        }
+        captured.push_str("[stderr]\n");
+        captured.push_str(output.stderr.trim_end());
+    }
+    if captured.is_empty() {
+        captured.push_str("(no output)");
+    }
+    if output.truncated {
+        captured.push_str("\n… output truncated by OpenAB");
+    }
+    let captured = suppress_mentions(&strip_ansi_codes(&captured)).replace("```", "''' ");
+    let prefix = format!(
+        "{state}\nRepository: {}\nCommand: {}\nDuration: {:.2}s\n```text\n",
+        inline_code(&format!("@{}", binding.workspace_alias)),
+        inline_code(&project_command_display(command)),
+        output.elapsed.as_secs_f64(),
+    );
+    let suffix = "\n```";
+    let captured = truncate_for_discord(&captured, 1200);
+    format!("{prefix}{captured}{suffix}")
+}
+
 fn project_task_modal(title: Option<&str>, prompt: Option<&str>) -> CreateModal {
     let mut title_input =
         CreateInputText::new(InputTextStyle::Short, "Task title", "title")
@@ -673,7 +832,7 @@ fn project_welcome_message(binding: &ProjectBinding, tasks: &[TaskRecord]) -> Cr
     let embed = project_info_embed(binding)
         .field(
             "1 · Start a task",
-            "Tap **New task** for a custom request, or **Quick actions** for a repository shortcut.",
+            "Tap **New task** for a custom request, **Quick actions** for an Agent template, or **Repository commands** for an allowlisted executable.",
             false,
         )
         .field(
@@ -696,7 +855,7 @@ fn project_welcome_edit(binding: &ProjectBinding, tasks: &[TaskRecord]) -> EditM
     let embed = project_info_embed(binding)
         .field(
             "1 · Start a task",
-            "Tap **New task** for a custom request, or **Quick actions** for a repository shortcut.",
+            "Tap **New task** for a custom request, **Quick actions** for an Agent template, or **Repository commands** for an allowlisted executable.",
             false,
         )
         .field(
@@ -1353,7 +1512,7 @@ fn help_topic_message(
     let (title, description) = match topic {
         "discord" => (
             "📱 在 Discord 開始開發",
-            "1. 開啟 repository 的 Project Home。\n2. 點 **New task** 輸入需求，或用 **Quick actions** 選常用工作。\n3. 送出後在 task thread 回覆，即可保留同一個 context。\n4. 要查看 repository 內的 PNG，直接請 Agent 將相對路徑圖片傳回 Discord。",
+            "1. 開啟 repository 的 Project Home。\n2. 點 **New task** 輸入需求，或用 **Quick actions** 選 Agent 範本。\n3. 不需要模型時，點 **Repository commands** 直接執行管理者允許的固定指令。\n4. 送出 task 後在 thread 回覆，即可保留同一個 context。\n5. 要查看 repository 內的 PNG，直接請 Agent 將相對路徑圖片傳回 Discord。",
         ),
         "cursor" => (
             "🖥️ 回到電腦接續",
@@ -1385,6 +1544,11 @@ fn help_topic_message(
                     buttons.push(
                         CreateButton::new("oab_project:actions")
                             .label("⚡ Quick actions")
+                            .style(ButtonStyle::Secondary),
+                    );
+                    buttons.push(
+                        CreateButton::new("oab_project:commands")
+                            .label("⌨ Repository commands")
                             .style(ButtonStyle::Secondary),
                     );
                 } else {
@@ -1466,6 +1630,11 @@ fn help_project_message(
                 .label("⚡ Quick actions")
                 .style(ButtonStyle::Secondary),
         );
+        buttons.push(
+            CreateButton::new("oab_project:commands")
+                .label("⌨ Repository commands")
+                .style(ButtonStyle::Secondary),
+        );
     } else {
         buttons.push(project_link_button(binding));
     }
@@ -1478,7 +1647,7 @@ fn help_project_message(
         .embed(
             CreateEmbed::new()
                 .title(format!("📁 @{}", binding.workspace_alias))
-                .description("已選擇這個 repository project。使用 **New task** 輸入需求，或從 **Quick actions** 選擇常用工作。")
+                .description("已選擇這個 repository project。使用 **New task** 輸入需求、從 **Quick actions** 選 Agent 範本，或用 **Repository commands** 直接執行固定指令。")
                 .colour(0x5865F2)
                 .field("Project channel", format!("<#{}>", binding.channel_id), true)
                 .field(
@@ -2209,6 +2378,10 @@ pub struct Handler {
     pub task_registry: TaskRegistry,
     /// Trusted, per-workspace Agent prompt shortcuts rendered in Project Home.
     pub project_actions: Vec<DiscordProjectActionConfig>,
+    /// Trusted, per-workspace executable shortcuts rendered in Project Home.
+    pub project_commands: Vec<DiscordProjectCommandConfig>,
+    /// Prevent duplicate clicks from running the same command concurrently.
+    pub project_command_runs: tokio::sync::Mutex<HashSet<String>>,
     /// Optional client for the isolated Discord Admin Bot control plane.
     pub admin_control: Option<DiscordAdminClient>,
 }
@@ -3773,6 +3946,14 @@ impl EventHandler for Handler {
             Interaction::Component(comp) if comp.data.custom_id == "oab_project_actions" => {
                 self.handle_project_action_select(&ctx, &comp).await;
             }
+            Interaction::Component(comp) if comp.data.custom_id == "oab_project_commands" => {
+                self.handle_project_command_select(&ctx, &comp).await;
+            }
+            Interaction::Component(comp)
+                if comp.data.custom_id.starts_with("oab_project_command:") =>
+            {
+                self.handle_project_command_control(&ctx, &comp).await;
+            }
             Interaction::Component(comp) if comp.data.custom_id.starts_with("oab_project:") => {
                 self.handle_project_component(&ctx, &comp).await;
             }
@@ -3817,12 +3998,87 @@ impl EventHandler for Handler {
 
 // --- Slash command & interaction handlers ---
 
+fn project_actions_for_workspace<'a>(
+    actions: &'a [DiscordProjectActionConfig],
+    workspace_alias: &str,
+) -> Vec<&'a DiscordProjectActionConfig> {
+    let local_ids = actions
+        .iter()
+        .filter(|action| action.workspace_alias == workspace_alias)
+        .map(|action| action.id.as_str())
+        .collect::<HashSet<_>>();
+    actions
+        .iter()
+        .filter(|action| {
+            action.workspace_alias == "*" && !local_ids.contains(action.id.as_str())
+        })
+        .chain(
+            actions
+                .iter()
+                .filter(|action| action.workspace_alias == workspace_alias),
+        )
+        .collect()
+}
+
+fn project_commands_for_workspace<'a>(
+    commands: &'a [DiscordProjectCommandConfig],
+    workspace_alias: &str,
+) -> Vec<&'a DiscordProjectCommandConfig> {
+    let local_ids = commands
+        .iter()
+        .filter(|command| command.workspace_alias == workspace_alias)
+        .map(|command| command.id.as_str())
+        .collect::<HashSet<_>>();
+    commands
+        .iter()
+        .filter(|command| {
+            command.workspace_alias == "*" && !local_ids.contains(command.id.as_str())
+        })
+        .chain(
+            commands
+                .iter()
+                .filter(|command| command.workspace_alias == workspace_alias),
+        )
+        .collect()
+}
+
 impl Handler {
     fn project_actions_for(&self, workspace_alias: &str) -> Vec<&DiscordProjectActionConfig> {
+        project_actions_for_workspace(&self.project_actions, workspace_alias)
+    }
+
+    fn project_action_for(
+        &self,
+        workspace_alias: &str,
+        id: &str,
+    ) -> Option<&DiscordProjectActionConfig> {
         self.project_actions
             .iter()
-            .filter(|action| action.workspace_alias == workspace_alias)
-            .collect()
+            .find(|action| action.workspace_alias == workspace_alias && action.id == id)
+            .or_else(|| {
+                self.project_actions
+                    .iter()
+                    .find(|action| action.workspace_alias == "*" && action.id == id)
+            })
+    }
+
+    fn project_commands_for(&self, workspace_alias: &str) -> Vec<&DiscordProjectCommandConfig> {
+        project_commands_for_workspace(&self.project_commands, workspace_alias)
+    }
+
+    fn project_command_for(
+        &self,
+        workspace_alias: &str,
+        id: &str,
+    ) -> Option<&DiscordProjectCommandConfig> {
+        self.project_commands
+            .iter()
+            .find(|command| command.workspace_alias == workspace_alias && command.id == id)
+            .or_else(|| {
+                self.project_commands
+                    .iter()
+                    .find(|command| command.workspace_alias == "*" && command.id == id)
+            })
     }
 
     fn visible_projects(
@@ -6434,6 +6690,16 @@ impl Handler {
             }
             return;
         }
+        if action == "commands" {
+            let commands = self.project_commands_for(&binding.workspace_alias);
+            let response = CreateInteractionResponse::Message(project_commands_message(
+                &binding, &commands,
+            ));
+            if let Err(error) = comp.create_response(&ctx.http, response).await {
+                tracing::error!(%error, "failed to open repository commands");
+            }
+            return;
+        }
         if action == "attach" {
             let chats = match self.available_cursor_chats(&binding, "").await {
                 Ok(chats) => chats,
@@ -6538,11 +6804,8 @@ impl Handler {
             }
             _ => None,
         };
-        let selected = selected_id.and_then(|id| {
-            self.project_actions.iter().find(|action| {
-                action.workspace_alias == binding.workspace_alias && action.id == id
-            })
-        });
+        let selected = selected_id
+            .and_then(|id| self.project_action_for(&binding.workspace_alias, id));
         let Some(action) = selected else {
             let actions = self.project_actions_for(&binding.workspace_alias);
             let response = CreateInteractionResponse::Message(
@@ -6569,6 +6832,232 @@ impl Handler {
         {
             tracing::error!(%error, action_id = %action.id, "failed to open repository action task modal");
         }
+    }
+
+    async fn execute_project_command_interaction(
+        &self,
+        ctx: &Context,
+        comp: &serenity::model::application::ComponentInteraction,
+        binding: ProjectBinding,
+        command: DiscordProjectCommandConfig,
+    ) {
+        if let Err(error) = comp.defer_ephemeral(&ctx.http).await {
+            tracing::error!(%error, command_id = %command.id, "failed to defer repository command");
+            return;
+        }
+
+        let run_key = format!("{}:{}", binding.channel_id, command.id);
+        let inserted = {
+            let mut running = self.project_command_runs.lock().await;
+            running.insert(run_key.clone())
+        };
+        if !inserted {
+            let _ = comp
+                .edit_response(
+                    &ctx.http,
+                    EditInteractionResponse::new()
+                        .content("⏳ This repository command is already running.")
+                        .embeds(Vec::new())
+                        .components(Vec::new()),
+                )
+                .await;
+            return;
+        }
+
+        let aliases = self.router.workspace_aliases_map();
+        let workspace = resolve_workspace(
+            &format!("@{}", binding.workspace_alias),
+            &aliases,
+            &self.router.bot_home_path(),
+            &self.router.workspace_root_path(),
+        )
+        .map_err(anyhow::Error::msg);
+        let result = match workspace {
+            Ok(workspace) => {
+                tracing::info!(
+                    workspace_alias = %binding.workspace_alias,
+                    command_id = %command.id,
+                    user_id = %comp.user.id,
+                    "repository command started"
+                );
+                run_project_command(&command, &workspace).await
+            }
+            Err(error) => Err(error),
+        };
+        {
+            let mut running = self.project_command_runs.lock().await;
+            running.remove(&run_key);
+        }
+
+        let content = match result {
+            Ok(output) => {
+                tracing::info!(
+                    workspace_alias = %binding.workspace_alias,
+                    command_id = %command.id,
+                    exit_code = ?output.exit_code,
+                    timed_out = output.timed_out,
+                    "repository command finished"
+                );
+                project_command_result_content(&binding, &command, &output)
+            }
+            Err(error) => {
+                tracing::warn!(
+                    workspace_alias = %binding.workspace_alias,
+                    command_id = %command.id,
+                    %error,
+                    "repository command failed to start"
+                );
+                format!(
+                    "⚠️ Could not run repository command: {}",
+                    suppress_mentions(&truncate_for_discord(&error.to_string(), 1500))
+                )
+            }
+        };
+        if let Err(error) = comp
+            .edit_response(
+                &ctx.http,
+                EditInteractionResponse::new()
+                    .content(content)
+                    .embeds(Vec::new())
+                    .components(Vec::new()),
+            )
+            .await
+        {
+            tracing::error!(%error, command_id = %command.id, "failed to show repository command result");
+        }
+    }
+
+    async fn handle_project_command_select(
+        &self,
+        ctx: &Context,
+        comp: &serenity::model::application::ComponentInteraction,
+    ) {
+        if comp.user.bot
+            || is_denied_user(
+                false,
+                self.allow_all_users,
+                &self.allowed_users,
+                comp.user.id.get(),
+            )
+        {
+            let response = CreateInteractionResponse::Message(
+                CreateInteractionResponseMessage::new()
+                    .content("🚫 你沒有執行 repository commands 的權限。")
+                    .ephemeral(true),
+            );
+            let _ = comp.create_response(&ctx.http, response).await;
+            return;
+        }
+        let Some(binding) = self
+            .project_registry
+            .binding_for_channel(comp.channel_id.get())
+        else {
+            let response = CreateInteractionResponse::Message(
+                CreateInteractionResponseMessage::new()
+                    .content("⚠️ This channel is no longer linked to an OpenAB project.")
+                    .ephemeral(true),
+            );
+            let _ = comp.create_response(&ctx.http, response).await;
+            return;
+        };
+        let selected_id = match &comp.data.kind {
+            ComponentInteractionDataKind::StringSelect { values } => values.first(),
+            _ => None,
+        };
+        let selected = selected_id
+            .and_then(|id| self.project_command_for(&binding.workspace_alias, id));
+        let Some(command) = selected.cloned() else {
+            let commands = self.project_commands_for(&binding.workspace_alias);
+            let response = CreateInteractionResponse::Message(
+                project_commands_message(&binding, &commands)
+                    .content("⚠️ 這個 command 已移除，清單已重新整理。"),
+            );
+            let _ = comp.create_response(&ctx.http, response).await;
+            return;
+        };
+
+        if command.requires_confirmation {
+            let response = CreateInteractionResponse::Message(
+                project_command_confirmation_message(&binding, &command),
+            );
+            if let Err(error) = comp.create_response(&ctx.http, response).await {
+                tracing::error!(%error, command_id = %command.id, "failed to confirm repository command");
+            }
+        } else {
+            self.execute_project_command_interaction(ctx, comp, binding, command)
+                .await;
+        }
+    }
+
+    async fn handle_project_command_control(
+        &self,
+        ctx: &Context,
+        comp: &serenity::model::application::ComponentInteraction,
+    ) {
+        if comp.user.bot
+            || is_denied_user(
+                false,
+                self.allow_all_users,
+                &self.allowed_users,
+                comp.user.id.get(),
+            )
+        {
+            let response = CreateInteractionResponse::Message(
+                CreateInteractionResponseMessage::new()
+                    .content("🚫 你沒有執行 repository commands 的權限。")
+                    .ephemeral(true),
+            );
+            let _ = comp.create_response(&ctx.http, response).await;
+            return;
+        }
+        let action = comp
+            .data
+            .custom_id
+            .strip_prefix("oab_project_command:")
+            .unwrap_or("");
+        if action == "cancel" {
+            let response = CreateInteractionResponse::UpdateMessage(
+                CreateInteractionResponseMessage::new()
+                    .content("Cancelled. The repository command was not run.")
+                    .embeds(Vec::new())
+                    .components(Vec::new()),
+            );
+            let _ = comp.create_response(&ctx.http, response).await;
+            return;
+        }
+        let Some(command_id) = action.strip_prefix("run:") else {
+            let response = CreateInteractionResponse::Message(
+                CreateInteractionResponseMessage::new()
+                    .content("⚠️ This repository command control is no longer valid.")
+                    .ephemeral(true),
+            );
+            let _ = comp.create_response(&ctx.http, response).await;
+            return;
+        };
+        let Some(binding) = self
+            .project_registry
+            .binding_for_channel(comp.channel_id.get())
+        else {
+            let response = CreateInteractionResponse::Message(
+                CreateInteractionResponseMessage::new()
+                    .content("⚠️ This channel is no longer linked to an OpenAB project.")
+                    .ephemeral(true),
+            );
+            let _ = comp.create_response(&ctx.http, response).await;
+            return;
+        };
+        let command = self.project_command_for(&binding.workspace_alias, command_id);
+        let Some(command) = command.cloned() else {
+            let response = CreateInteractionResponse::Message(
+                CreateInteractionResponseMessage::new()
+                    .content("⚠️ This repository command was removed before confirmation.")
+                    .ephemeral(true),
+            );
+            let _ = comp.create_response(&ctx.http, response).await;
+            return;
+        };
+        self.execute_project_command_interaction(ctx, comp, binding, command)
+            .await;
     }
 
     async fn handle_project_attach_modal(
@@ -8982,6 +9471,56 @@ mod tests {
         }
     }
 
+    fn ui_project_command(id: &str) -> DiscordProjectCommandConfig {
+        DiscordProjectCommandConfig {
+            workspace_alias: "api".into(),
+            id: id.into(),
+            label: format!("Command {id}"),
+            description: format!("Run {id}"),
+            program: "git".into(),
+            args: vec!["status".into(), "--short".into()],
+            timeout_seconds: 30,
+            requires_confirmation: true,
+        }
+    }
+
+    #[test]
+    fn global_project_shortcuts_apply_to_every_workspace_and_local_ids_override() {
+        let mut global_action = ui_project_action("commit");
+        global_action.workspace_alias = "*".into();
+        global_action.label = "Global commit".into();
+        let mut local_action = ui_project_action("commit");
+        local_action.label = "API commit".into();
+        let mut global_review = ui_project_action("review");
+        global_review.workspace_alias = "*".into();
+        let actions = vec![global_action, local_action, global_review];
+        let visible_actions = project_actions_for_workspace(&actions, "api");
+        assert_eq!(
+            visible_actions
+                .iter()
+                .map(|action| action.label.as_str())
+                .collect::<Vec<_>>(),
+            ["Action review", "API commit"]
+        );
+
+        let mut global_command = ui_project_command("push");
+        global_command.workspace_alias = "*".into();
+        global_command.label = "Global push".into();
+        let mut local_command = ui_project_command("push");
+        local_command.label = "API push".into();
+        let mut global_status = ui_project_command("status");
+        global_status.workspace_alias = "*".into();
+        let commands = vec![global_command, local_command, global_status];
+        let visible_commands = project_commands_for_workspace(&commands, "api");
+        assert_eq!(
+            visible_commands
+                .iter()
+                .map(|command| command.label.as_str())
+                .collect::<Vec<_>>(),
+            ["Command status", "API push"]
+        );
+    }
+
     fn managed_entry(
         thread_id: u64,
         task_state: TaskState,
@@ -9057,6 +9596,7 @@ mod tests {
         let project = serde_json::to_string(&project_welcome_components(&[])).unwrap();
         assert!(project.contains("oab_project:sessions"));
         assert!(project.contains("oab_project:actions"));
+        assert!(project.contains("oab_project:commands"));
 
         let admin = serde_json::to_string(&admin_navigation_buttons()).unwrap();
         assert!(admin.contains("oab_admin:cleanup"));
@@ -9144,6 +9684,55 @@ mod tests {
         .unwrap();
         assert!(modal.contains("Task test"));
         assert!(modal.contains("Run the test workflow without changing files."));
+    }
+
+    #[test]
+    fn project_commands_card_caps_options_and_requires_confirmation() {
+        let commands = (1..=30)
+            .map(|index| ui_project_command(&format!("command-{index}")))
+            .collect::<Vec<_>>();
+        let command_refs = commands.iter().collect::<Vec<_>>();
+        let value = serde_json::to_value(project_commands_message(&ui_binding(), &command_refs))
+            .expect("commands card should serialize");
+        let select = component_with_custom_id(&value, "oab_project_commands").unwrap();
+        assert_eq!(
+            select["options"].as_array().unwrap().len(),
+            SELECT_MENU_PAGE_SIZE
+        );
+        assert!(value
+            .to_string()
+            .contains("顯示前 25 個，共 30 個 commands"));
+
+        let confirmation = serde_json::to_string(&project_command_confirmation_message(
+            &ui_binding(),
+            &ui_project_command("git-status"),
+        ))
+        .unwrap();
+        assert!(confirmation.contains("oab_project_command:run:git-status"));
+        assert!(confirmation.contains("oab_project_command:cancel"));
+        assert!(confirmation.contains("git status --short"));
+    }
+
+    #[test]
+    fn project_command_result_is_bounded_and_suppresses_mentions() {
+        let output = ProjectCommandOutput {
+            exit_code: Some(0),
+            timed_out: false,
+            stdout: format!("@everyone\n{}", "x".repeat(5000)),
+            stderr: String::new(),
+            truncated: true,
+            elapsed: std::time::Duration::from_millis(125),
+        };
+
+        let content = project_command_result_content(
+            &ui_binding(),
+            &ui_project_command("git-status"),
+            &output,
+        );
+
+        assert!(content.chars().count() < 2000);
+        assert!(!content.contains("@everyone"));
+        assert!(content.ends_with("```") || content.ends_with("```\n"));
     }
 
     #[test]

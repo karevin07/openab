@@ -1743,6 +1743,7 @@ async fn main() -> anyhow::Result<()> {
             project_channels_enabled = discord_cfg.project_channels_enabled,
             project_category_id,
             project_actions = discord_cfg.project_actions.len(),
+            project_commands = discord_cfg.project_commands.len(),
             admin_control_enabled = admin_control.is_some(),
             "starting discord adapter"
         );
@@ -1816,6 +1817,8 @@ async fn main() -> anyhow::Result<()> {
             project_registry,
             task_registry,
             project_actions: discord_cfg.project_actions,
+            project_commands: discord_cfg.project_commands,
+            project_command_runs: tokio::sync::Mutex::new(std::collections::HashSet::new()),
             admin_control,
         };
 
