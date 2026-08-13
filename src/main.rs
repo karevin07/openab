@@ -1737,6 +1737,7 @@ async fn main() -> anyhow::Result<()> {
             allow_dm = discord_cfg.allow_dm,
             project_channels_enabled = discord_cfg.project_channels_enabled,
             project_category_id,
+            project_actions = discord_cfg.project_actions.len(),
             "starting discord adapter"
         );
 
@@ -1808,6 +1809,7 @@ async fn main() -> anyhow::Result<()> {
             project_category_id,
             project_registry,
             task_registry,
+            project_actions: discord_cfg.project_actions,
         };
 
         let intents = GatewayIntents::GUILD_MESSAGES

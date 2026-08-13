@@ -524,6 +524,12 @@ pub struct DiscordConfig {
     /// Discord category ID under which `/project create` places channels.
     /// Required when `project_channels_enabled` is true.
     pub project_category_id: Option<String>,
+    /// Trusted, repository-specific prompt shortcuts shown from Discord
+    /// Project Home. Selecting one opens the normal new-task modal with the
+    /// configured title and prompt pre-filled; OpenAB never executes these as
+    /// raw shell commands.
+    #[serde(default)]
+    pub project_actions: Vec<DiscordProjectActionConfig>,
     /// Explicit flag: true = allow all channels, false = check allowed_channels list.
     /// When not set, auto-detected: non-empty list → false, empty list → true.
     pub allow_all_channels: Option<bool>,
@@ -573,6 +579,25 @@ pub struct DiscordConfig {
     pub max_batch_tokens: usize,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct DiscordProjectActionConfig {
+    /// Workspace alias exactly as registered in `[workspace.aliases]` or by
+    /// repository discovery. Do not include the leading `@`.
+    pub workspace_alias: String,
+    /// Stable component-safe identifier, unique within one workspace.
+    pub id: String,
+    /// Discord select-menu label (maximum 100 characters).
+    pub label: String,
+    /// Optional one-line explanation shown in the select menu.
+    #[serde(default)]
+    pub description: String,
+    /// Optional task title. Defaults to `label` when empty.
+    #[serde(default)]
+    pub title: String,
+    /// Prompt placed in the editable new-task modal.
+    pub prompt: String,
+}
+
 fn default_max_bot_turns() -> u32 {
     100
 }
@@ -581,6 +606,61 @@ fn default_max_buffered_messages() -> usize {
 }
 fn default_max_batch_tokens() -> usize {
     24_000
+}
+
+fn validate_discord_project_actions(actions: &[DiscordProjectActionConfig]) -> anyhow::Result<()> {
+    let mut seen = std::collections::HashSet::new();
+    for action in actions {
+        anyhow::ensure!(
+            !action.workspace_alias.trim().is_empty()
+                && action.workspace_alias == action.workspace_alias.trim()
+                && !action.workspace_alias.starts_with('@'),
+            "discord.project_actions workspace_alias must be non-empty, trimmed, and omit the leading @"
+        );
+        anyhow::ensure!(
+            !action.id.is_empty()
+                && action.id.len() <= 40
+                && action
+                    .id
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-')),
+            "discord.project_actions id '{}' must contain only ASCII letters, numbers, '-' or '_' and be at most 40 characters",
+            action.id
+        );
+        anyhow::ensure!(
+            seen.insert((action.workspace_alias.clone(), action.id.clone())),
+            "duplicate discord.project_actions id '{}' for workspace '{}'",
+            action.id,
+            action.workspace_alias
+        );
+        let label_len = action.label.trim().chars().count();
+        anyhow::ensure!(
+            (1..=100).contains(&label_len),
+            "discord.project_actions label for '{}:{}' must be 1 to 100 characters",
+            action.workspace_alias,
+            action.id
+        );
+        anyhow::ensure!(
+            action.description.chars().count() <= 100,
+            "discord.project_actions description for '{}:{}' must be at most 100 characters",
+            action.workspace_alias,
+            action.id
+        );
+        anyhow::ensure!(
+            action.title.trim().chars().count() <= 100,
+            "discord.project_actions title for '{}:{}' must be at most 100 characters",
+            action.workspace_alias,
+            action.id
+        );
+        let prompt_len = action.prompt.trim().chars().count();
+        anyhow::ensure!(
+            (1..=4000).contains(&prompt_len),
+            "discord.project_actions prompt for '{}:{}' must be 1 to 4000 characters",
+            action.workspace_alias,
+            action.id
+        );
+    }
+    Ok(())
 }
 
 /// Controls whether the bot responds to user messages in threads without @mention.
@@ -2236,6 +2316,10 @@ fn parse_config_inner(expanded: &str, source: &str) -> anyhow::Result<Config> {
     let mut config: Config = toml::from_str(expanded)
         .map_err(|e| anyhow::anyhow!("failed to parse config from {source}: {e}"))?;
 
+    if let Some(discord) = &config.discord {
+        validate_discord_project_actions(&discord.project_actions)?;
+    }
+
     // Resolve Discord shortcodes in reactions.mapping keys.
     // Allows operators to write `:thumbsup: = "OK"` instead of `"👍" = "OK"`.
     config.reactions.mapping = config
@@ -2576,6 +2660,72 @@ project_category_id = "123456789"
         let discord = cfg.discord.unwrap();
         assert!(discord.project_channels_enabled);
         assert_eq!(discord.project_category_id.as_deref(), Some("123456789"));
+    }
+
+    #[test]
+    fn discord_project_actions_parse_per_workspace() {
+        let cfg = parse_config_str(
+            r#"
+[discord]
+bot_token = "token"
+
+[[discord.project_actions]]
+workspace_alias = "openab"
+id = "test"
+label = "Run tests"
+description = "Run the repository test suite"
+title = "Test OpenAB"
+prompt = "Run cargo test without changing files."
+"#,
+            "test",
+        )
+        .expect("project actions should parse");
+
+        let actions = cfg.discord.unwrap().project_actions;
+        assert_eq!(actions.len(), 1);
+        assert_eq!(actions[0].workspace_alias, "openab");
+        assert_eq!(actions[0].id, "test");
+        assert_eq!(actions[0].prompt, "Run cargo test without changing files.");
+    }
+
+    #[test]
+    fn discord_project_actions_reject_ambiguous_or_unsafe_ids() {
+        let duplicate = parse_config_str(
+            r#"
+[discord]
+bot_token = "token"
+[[discord.project_actions]]
+workspace_alias = "openab"
+id = "test"
+label = "Test"
+prompt = "Run tests"
+[[discord.project_actions]]
+workspace_alias = "openab"
+id = "test"
+label = "Test again"
+prompt = "Run tests again"
+"#,
+            "test",
+        )
+        .unwrap_err();
+        assert!(duplicate
+            .to_string()
+            .contains("duplicate discord.project_actions id 'test'"));
+
+        let unsafe_id = parse_config_str(
+            r#"
+[discord]
+bot_token = "token"
+[[discord.project_actions]]
+workspace_alias = "openab"
+id = "test; rm"
+label = "Test"
+prompt = "Run tests"
+"#,
+            "test",
+        )
+        .unwrap_err();
+        assert!(unsafe_id.to_string().contains("must contain only ASCII"));
     }
 
     #[test]
