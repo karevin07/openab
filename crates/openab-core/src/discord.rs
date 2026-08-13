@@ -16,6 +16,7 @@ use crate::project_registry::{ProjectAccessTarget, ProjectBinding, ProjectRegist
 use crate::remind::{self, ReminderStore};
 use crate::task_registry::{TaskRecord, TaskRegistry, TaskState};
 use crate::trust::l3_gate_applies;
+use crate::workspace_attachment::prepare_workspace_pngs;
 use async_trait::async_trait;
 use serenity::builder::{
     CreateActionRow, CreateAttachment, CreateAutocompleteResponse, CreateButton, CreateChannel,
@@ -1352,7 +1353,7 @@ fn help_topic_message(
     let (title, description) = match topic {
         "discord" => (
             "📱 在 Discord 開始開發",
-            "1. 開啟 repository 的 Project Home。\n2. 點 **New task** 輸入需求，或用 **Quick actions** 選常用工作。\n3. 送出後在 task thread 回覆，即可保留同一個 context。",
+            "1. 開啟 repository 的 Project Home。\n2. 點 **New task** 輸入需求，或用 **Quick actions** 選常用工作。\n3. 送出後在 task thread 回覆，即可保留同一個 context。\n4. 要查看 repository 內的 PNG，直接請 Agent 將相對路徑圖片傳回 Discord。",
         ),
         "cursor" => (
             "🖥️ 回到電腦接續",
@@ -1975,6 +1976,28 @@ impl ChatAdapter for DiscordAdapter {
             channel: channel.clone(),
             message_id: msg.id.to_string(),
         })
+    }
+
+    async fn send_workspace_attachments(
+        &self,
+        channel: &ChannelRef,
+        workspace: &str,
+        paths: &[String],
+    ) -> anyhow::Result<()> {
+        let prepared = prepare_workspace_pngs(workspace, paths)?;
+        let files = prepared
+            .into_iter()
+            .map(|image| CreateAttachment::bytes(image.bytes, image.filename))
+            .collect::<Vec<_>>();
+        let ch_id: u64 = Self::resolve_channel(channel).parse()?;
+        ChannelId::new(ch_id)
+            .send_files(
+                &self.http,
+                files,
+                CreateMessage::new().content("🖼️ Workspace image attachment"),
+            )
+            .await?;
+        Ok(())
     }
 
     async fn send_message_with_reply(
@@ -8505,6 +8528,10 @@ fn build_sender_context(
         timestamp: Some(timestamp.to_string()),
         message_id: Some(message_id.to_string()),
         receiver_id: Some(receiver_id.to_string()),
+        output_instructions: Some(vec![
+            "When the user asks you to display or send an existing PNG from this session workspace, begin the final answer with one [[attach:relative/path.png]] line per image (maximum 4). Use workspace-relative paths only; never use absolute paths."
+                .to_string(),
+        ]),
     }
 }
 
@@ -9916,6 +9943,10 @@ mod tests {
         assert_eq!(ctx.sender_id, "user1");
         assert!(!ctx.is_bot);
         assert_eq!(ctx.receiver_id, Some("bot99".to_string()));
+        assert!(ctx
+            .output_instructions
+            .as_ref()
+            .is_some_and(|items| items.iter().any(|item| item.contains("[[attach:"))));
     }
 
     /// Non-thread message: channel_id = message channel, thread_id = None.

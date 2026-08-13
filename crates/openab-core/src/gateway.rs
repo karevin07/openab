@@ -942,6 +942,7 @@ pub async fn run_gateway_adapter(
                                         }),
                                         message_id: if event.message_id.is_empty() { None } else { Some(event.message_id.clone()) },
                                         receiver_id: None, // gateway does not yet resolve receiver identity
+                                        output_instructions: None,
                                     };
                                     let sender_json = serde_json::to_string(&sender_ctx)
                                         .unwrap_or_default();
@@ -1421,6 +1422,7 @@ pub async fn process_gateway_event(
         }),
         message_id: if event.message_id.is_empty() { None } else { Some(event.message_id.clone()) },
         receiver_id: None,
+        output_instructions: None,
     };
     let sender_json = serde_json::to_string(&sender_ctx).unwrap_or_default();
 

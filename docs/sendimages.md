@@ -11,8 +11,20 @@
 
 ---
 
-OpenAB does **not** relay images from the agent to Discord — it only streams text.
-To send an image back to the user, the agent must call the Discord API directly.
+OpenAB can natively relay PNG files that already exist inside the current session
+workspace. Begin the final response with one directive per image:
+
+```text
+[[attach:artifacts/preview.png]]
+Here is the generated preview.
+```
+
+Paths must be workspace-relative. The Discord adapter validates the canonical
+workspace boundary, file size, PNG signature, and dimensions before uploading
+with OpenAB's own bot connection. The agent does not need a Discord token.
+
+The direct Discord API approach below remains a fallback for non-PNG files or
+deployments that do not include native workspace attachment relay.
 
 > For sending non-image files (PDF, CSV, logs, etc.), see [sendfiles.md](sendfiles.md).
 
