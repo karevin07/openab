@@ -29,7 +29,7 @@ use serenity::builder::{
     CreateCommand, CreateCommandOption, CreateEmbed, CreateEmbedFooter, CreateInputText,
     CreateInteractionResponse, CreateInteractionResponseFollowup, CreateInteractionResponseMessage,
     CreateMessage, CreateModal, CreateSelectMenu, CreateSelectMenuKind, CreateSelectMenuOption,
-    CreateThread, EditChannel, EditInteractionResponse, EditMessage, GetMessages,
+    CreateThread, EditChannel, EditInteractionResponse, EditMessage, EditThread, GetMessages,
 };
 use serenity::http::Http;
 use serenity::model::application::{
@@ -219,7 +219,7 @@ fn session_state_presentation(
     }
 }
 
-const SESSION_CLOSE_CONFIRMATION: &str = "⚠️ **Close this session?** This stops current work, drops buffered messages, and removes the OpenAB session mapping. The repository, Discord thread, and Cursor checkpoint are kept; the next message starts a new session context.";
+const SESSION_CLOSE_CONFIRMATION: &str = "⚠️ **Close this session?** This stops current work, drops buffered messages, and removes the OpenAB session mapping. Choose whether to archive the Discord thread too. The repository and Cursor checkpoint are always kept.";
 
 fn session_closed_note(dropped: usize) -> String {
     if dropped > 0 {
@@ -230,6 +230,14 @@ fn session_closed_note(dropped: usize) -> String {
         "✅ Session closed. Cursor checkpoint was kept; send a new message to start a fresh session context."
             .to_string()
     }
+}
+
+async fn archive_discord_thread(http: &Http, thread_id: u64) -> Result<(), String> {
+    ChannelId::new(thread_id)
+        .edit_thread(http, EditThread::new().archived(true))
+        .await
+        .map(|_| ())
+        .map_err(|error| format!("Could not archive Discord thread: {error}"))
 }
 
 struct InteractionCard {
@@ -295,7 +303,7 @@ fn session_control_card(
             .style(ButtonStyle::Primary)
             .disabled(!has_session || snapshot.externally_detached),
         CreateButton::new("oab_session:close")
-            .label("✕ Close")
+            .label("✕ Close…")
             .style(ButtonStyle::Danger)
             .disabled(!has_session),
         CreateButton::new("oab_help:open")
@@ -439,7 +447,7 @@ fn task_control_rows(task: &TaskRecord) -> Vec<CreateActionRow> {
                     .label("🖥️ Continue on computer")
                     .style(ButtonStyle::Secondary),
                 CreateButton::new("oab_session:close")
-                    .label("✕ Close")
+                    .label("✕ Close…")
                     .style(ButtonStyle::Danger),
                 help(),
             ]),
@@ -491,7 +499,7 @@ fn task_control_rows(task: &TaskRecord) -> Vec<CreateActionRow> {
                     .label("🖥️ Use Cursor")
                     .style(ButtonStyle::Secondary),
                 CreateButton::new("oab_session:close")
-                    .label("✕ Close")
+                    .label("✕ Close…")
                     .style(ButtonStyle::Danger),
             ]);
             buttons
@@ -1059,6 +1067,7 @@ fn help_action_center(
     image_url: Option<&str>,
     projects: &[ProjectBinding],
     admin_control_enabled: bool,
+    task: Option<&TaskRecord>,
 ) -> CreateInteractionResponseMessage {
     let mut embed = CreateEmbed::new()
         .title("🧭 OpenAB · What do you want to do?")
@@ -1084,7 +1093,39 @@ fn help_action_center(
             false,
         );
     }
-    let mut components = vec![CreateActionRow::Buttons(vec![
+    let mut components = Vec::new();
+    if let Some(task) = task {
+        let (_, state, _) = task_state_presentation(task.state);
+        let guidance = if task.state == TaskState::Ready {
+            "可直接從下方繼續目前 Cursor session，或執行 repository command。"
+        } else {
+            "目前無法啟動捷徑；請等待 task 回到 Waiting for you。"
+        };
+        embed = embed.field(
+            "Current task",
+            format!(
+                "**{}** · {state}\n{} · <#{}>",
+                suppress_mentions(&task.title),
+                guidance,
+                task.thread_id
+            ),
+            false,
+        );
+        if task.state == TaskState::Ready {
+            components.push(CreateActionRow::Buttons(vec![
+                CreateButton::new("oab_task:continue")
+                    .label("💬 Continue")
+                    .style(ButtonStyle::Primary),
+                CreateButton::new("oab_task:actions")
+                    .label("⚡ Quick actions")
+                    .style(ButtonStyle::Success),
+                CreateButton::new("oab_task:commands")
+                    .label("⌨ Commands")
+                    .style(ButtonStyle::Secondary),
+            ]));
+        }
+    }
+    components.push(CreateActionRow::Buttons(vec![
         CreateButton::new("oab_help:discord")
             .label("📱 Start on Discord")
             .style(ButtonStyle::Primary),
@@ -1100,7 +1141,7 @@ fn help_action_center(
         CreateButton::new("oab_help:troubleshoot")
             .label("🛠️ Troubleshoot")
             .style(ButtonStyle::Secondary),
-    ])];
+    ]));
     if admin_control_enabled {
         components.push(CreateActionRow::Buttons(vec![CreateButton::new(
             "oab_admin:open",
@@ -1853,7 +1894,7 @@ fn session_manager_card(
     let mut embed = CreateEmbed::new()
         .title(format!("🧠 @{} · Cursor Sessions", binding.workspace_alias))
         .description(
-            "選擇一個 task 查看 Cursor session 狀態。Close 只清除 OpenAB 的 session 關聯，不會刪除 repository 或 Cursor checkpoint。",
+            "選擇一個 task 查看 Cursor session 狀態。Close 可同時封存 Discord thread；repository 與 Cursor checkpoint 都不會刪除。",
         )
         .colour(0x5865F2)
         .field(
@@ -1893,7 +1934,7 @@ fn session_manager_card(
         {
             embed = embed.field(
                 "清理紀錄",
-                "Session 已關閉；可用 **Remove from list** 隱藏這筆 task metadata。Discord thread 與 Cursor checkpoint 都會保留。",
+                "Session 已關閉。用 **Archive thread** 移出 Discord 的 active threads；用 **Remove session record** 隱藏 OpenAB task metadata。兩者都不會刪除 Cursor checkpoint。",
                 false,
             );
         }
@@ -1919,7 +1960,7 @@ fn session_manager_card(
             .join("\n");
         embed = embed.field("Recent sessions", list, false).field(
             "安全清除",
-            "先選擇 session，再按 **Close session**。關閉後才能 **Remove from list**；不提供直接刪除 Cursor checkpoint，避免不可逆資料遺失。",
+            "先選擇 session，再按 **Close…**，可只關閉 session 或一併封存 thread。關閉後才能 **Remove session record**；不提供直接刪除 Cursor checkpoint。",
             false,
         );
     }
@@ -1980,24 +2021,44 @@ fn session_manager_card(
         let can_close = !entry.snapshot.externally_detached
             && (entry.snapshot.state != SessionState::None
                 || entry.task.state != TaskState::Closed);
-        buttons.push(
-            CreateButton::new(format!(
-                "oab_sessions:close:{}:{}",
-                binding.channel_id, entry.task.thread_id
-            ))
-            .label("✕ Close session")
-            .style(ButtonStyle::Danger)
-            .disabled(!can_close),
-        );
         let can_remove = entry.task.state == TaskState::Closed
             && entry.snapshot.state == SessionState::None
             && !entry.snapshot.externally_detached;
+        if can_close {
+            buttons.push(
+                CreateButton::new(format!(
+                    "oab_sessions:close:{}:{}",
+                    binding.channel_id, entry.task.thread_id
+                ))
+                .label("✕ Close…")
+                .style(ButtonStyle::Danger),
+            );
+        } else if can_remove {
+            buttons.push(
+                CreateButton::new(format!(
+                    "oab_sessions:archive:{}:{}",
+                    binding.channel_id, entry.task.thread_id
+                ))
+                .label("Archive thread")
+                .style(ButtonStyle::Secondary),
+            );
+        } else {
+            buttons.push(
+                CreateButton::new(format!(
+                    "oab_sessions:close:{}:{}",
+                    binding.channel_id, entry.task.thread_id
+                ))
+                .label("✕ Close…")
+                .style(ButtonStyle::Danger)
+                .disabled(true),
+            );
+        }
         buttons.push(
             CreateButton::new(format!(
                 "oab_sessions:remove:{}:{}",
                 binding.channel_id, entry.task.thread_id
             ))
-            .label("Remove from list")
+            .label("Remove session record")
             .style(ButtonStyle::Secondary)
             .disabled(!can_remove),
         );
@@ -4307,11 +4368,13 @@ impl Handler {
             &role_ids,
             permissions,
         );
+        let task = self.task_registry.task_for_thread(cmd.channel_id.get());
         let response = CreateInteractionResponse::Message(
             help_action_center(
                 avatar_url.as_deref(),
                 &projects,
                 self.admin_control.is_some(),
+                task.as_ref(),
             )
             .ephemeral(true),
         );
@@ -4358,6 +4421,7 @@ impl Handler {
             &role_ids,
             permissions,
         );
+        let task = self.task_registry.task_for_thread(comp.channel_id.get());
         if matches!(topic, "open" | "back") {
             let avatar_url = ctx.cache.current_user().avatar_url();
             let response = if topic == "back" {
@@ -4365,6 +4429,7 @@ impl Handler {
                     avatar_url.as_deref(),
                     &projects,
                     self.admin_control.is_some(),
+                    task.as_ref(),
                 ))
             } else {
                 CreateInteractionResponse::Message(
@@ -4372,6 +4437,7 @@ impl Handler {
                         avatar_url.as_deref(),
                         &projects,
                         self.admin_control.is_some(),
+                        task.as_ref(),
                     )
                     .ephemeral(true),
                 )
@@ -4382,7 +4448,6 @@ impl Handler {
             return;
         }
 
-        let task = self.task_registry.task_for_thread(comp.channel_id.get());
         let binding = task
             .as_ref()
             .and_then(|task| {
@@ -4498,6 +4563,9 @@ impl Handler {
                     avatar_url.as_deref(),
                     &projects,
                     self.admin_control.is_some(),
+                    self.task_registry
+                        .task_for_thread(comp.channel_id.get())
+                        .as_ref(),
                 )
                 .content("⚠️ 這個 project 已移除或你已沒有存取權限，清單已重新整理。")
             },
@@ -5034,17 +5102,22 @@ impl Handler {
                     CreateEmbed::new()
                         .title("⚠️ Close Cursor session?")
                         .description(format!(
-                            "即將關閉 **{}**。這會停止目前工作並清除 OpenAB 的 session 關聯；repository、Discord thread 與 Cursor checkpoint 都不會刪除。",
+                            "即將關閉 **{}**。建議同時封存 Discord thread，讓它移出 active threads。repository 與 Cursor checkpoint 都不會刪除。",
                             suppress_mentions(&task.title)
                         ))
                         .colour(0xE74C3C),
                 )
                 .components(vec![CreateActionRow::Buttons(vec![
                     CreateButton::new(format!(
-                        "oab_sessions:confirm_close:{project_channel_id}:{thread_id}"
+                        "oab_sessions:confirm_close_archive:{project_channel_id}:{thread_id}"
                     ))
-                    .label("Close session")
+                    .label("Close & archive")
                     .style(ButtonStyle::Danger),
+                    CreateButton::new(format!(
+                        "oab_sessions:confirm_close_only:{project_channel_id}:{thread_id}"
+                    ))
+                    .label("Close session only")
+                    .style(ButtonStyle::Secondary),
                     CreateButton::new(format!(
                         "oab_sessions:view:{project_channel_id}:{thread_id}"
                     ))
@@ -5055,10 +5128,11 @@ impl Handler {
             return;
         }
 
-        if action == "confirm_close" {
+        if matches!(action, "confirm_close_archive" | "confirm_close_only") {
             let session_key = format!("discord:{thread_id}");
             let snapshot = self.router.pool().session_snapshot(&session_key).await;
-            let note = if snapshot.externally_detached {
+            let mut session_closed = false;
+            let mut note = if snapshot.externally_detached {
                 "⚠️ Cursor 已在電腦上接手。請先正常離開 terminal，session 未被關閉。".to_string()
             } else {
                 let dropped = self
@@ -5070,26 +5144,23 @@ impl Handler {
                     self.router.pool().reset_session(&session_key).await
                 };
                 match reset_result {
-                    Ok(()) => match self.task_registry.set_state(thread_id, TaskState::Closed) {
-                        Ok(_) if dropped > 0 => format!(
-                            "✅ Session closed and {dropped} buffered message(s) dropped. Cursor checkpoint was kept."
-                        ),
-                        Ok(_) => {
-                            "✅ Session closed. Cursor checkpoint was kept; you may now remove this item from the list."
-                                .to_string()
+                    Ok(()) => {
+                        session_closed = true;
+                        match self.task_registry.set_state(thread_id, TaskState::Closed) {
+                            Ok(_) if dropped > 0 => format!(
+                                "✅ Session closed and {dropped} buffered message(s) dropped. Cursor checkpoint was kept."
+                            ),
+                            Ok(_) => {
+                                "✅ Session closed. Cursor checkpoint was kept.".to_string()
+                            }
+                            Err(error) => format!(
+                                "⚠️ Session closed, but task metadata could not be updated: {error}"
+                            ),
                         }
-                        Err(error) => format!("⚠️ Session closed, but task metadata could not be updated: {error}"),
-                    },
+                    }
                     Err(error) => format!("⚠️ Could not close session: {error}"),
                 }
             };
-            let entries = self.managed_sessions_for_project(project_channel_id).await;
-            let _ = comp
-                .edit_response(
-                    &ctx.http,
-                    session_manager_edit(&binding, &entries, Some(thread_id), Some(note)),
-                )
-                .await;
 
             if let Some(updated) = self.task_registry.task_for_thread(thread_id) {
                 if let Some(message_id) = updated.status_message_id {
@@ -5108,6 +5179,53 @@ impl Handler {
             if let Err(error) = self.upsert_project_home(ctx, &binding).await {
                 tracing::warn!(%error, "failed to refresh Project Home after manager close");
             }
+
+            if session_closed && action == "confirm_close_archive" {
+                match archive_discord_thread(&ctx.http, thread_id).await {
+                    Ok(()) => note.push_str(" Discord thread archived."),
+                    Err(error) => {
+                        tracing::warn!(%error, thread_id, "session closed but thread archive failed");
+                        note.push_str("\n⚠️ Session was closed, but the Discord thread could not be archived. Check the bot's Manage Threads permission.");
+                    }
+                }
+            }
+            let entries = self.managed_sessions_for_project(project_channel_id).await;
+            let _ = comp
+                .edit_response(
+                    &ctx.http,
+                    session_manager_edit(&binding, &entries, Some(thread_id), Some(note)),
+                )
+                .await;
+            return;
+        }
+
+        if action == "archive" {
+            let snapshot = self
+                .router
+                .pool()
+                .session_snapshot(&format!("discord:{thread_id}"))
+                .await;
+            let note = if task.state != TaskState::Closed
+                || snapshot.state != SessionState::None
+                || snapshot.externally_detached
+            {
+                "⚠️ 請先關閉 session，再封存 Discord thread。".to_string()
+            } else {
+                match archive_discord_thread(&ctx.http, thread_id).await {
+                    Ok(()) => "✅ Discord thread archived. Session record and Cursor checkpoint were kept."
+                        .to_string(),
+                    Err(error) => format!(
+                        "⚠️ {error}. Check the bot's Manage Threads permission; the session record was kept."
+                    ),
+                }
+            };
+            let entries = self.managed_sessions_for_project(project_channel_id).await;
+            let _ = comp
+                .edit_response(
+                    &ctx.http,
+                    session_manager_edit(&binding, &entries, Some(thread_id), Some(note)),
+                )
+                .await;
             return;
         }
 
@@ -6363,9 +6481,12 @@ impl Handler {
             let confirmation = CreateInteractionResponseMessage::new()
                 .content(SESSION_CLOSE_CONFIRMATION)
                 .components(vec![CreateActionRow::Buttons(vec![
-                    CreateButton::new("oab_session:confirm_close")
-                        .label("Close session")
+                    CreateButton::new("oab_session:confirm_close_archive")
+                        .label("Close & archive")
                         .style(ButtonStyle::Danger),
+                    CreateButton::new("oab_session:confirm_close_only")
+                        .label("Close session only")
+                        .style(ButtonStyle::Secondary),
                     CreateButton::new("oab_session:refresh")
                         .label("Keep session")
                         .style(ButtonStyle::Secondary),
@@ -6386,7 +6507,8 @@ impl Handler {
         }
 
         let mut task_state_update = None;
-        let note = match action {
+        let mut archive_after_close = false;
+        let mut note = match action {
             "refresh" => None,
             "cancel" => Some(
                 match self.router.pool().cancel_session(&scope.session_key).await {
@@ -6406,7 +6528,7 @@ impl Handler {
                     Err(error) => format!("⚠️ Could not detach session: {error}"),
                 },
             ),
-            "confirm_close" => {
+            "confirm_close_archive" | "confirm_close_only" => {
                 let dropped = self
                     .dispatcher
                     .cancel_buffered_thread("discord", &comp.channel_id.get().to_string());
@@ -6414,10 +6536,12 @@ impl Handler {
                     match self.router.pool().reset_session(&scope.session_key).await {
                         Ok(()) if dropped > 0 => {
                             task_state_update = Some(TaskState::Closed);
+                            archive_after_close = action == "confirm_close_archive";
                             session_closed_note(dropped)
                         }
                         Ok(()) => {
                             task_state_update = Some(TaskState::Closed);
+                            archive_after_close = action == "confirm_close_archive";
                             session_closed_note(0)
                         }
                         Err(_) if dropped > 0 => format!(
@@ -6477,6 +6601,20 @@ impl Handler {
                     tracing::warn!(%error, "failed to refresh Project Home after session control");
                 }
             }
+        }
+        if archive_after_close {
+            let archive_note = match archive_discord_thread(&ctx.http, comp.channel_id.get()).await {
+                Ok(()) => "Discord thread archived.".to_string(),
+                Err(error) => {
+                    tracing::warn!(%error, thread_id = comp.channel_id.get(), "session closed but thread archive failed");
+                    "⚠️ Session was closed, but the Discord thread could not be archived. Check the bot's Manage Threads permission."
+                        .to_string()
+                }
+            };
+            note = Some(match note {
+                Some(value) => format!("{value}\n{archive_note}"),
+                None => archive_note,
+            });
         }
         let message = match task {
             Some(task) => task_status_interaction_edit(&task, note),
@@ -9657,7 +9795,7 @@ mod tests {
     #[test]
     fn close_copy_states_what_is_removed_and_retained() {
         assert!(SESSION_CLOSE_CONFIRMATION.contains("OpenAB session mapping"));
-        assert!(SESSION_CLOSE_CONFIRMATION.contains("Cursor checkpoint are kept"));
+        assert!(SESSION_CLOSE_CONFIRMATION.contains("Cursor checkpoint are always kept"));
         assert!(session_closed_note(0).contains("Cursor checkpoint was kept"));
         assert!(session_closed_note(2).contains("2 buffered message(s) dropped"));
     }
@@ -9828,9 +9966,25 @@ mod tests {
 
     #[test]
     fn help_and_project_home_expose_session_manager() {
-        let help = serde_json::to_string(&help_action_center(None, &[], true)).unwrap();
+        let help = serde_json::to_string(&help_action_center(None, &[], true, None)).unwrap();
         assert!(help.contains("oab_help:sessions"));
         assert!(help.contains("oab_admin:open"));
+
+        let ready_task = ui_task(TaskState::Ready, None);
+        let task_help =
+            serde_json::to_string(&help_action_center(None, &[], false, Some(&ready_task)))
+                .unwrap();
+        assert!(task_help.contains("Current task"));
+        assert!(task_help.contains("oab_task:continue"));
+        assert!(task_help.contains("oab_task:actions"));
+        assert!(task_help.contains("oab_task:commands"));
+
+        let running_task = ui_task(TaskState::Running, None);
+        let running_help =
+            serde_json::to_string(&help_action_center(None, &[], false, Some(&running_task)))
+                .unwrap();
+        assert!(running_help.contains("等待 task 回到 Waiting for you"));
+        assert!(!running_help.contains("oab_task:actions"));
 
         let project = serde_json::to_string(&project_welcome_components(&[])).unwrap();
         assert!(project.contains("oab_project:sessions"));
@@ -10008,7 +10162,8 @@ mod tests {
                 binding
             })
             .collect::<Vec<_>>();
-        let value = serde_json::to_value(help_action_center(None, &projects, false)).unwrap();
+        let value =
+            serde_json::to_value(help_action_center(None, &projects, false, None)).unwrap();
         let select = component_with_custom_id(&value, "oab_help_project").unwrap();
 
         assert_eq!(
@@ -10085,8 +10240,11 @@ mod tests {
             None,
         ))
         .unwrap();
+        let archive = component_with_custom_id(&value, "oab_sessions:archive:2:3").unwrap();
         let remove = component_with_custom_id(&value, "oab_sessions:remove:2:3").unwrap();
+        assert_eq!(archive["disabled"].as_bool(), Some(false));
         assert_eq!(remove["disabled"].as_bool(), Some(false));
+        assert_eq!(remove["label"].as_str(), Some("Remove session record"));
 
         let mut detached = managed_entry(4, TaskState::Cursor, SessionState::Persisted);
         detached.snapshot.externally_detached = true;
