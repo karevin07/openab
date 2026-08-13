@@ -49,6 +49,7 @@ WORKDIR /home/agent
 
 COPY --from=builder --chown=agent:agent /build/target/release/openab /usr/local/bin/openab
 COPY --chmod=755 scripts/cursor_cli_acp.py /usr/local/bin/cursor-cli-acp
+RUN python3 -c "import runpy; runpy.run_path('/usr/local/bin/cursor-cli-acp', run_name='cursor_cli_acp_smoke')"
 
 RUN mkdir -p /home/agent/.cursor && chown -R agent:agent /home/agent
 

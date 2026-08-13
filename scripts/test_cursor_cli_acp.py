@@ -389,6 +389,18 @@ class CursorCliAcpTest(unittest.TestCase):
         self.assertEqual("".join(chunks), first)
         self.assertEqual(state["streamed_text"], first)
 
+    def test_near_duplicate_snapshot_detects_small_revision(self):
+        previous = "四張圖片：夏蓧竹、林洛冰、張淺、蘇瑜，請確認是否全部到齊。"
+        revised = "四張圖片：夏蓧竹、林洛冰、張淺淺、蘇瑜，請確認是否全部到齊。"
+
+        self.assertTrue(bridge.is_near_duplicate_snapshot(previous, revised))
+
+    def test_near_duplicate_snapshot_keeps_distinct_text(self):
+        previous = "先確認四張角色圖片是否全部成功上傳。"
+        current = "接著執行完整測試並整理程式碼變更摘要。"
+
+        self.assertFalse(bridge.is_near_duplicate_snapshot(previous, current))
+
     def test_per_tool_phase_snapshot_does_not_repeat_current_segment(self):
         first = "first progress sentence"
         second = "second progress sentence"
