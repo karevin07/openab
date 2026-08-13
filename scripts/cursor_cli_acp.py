@@ -5,7 +5,6 @@ from __future__ import annotations
 
 import base64
 import binascii
-import difflib
 import hashlib
 import json
 import os
@@ -338,7 +337,14 @@ def is_near_duplicate_snapshot(previous: str, current: str) -> bool:
     length_ratio = min(len(previous), len(current)) / max(len(previous), len(current))
     if length_ratio < 0.75:
         return False
-    return difflib.SequenceMatcher(None, previous, current).ratio() >= 0.85
+    previous_pairs = set(zip(previous, previous[1:]))
+    current_pairs = set(zip(current, current[1:]))
+    if not previous_pairs or not current_pairs:
+        return False
+    similarity = 2 * len(previous_pairs & current_pairs) / (
+        len(previous_pairs) + len(current_pairs)
+    )
+    return similarity >= 0.85
 
 
 def emit_stream_event(
