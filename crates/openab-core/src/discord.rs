@@ -4,7 +4,7 @@ use crate::adapter::{
     AdapterRouter, ChannelRef, ChatAdapter, MessageRef, SenderContext, TaskLifecycleEvent,
 };
 use crate::bot_turns::{BotTurnTracker, TurnAction, TurnSeverity, BOT_TURN_LIMIT_WARNING_PREFIX};
-use crate::config::{AllowBots, AllowUsers, SttConfig};
+use crate::config::{AllowBots, AllowUsers, DiscordProjectActionConfig, SttConfig};
 use crate::dispatch::DispatchTarget;
 use crate::format;
 use crate::media;
@@ -548,8 +548,8 @@ fn project_welcome_components(tasks: &[TaskRecord]) -> Vec<CreateActionRow> {
         CreateButton::new("oab_project:attach")
             .label("📤 Attach local chat")
             .style(ButtonStyle::Success),
-        CreateButton::new("oab_project:status")
-            .label("📁 Project info")
+        CreateButton::new("oab_project:actions")
+            .label("⚡ Quick actions")
             .style(ButtonStyle::Secondary),
         CreateButton::new("oab_project:sessions")
             .label("🧠 Sessions")
@@ -582,11 +582,93 @@ fn project_welcome_components(tasks: &[TaskRecord]) -> Vec<CreateActionRow> {
     rows
 }
 
+fn project_actions_message(
+    binding: &ProjectBinding,
+    actions: &[&DiscordProjectActionConfig],
+) -> CreateInteractionResponseMessage {
+    let mut embed = CreateEmbed::new()
+        .title(format!("⚡ @{} · Quick actions", binding.workspace_alias))
+        .description(
+            "選擇常用工作後，OpenAB 會開啟可編輯的 New Task 視窗。確認內容後才會建立 Agent session；這裡不會直接執行任意 shell。",
+        )
+        .colour(0xF1C40F)
+        .field(
+            "Repository",
+            inline_code(&format!("@{}", binding.workspace_alias)),
+            true,
+        );
+    if actions.is_empty() {
+        return CreateInteractionResponseMessage::new()
+            .embed(embed.field(
+                "尚未設定",
+                "請由管理者在 `[[discord.project_actions]]` 加入這個 workspace 的常用工作。",
+                false,
+            ))
+            .ephemeral(true);
+    }
+
+    let options = actions
+        .iter()
+        .take(SELECT_MENU_PAGE_SIZE)
+        .map(|action| {
+            let mut option = CreateSelectMenuOption::new(action.label.trim(), &action.id);
+            if !action.description.trim().is_empty() {
+                option = option.description(action.description.trim());
+            }
+            option
+        })
+        .collect();
+    let placeholder = if actions.len() > SELECT_MENU_PAGE_SIZE {
+        embed = embed.footer(CreateEmbedFooter::new(format!(
+            "顯示前 {SELECT_MENU_PAGE_SIZE} 個，共 {} 個 actions",
+            actions.len()
+        )));
+        format!("選擇常用工作（前 {SELECT_MENU_PAGE_SIZE} 個）")
+    } else {
+        "選擇常用工作".to_string()
+    };
+    let select = CreateSelectMenu::new(
+        "oab_project_actions",
+        CreateSelectMenuKind::String { options },
+    )
+    .placeholder(placeholder);
+    CreateInteractionResponseMessage::new()
+        .embed(embed)
+        .components(vec![CreateActionRow::SelectMenu(select)])
+        .ephemeral(true)
+}
+
+fn project_task_modal(title: Option<&str>, prompt: Option<&str>) -> CreateModal {
+    let mut title_input =
+        CreateInputText::new(InputTextStyle::Short, "Task title", "title")
+            .placeholder("Fix login redirect")
+            .max_length(100)
+            .required(false);
+    if let Some(title) = title.filter(|value| !value.trim().is_empty()) {
+        title_input = title_input.value(truncate_for_discord(title.trim(), 100));
+    }
+    let mut prompt_input = CreateInputText::new(
+        InputTextStyle::Paragraph,
+        "What should Cursor do?",
+        "prompt",
+    )
+    .placeholder("Describe the outcome, constraints, and how to verify it")
+    .min_length(1)
+    .max_length(4000);
+    if let Some(prompt) = prompt.filter(|value| !value.trim().is_empty()) {
+        prompt_input = prompt_input.value(truncate_for_discord(prompt.trim(), 4000));
+    }
+    CreateModal::new("oab_project_new", "Start a new development task").components(vec![
+        CreateActionRow::InputText(title_input),
+        CreateActionRow::InputText(prompt_input),
+    ])
+}
+
 fn project_welcome_message(binding: &ProjectBinding, tasks: &[TaskRecord]) -> CreateMessage {
     let embed = project_info_embed(binding)
         .field(
             "1 · Start a task",
-            "Tap **New task**, enter a title and request, then OpenAB creates the thread and starts Cursor.",
+            "Tap **New task** for a custom request, or **Quick actions** for a repository shortcut.",
             false,
         )
         .field(
@@ -609,7 +691,7 @@ fn project_welcome_edit(binding: &ProjectBinding, tasks: &[TaskRecord]) -> EditM
     let embed = project_info_embed(binding)
         .field(
             "1 · Start a task",
-            "Tap **New task**, enter a title and request, then OpenAB creates the thread and starts Cursor.",
+            "Tap **New task** for a custom request, or **Quick actions** for a repository shortcut.",
             false,
         )
         .field(
@@ -747,7 +829,7 @@ fn help_topic_message(
     let (title, description) = match topic {
         "discord" => (
             "📱 在 Discord 開始開發",
-            "1. 開啟 repository 的 Project Home。\n2. 點 **New task**，輸入標題與需求。\n3. 之後直接在 task thread 回覆，即可保留同一個 context。",
+            "1. 開啟 repository 的 Project Home。\n2. 點 **New task** 輸入需求，或用 **Quick actions** 選常用工作。\n3. 送出後在 task thread 回覆，即可保留同一個 context。",
         ),
         "cursor" => (
             "🖥️ 回到電腦接續",
@@ -775,6 +857,11 @@ fn help_topic_message(
                         CreateButton::new("oab_project:new")
                             .label("▶ New task")
                             .style(ButtonStyle::Primary),
+                    );
+                    buttons.push(
+                        CreateButton::new("oab_project:actions")
+                            .label("⚡ Quick actions")
+                            .style(ButtonStyle::Secondary),
                     );
                 } else {
                     buttons.push(project_link_button(binding));
@@ -850,6 +937,11 @@ fn help_project_message(
                 .label("📤 Attach local chat")
                 .style(ButtonStyle::Secondary),
         );
+        buttons.push(
+            CreateButton::new("oab_project:actions")
+                .label("⚡ Quick actions")
+                .style(ButtonStyle::Secondary),
+        );
     } else {
         buttons.push(project_link_button(binding));
     }
@@ -862,7 +954,7 @@ fn help_project_message(
         .embed(
             CreateEmbed::new()
                 .title(format!("📁 @{}", binding.workspace_alias))
-                .description("已選擇這個 repository project。開啟 Project Home 後點 **New task**，即可建立獨立的 Discord thread 與 Cursor session。")
+                .description("已選擇這個 repository project。使用 **New task** 輸入需求，或從 **Quick actions** 選擇常用工作。")
                 .colour(0x5865F2)
                 .field("Project channel", format!("<#{}>", binding.channel_id), true)
                 .field(
@@ -1569,6 +1661,8 @@ pub struct Handler {
     pub project_registry: ProjectRegistry,
     /// Persistent task metadata used by Project Home and task status cards.
     pub task_registry: TaskRegistry,
+    /// Trusted, per-workspace Agent prompt shortcuts rendered in Project Home.
+    pub project_actions: Vec<DiscordProjectActionConfig>,
 }
 
 struct DiscordCommandScope {
@@ -3121,6 +3215,9 @@ impl EventHandler for Handler {
             Interaction::Component(comp) if comp.data.custom_id.starts_with("oab_sessions:") => {
                 self.handle_session_manager_component(&ctx, &comp).await;
             }
+            Interaction::Component(comp) if comp.data.custom_id == "oab_project_actions" => {
+                self.handle_project_action_select(&ctx, &comp).await;
+            }
             Interaction::Component(comp) if comp.data.custom_id.starts_with("oab_project:") => {
                 self.handle_project_component(&ctx, &comp).await;
             }
@@ -3155,6 +3252,13 @@ impl EventHandler for Handler {
 // --- Slash command & interaction handlers ---
 
 impl Handler {
+    fn project_actions_for(&self, workspace_alias: &str) -> Vec<&DiscordProjectActionConfig> {
+        self.project_actions
+            .iter()
+            .filter(|action| action.workspace_alias == workspace_alias)
+            .collect()
+    }
+
     fn visible_projects(
         &self,
         guild_id: Option<u64>,
@@ -5368,30 +5472,22 @@ impl Handler {
             return;
         }
         if action == "new" {
-            let modal = CreateModal::new("oab_project_new", "Start a new development task")
-                .components(vec![
-                    CreateActionRow::InputText(
-                        CreateInputText::new(InputTextStyle::Short, "Task title", "title")
-                            .placeholder("Fix login redirect")
-                            .max_length(100)
-                            .required(false),
-                    ),
-                    CreateActionRow::InputText(
-                        CreateInputText::new(
-                            InputTextStyle::Paragraph,
-                            "What should Cursor do?",
-                            "prompt",
-                        )
-                        .placeholder("Describe the outcome, constraints, and how to verify it")
-                        .min_length(1)
-                        .max_length(4000),
-                    ),
-                ]);
+            let modal = project_task_modal(None, None);
             if let Err(error) = comp
                 .create_response(&ctx.http, CreateInteractionResponse::Modal(modal))
                 .await
             {
                 tracing::error!(%error, "failed to open new task modal");
+            }
+            return;
+        }
+        if action == "actions" {
+            let actions = self.project_actions_for(&binding.workspace_alias);
+            let response = CreateInteractionResponse::Message(project_actions_message(
+                &binding, &actions,
+            ));
+            if let Err(error) = comp.create_response(&ctx.http, response).await {
+                tracing::error!(%error, "failed to open repository quick actions");
             }
             return;
         }
@@ -5457,6 +5553,78 @@ impl Handler {
             .await
         {
             tracing::error!(%error, action, "failed to respond to project control");
+        }
+    }
+
+    async fn handle_project_action_select(
+        &self,
+        ctx: &Context,
+        comp: &serenity::model::application::ComponentInteraction,
+    ) {
+        if comp.user.bot
+            || is_denied_user(
+                false,
+                self.allow_all_users,
+                &self.allowed_users,
+                comp.user.id.get(),
+            )
+        {
+            let response = CreateInteractionResponse::Message(
+                CreateInteractionResponseMessage::new()
+                    .content("🚫 你沒有使用這個 Bot 的權限。")
+                    .ephemeral(true),
+            );
+            let _ = comp.create_response(&ctx.http, response).await;
+            return;
+        }
+        let Some(binding) = self
+            .project_registry
+            .binding_for_channel(comp.channel_id.get())
+        else {
+            let response = CreateInteractionResponse::Message(
+                CreateInteractionResponseMessage::new()
+                    .content("⚠️ This channel is no longer linked to an OpenAB project.")
+                    .ephemeral(true),
+            );
+            let _ = comp.create_response(&ctx.http, response).await;
+            return;
+        };
+        let selected_id = match &comp.data.kind {
+            ComponentInteractionDataKind::StringSelect { values } => {
+                values.first().map(String::as_str)
+            }
+            _ => None,
+        };
+        let selected = selected_id.and_then(|id| {
+            self.project_actions.iter().find(|action| {
+                action.workspace_alias == binding.workspace_alias && action.id == id
+            })
+        });
+        let Some(action) = selected else {
+            let actions = self.project_actions_for(&binding.workspace_alias);
+            let response = CreateInteractionResponse::Message(
+                project_actions_message(&binding, &actions)
+                    .content("⚠️ 這個 action 已移除，清單已重新整理。"),
+            );
+            let _ = comp.create_response(&ctx.http, response).await;
+            return;
+        };
+        let title = if action.title.trim().is_empty() {
+            action.label.trim()
+        } else {
+            action.title.trim()
+        };
+        if let Err(error) = comp
+            .create_response(
+                &ctx.http,
+                CreateInteractionResponse::Modal(project_task_modal(
+                    Some(title),
+                    Some(&action.prompt),
+                )),
+            )
+            .await
+        {
+            tracing::error!(%error, action_id = %action.id, "failed to open repository action task modal");
         }
     }
 
@@ -7856,6 +8024,17 @@ mod tests {
         }
     }
 
+    fn ui_project_action(id: &str) -> DiscordProjectActionConfig {
+        DiscordProjectActionConfig {
+            workspace_alias: "api".into(),
+            id: id.into(),
+            label: format!("Action {id}"),
+            description: format!("Run {id}"),
+            title: format!("Task {id}"),
+            prompt: format!("Run the {id} workflow without changing files."),
+        }
+    }
+
     fn managed_entry(
         thread_id: u64,
         task_state: TaskState,
@@ -7929,6 +8108,32 @@ mod tests {
 
         let project = serde_json::to_string(&project_welcome_components(&[])).unwrap();
         assert!(project.contains("oab_project:sessions"));
+        assert!(project.contains("oab_project:actions"));
+    }
+
+    #[test]
+    fn project_actions_card_caps_options_and_modal_prefills_prompt() {
+        let actions = (1..=30)
+            .map(|index| ui_project_action(&format!("action-{index}")))
+            .collect::<Vec<_>>();
+        let action_refs = actions.iter().collect::<Vec<_>>();
+        let value = serde_json::to_value(project_actions_message(&ui_binding(), &action_refs))
+            .expect("actions card should serialize");
+        let select = component_with_custom_id(&value, "oab_project_actions").unwrap();
+        assert_eq!(
+            select["options"].as_array().unwrap().len(),
+            SELECT_MENU_PAGE_SIZE
+        );
+        assert!(value.to_string().contains("顯示前 25 個，共 30 個 actions"));
+
+        let action = ui_project_action("test");
+        let modal = serde_json::to_string(&project_task_modal(
+            Some(&action.title),
+            Some(&action.prompt),
+        ))
+        .unwrap();
+        assert!(modal.contains("Task test"));
+        assert!(modal.contains("Run the test workflow without changing files."));
     }
 
     #[test]

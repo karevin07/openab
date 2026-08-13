@@ -75,6 +75,7 @@ Discord adapter. Requires a Discord bot token.
 | `bot_token` | string | *required* | Discord bot token. Use `${DISCORD_BOT_TOKEN}` for env var. |
 | `project_channels_enabled` | bool | `false` | Enable administrator-only `/project` commands for private workspace channels. Existing persisted bindings remain routable when disabled. |
 | `project_category_id` | string \| omit | none | Discord category ID used by `/project create`. Required when project channels are enabled. |
+| `project_actions` | table[] | `[]` | Trusted per-workspace Agent prompt shortcuts shown from Project Home. See below. |
 | `allow_all_channels` | bool \| omit | auto-detect | `true` = all channels; `false` = only `allowed_channels`. Omitted = inferred from list (non-empty → false, empty → true). |
 | `allowed_channels` | string[] | `[]` | Channel IDs to allow. Only checked when `allow_all_channels` resolves to false. |
 | `allow_all_users` | bool \| omit | auto-detect | `true` = any user; `false` = only `allowed_users`. Omitted = inferred from list. |
@@ -87,6 +88,35 @@ Discord adapter. Requires a Discord bot token.
 | `message_processing_mode` | string | `"per-message"` | Message dispatch mode: `"per-message"` (each message = own turn), `"per-thread"` (all messages in thread share one buffer), or `"per-lane"` (each sender gets own buffer). See [Message Dispatch Modes](message-dispatch-modes.md). |
 | `max_buffered_messages` | u32 | `10` | Per-thread/lane mpsc channel capacity. Only applies to `per-thread` / `per-lane` modes. |
 | `max_batch_tokens` | u32 | `24000` | Soft token cap per ACP turn. Only applies to `per-thread` / `per-lane` modes. |
+
+### `[[discord.project_actions]]`
+
+Adds repository-specific **Quick actions** to managed Discord Project Home cards. Selecting an
+action opens the normal editable New Task modal with `title` and `prompt` pre-filled. OpenAB does
+not execute the configured value as a raw shell command.
+
+```toml
+[[discord.project_actions]]
+workspace_alias = "openab"
+id = "test"
+label = "Run tests"
+description = "Run the repository test suite"
+title = "Test OpenAB"
+prompt = "Run `cargo test` without changing files, then summarize failures."
+```
+
+| Key | Required | Constraints |
+|---|---|---|
+| `workspace_alias` | yes | Exact workspace alias without the leading `@`. |
+| `id` | yes | Unique per workspace; ASCII letters, numbers, `-`, `_`; maximum 40 characters. |
+| `label` | yes | Select option label; 1–100 characters. |
+| `description` | no | Select option description; maximum 100 characters. |
+| `title` | no | Pre-filled task title; maximum 100 characters; defaults to `label`. |
+| `prompt` | yes | Editable Agent request; 1–4000 characters. |
+
+Discord renders at most the first 25 configured actions for one workspace. Keep this config in a
+trusted operator-controlled file: repository content that an Agent can edit must not grant itself
+new direct-execution privileges.
 
 ---
 

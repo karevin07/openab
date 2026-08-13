@@ -73,6 +73,13 @@ allow_user_messages = "multibot-mentions"      # multibot-mentions | involved | 
 trusted_bot_ids = []                  # bot user IDs allowed through (empty = any)
 # project_channels_enabled = true     # enable /project create/list/status/remove
 # project_category_id = "123456789"  # category for private project channels
+
+# Optional repository-specific Agent prompt shortcut:
+#[[discord.project_actions]]
+#workspace_alias = "openab"
+#id = "test"
+#label = "Run tests"
+#prompt = "Run cargo test without changing files, then summarize failures."
 ```
 
 ### Private project channels
@@ -96,7 +103,10 @@ On startup, OpenAB reconciles bindings with Discord: deleted or invalid channels
 moved channels are retained with a warning, and transient API failures never delete mappings.
 
 New project channels receive an interactive **Project Home** embed with onboarding and project
-information buttons. Run `/project home` in an existing managed channel to post the current card.
+information buttons. **Quick actions** opens repository-specific prompt shortcuts configured with
+`[[discord.project_actions]]`; the selected title and prompt remain editable before a normal task
+is created, and are never executed as raw shell. Run `/project home` in an existing managed channel
+to post the current card.
 Inside a session thread, `/session status` opens a control panel with refresh, stop, detach-for-Cursor,
 and close actions. Closing from the panel requires confirmation. While the host terminal owns a
 handoff, the panel explicitly reports **Detached to Cursor** and disables conflicting actions.
