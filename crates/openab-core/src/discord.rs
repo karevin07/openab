@@ -5,7 +5,8 @@ use crate::adapter::{
 };
 use crate::bot_turns::{BotTurnTracker, TurnAction, TurnSeverity, BOT_TURN_LIMIT_WARNING_PREFIX};
 use crate::config::{
-    AllowBots, AllowUsers, DiscordProjectActionConfig, DiscordProjectCommandConfig, SttConfig,
+    AllowBots, AllowUsers, DiscordProjectActionConfig, DiscordProjectCommandConfig,
+    DiscordProjectCommandRunner, SttConfig,
 };
 use crate::discord_admin::{
     AdminInventory, AdminStatus, CategoryPlan, ChannelPlan, CleanupCandidates, CreatedCategory,
@@ -16,6 +17,7 @@ use crate::directives::resolve_workspace;
 use crate::format;
 use crate::media;
 use crate::project_command::{run_project_command, ProjectCommandOutput};
+use crate::git_push_broker::GitPushBrokerClient;
 use crate::project_registry::{ProjectAccessTarget, ProjectBinding, ProjectRegistry};
 use crate::remind::{self, ReminderStore};
 use crate::task_registry::{TaskRecord, TaskRegistry, TaskState};
@@ -364,7 +366,9 @@ fn task_status_embed(task: &TaskRecord) -> CreateEmbed {
         .description(match task.state {
             TaskState::Queued => "需求已排入 queue，OpenAB 會依序處理。",
             TaskState::Running => "Cursor agent 正在處理目前的需求。",
-            TaskState::Ready => "本輪已完成；直接在 thread 回覆即可接續同一個 session。",
+            TaskState::Ready => {
+                "本輪已完成。可自由輸入需求、套用 Quick Action，或執行 repository command；都留在目前 thread。"
+            }
             TaskState::Cursor => "Session 已交給主機上的 Cursor terminal。",
             TaskState::Failed => "本輪執行失敗；請查看下方訊息後重試或調整需求。",
             TaskState::Closed => "Session 已關閉；新訊息將建立新的 session context。",
@@ -417,6 +421,30 @@ fn task_control_rows(task: &TaskRecord) -> Vec<CreateActionRow> {
         ))
         .label("← Project")
     };
+    if task.state == TaskState::Ready {
+        return vec![
+            CreateActionRow::Buttons(vec![
+                CreateButton::new("oab_task:continue")
+                    .label("💬 Continue")
+                    .style(ButtonStyle::Primary),
+                CreateButton::new("oab_task:actions")
+                    .label("⚡ Quick actions")
+                    .style(ButtonStyle::Success),
+                CreateButton::new("oab_task:commands")
+                    .label("⌨ Commands")
+                    .style(ButtonStyle::Secondary),
+            ]),
+            CreateActionRow::Buttons(vec![
+                CreateButton::new("oab_session:detach")
+                    .label("🖥️ Continue on computer")
+                    .style(ButtonStyle::Secondary),
+                CreateButton::new("oab_session:close")
+                    .label("✕ Close")
+                    .style(ButtonStyle::Danger),
+                help(),
+            ]),
+        ];
+    }
     let buttons = match task.state {
         TaskState::Queued => vec![
             CreateButton::new("oab_session:refresh")
@@ -433,18 +461,7 @@ fn task_control_rows(task: &TaskRecord) -> Vec<CreateActionRow> {
                 .style(ButtonStyle::Secondary),
             help(),
         ],
-        TaskState::Ready => vec![
-            CreateButton::new("oab_task:continue")
-                .label("💬 Continue")
-                .style(ButtonStyle::Primary),
-            CreateButton::new("oab_session:detach")
-                .label("🖥️ Continue on computer")
-                .style(ButtonStyle::Secondary),
-            CreateButton::new("oab_session:close")
-                .label("✕ Close")
-                .style(ButtonStyle::Danger),
-            help(),
-        ],
+        TaskState::Ready => unreachable!("ready controls returned above"),
         TaskState::Cursor => vec![
             CreateButton::new("oab_session:refresh")
                 .label("↻ Check status")
@@ -558,7 +575,7 @@ fn project_welcome_components(tasks: &[TaskRecord]) -> Vec<CreateActionRow> {
             .label("📤 Attach local chat")
             .style(ButtonStyle::Success),
         CreateButton::new("oab_project:actions")
-            .label("⚡ Quick actions")
+            .label("⚡ Task templates")
             .style(ButtonStyle::Secondary),
         CreateButton::new("oab_project:sessions")
             .label("🧠 Sessions")
@@ -601,9 +618,9 @@ fn project_actions_message(
     actions: &[&DiscordProjectActionConfig],
 ) -> CreateInteractionResponseMessage {
     let mut embed = CreateEmbed::new()
-        .title(format!("⚡ @{} · Quick actions", binding.workspace_alias))
+        .title(format!("⚡ @{} · New task templates", binding.workspace_alias))
         .description(
-            "選擇常用工作後，OpenAB 會開啟可編輯的 New Task 視窗。確認內容後才會建立 Agent session；這裡不會直接執行任意 shell。",
+            "這裡是 Project Home：選擇範本並確認後會建立新的 task thread/session。若要沿用既有 session，請進入該 task thread，從狀態卡點 Quick actions。",
         )
         .colour(0xF1C40F)
         .field(
@@ -652,6 +669,112 @@ fn project_actions_message(
         .ephemeral(true)
 }
 
+fn task_actions_message(
+    task: &TaskRecord,
+    actions: &[&DiscordProjectActionConfig],
+) -> CreateInteractionResponseMessage {
+    let mut embed = CreateEmbed::new()
+        .title(format!("⚡ Continue · {}", task.title))
+        .description(
+            "選擇常用工作後會開啟可編輯的 Continue 視窗；確認後送進目前 thread 的 Cursor session，不會建立新 thread。",
+        )
+        .colour(0xF1C40F)
+        .field(
+            "Repository",
+            inline_code(&format!("@{}", task.workspace_alias)),
+            true,
+        )
+        .field("Current session", format!("<#{}>", task.thread_id), true)
+        .footer(CreateEmbedFooter::new(
+            "Runs in this Cursor session · no new thread",
+        ));
+    if actions.is_empty() {
+        return CreateInteractionResponseMessage::new()
+            .embed(embed.field("尚未設定", "這個 repository 尚未設定 Quick actions。", false))
+            .ephemeral(true);
+    }
+    let options = actions
+        .iter()
+        .take(SELECT_MENU_PAGE_SIZE)
+        .map(|action| {
+            let mut option = CreateSelectMenuOption::new(action.label.trim(), &action.id);
+            if !action.description.trim().is_empty() {
+                option = option.description(action.description.trim());
+            }
+            option
+        })
+        .collect();
+    if actions.len() > SELECT_MENU_PAGE_SIZE {
+        embed = embed.footer(CreateEmbedFooter::new(format!(
+            "顯示前 {SELECT_MENU_PAGE_SIZE} 個，共 {} 個 actions",
+            actions.len()
+        )));
+    }
+    CreateInteractionResponseMessage::new()
+        .embed(embed)
+        .components(vec![CreateActionRow::SelectMenu(
+            CreateSelectMenu::new(
+                "oab_project_actions",
+                CreateSelectMenuKind::String { options },
+            )
+            .placeholder("選擇要送進目前 session 的工作"),
+        )])
+        .ephemeral(true)
+}
+
+fn task_commands_message(
+    task: &TaskRecord,
+    commands: &[&DiscordProjectCommandConfig],
+) -> CreateInteractionResponseMessage {
+    let mut embed = CreateEmbed::new()
+        .title(format!("⌨ Repository tools · {}", task.title))
+        .description(
+            "直接在目前 repository 執行管理者允許的固定指令。不會建立 thread，也不會把輸出加入 Cursor 對話 context。",
+        )
+        .colour(0x2ECC71)
+        .field(
+            "Repository",
+            inline_code(&format!("@{}", task.workspace_alias)),
+            true,
+        )
+        .field("Current session", format!("<#{}>", task.thread_id), true)
+        .footer(CreateEmbedFooter::new(
+            "Repository-only operation · Cursor session stays unchanged",
+        ));
+    if commands.is_empty() {
+        return CreateInteractionResponseMessage::new()
+            .embed(embed.field("尚未設定", "這個 repository 尚未設定 Commands。", false))
+            .ephemeral(true);
+    }
+    let options = commands
+        .iter()
+        .take(SELECT_MENU_PAGE_SIZE)
+        .map(|command| {
+            let mut option = CreateSelectMenuOption::new(command.label.trim(), &command.id);
+            if !command.description.trim().is_empty() {
+                option = option.description(command.description.trim());
+            }
+            option
+        })
+        .collect();
+    if commands.len() > SELECT_MENU_PAGE_SIZE {
+        embed = embed.footer(CreateEmbedFooter::new(format!(
+            "顯示前 {SELECT_MENU_PAGE_SIZE} 個，共 {} 個 commands",
+            commands.len()
+        )));
+    }
+    CreateInteractionResponseMessage::new()
+        .embed(embed)
+        .components(vec![CreateActionRow::SelectMenu(
+            CreateSelectMenu::new(
+                "oab_project_commands",
+                CreateSelectMenuKind::String { options },
+            )
+            .placeholder("選擇 repository command"),
+        )])
+        .ephemeral(true)
+}
+
 fn project_command_display(command: &DiscordProjectCommandConfig) -> String {
     let display = std::iter::once(command.program.as_str())
         .chain(command.args.iter().map(String::as_str))
@@ -677,7 +800,7 @@ fn project_commands_message(
             binding.workspace_alias
         ))
         .description(
-            "選擇管理者預先允許的固定指令。OpenAB 會直接在 repository 執行，不建立 Cursor session，也不接受任意 shell 輸入。",
+            "選擇管理者預先允許的固定指令。一般指令直接在 repository 執行；Git push 由隔離的 credential broker 處理。不建立 Cursor session，也不接受任意 shell 輸入。",
         )
         .colour(0x2ECC71)
         .field(
@@ -730,6 +853,10 @@ fn project_command_confirmation_message(
     binding: &ProjectBinding,
     command: &DiscordProjectCommandConfig,
 ) -> CreateInteractionResponseMessage {
+    let execution = match command.runner {
+        DiscordProjectCommandRunner::Local => "Local allowlisted executable",
+        DiscordProjectCommandRunner::GitPushBroker => "Isolated Git credential broker",
+    };
     CreateInteractionResponseMessage::new()
         .embed(
             CreateEmbed::new()
@@ -742,6 +869,12 @@ fn project_command_confirmation_message(
                     true,
                 )
                 .field("Command", inline_code(&project_command_display(command)), false)
+                .field("Execution", execution, false)
+                .field(
+                    "Cursor session",
+                    "Unchanged · command output is shown only in this ephemeral card",
+                    false,
+                )
                 .field("Timeout", format!("{} seconds", command.timeout_seconds), true),
         )
         .components(vec![CreateActionRow::Buttons(vec![
@@ -832,7 +965,7 @@ fn project_welcome_message(binding: &ProjectBinding, tasks: &[TaskRecord]) -> Cr
     let embed = project_info_embed(binding)
         .field(
             "1 · Start a task",
-            "Tap **New task** for a custom request, **Quick actions** for an Agent template, or **Repository commands** for an allowlisted executable.",
+            "Tap **New task** for a custom request or **Task templates** to start a new thread from a preset. Repository commands do not create a session.",
             false,
         )
         .field(
@@ -842,7 +975,7 @@ fn project_welcome_message(binding: &ProjectBinding, tasks: &[TaskRecord]) -> Cr
         )
         .field(
             "3 · Continue and control",
-            "Reply in the task thread to preserve context. Run `/session status` for lifecycle controls.",
+            "In a task thread, use **Continue**, **Quick actions**, or **Commands** to keep working without creating another thread.",
             false,
         )
         .field("Recent tasks", project_recent_tasks(tasks), false);
@@ -855,7 +988,7 @@ fn project_welcome_edit(binding: &ProjectBinding, tasks: &[TaskRecord]) -> EditM
     let embed = project_info_embed(binding)
         .field(
             "1 · Start a task",
-            "Tap **New task** for a custom request, **Quick actions** for an Agent template, or **Repository commands** for an allowlisted executable.",
+            "Tap **New task** for a custom request or **Task templates** to start a new thread from a preset. Repository commands do not create a session.",
             false,
         )
         .field(
@@ -865,7 +998,7 @@ fn project_welcome_edit(binding: &ProjectBinding, tasks: &[TaskRecord]) -> EditM
         )
         .field(
             "3 · Continue and control",
-            "Reply in the task thread to preserve context. Run `/session status` for lifecycle controls.",
+            "In a task thread, use **Continue**, **Quick actions**, or **Commands** to keep working without creating another thread.",
             false,
         )
         .field("Recent tasks", project_recent_tasks(tasks), false);
@@ -1512,7 +1645,7 @@ fn help_topic_message(
     let (title, description) = match topic {
         "discord" => (
             "📱 在 Discord 開始開發",
-            "1. 開啟 repository 的 Project Home。\n2. 點 **New task** 輸入需求，或用 **Quick actions** 選 Agent 範本。\n3. 不需要模型時，點 **Repository commands** 直接執行管理者允許的固定指令。\n4. 送出 task 後在 thread 回覆，即可保留同一個 context。\n5. 要查看 repository 內的 PNG，直接請 Agent 將相對路徑圖片傳回 Discord。",
+            "1. 在 Project Home 點 **New task**，或用 **Task templates** 從範本建立新 thread。\n2. 進入既有 task 後，用狀態卡的 **Continue** 或 **Quick actions** 接續同一個 Cursor session。\n3. **Commands** 只操作 repository，不建立 session，也不加入 Cursor context。\n4. 要查看 repository 內的 PNG，直接請 Agent 將相對路徑圖片傳回 Discord。",
         ),
         "cursor" => (
             "🖥️ 回到電腦接續",
@@ -1543,7 +1676,7 @@ fn help_topic_message(
                     );
                     buttons.push(
                         CreateButton::new("oab_project:actions")
-                            .label("⚡ Quick actions")
+                            .label("⚡ Task templates")
                             .style(ButtonStyle::Secondary),
                     );
                     buttons.push(
@@ -1627,7 +1760,7 @@ fn help_project_message(
         );
         buttons.push(
             CreateButton::new("oab_project:actions")
-                .label("⚡ Quick actions")
+                .label("⚡ Task templates")
                 .style(ButtonStyle::Secondary),
         );
         buttons.push(
@@ -1647,7 +1780,7 @@ fn help_project_message(
         .embed(
             CreateEmbed::new()
                 .title(format!("📁 @{}", binding.workspace_alias))
-                .description("已選擇這個 repository project。使用 **New task** 輸入需求、從 **Quick actions** 選 Agent 範本，或用 **Repository commands** 直接執行固定指令。")
+                .description("已選擇這個 repository project。使用 **New task** 輸入需求、從 **Task templates** 建立範本 task，或用 **Repository commands** 直接執行固定指令。")
                 .colour(0x5865F2)
                 .field("Project channel", format!("<#{}>", binding.channel_id), true)
                 .field(
@@ -1933,6 +2066,26 @@ fn task_prompt_modal(action: &str, initial_prompt: Option<&str>) -> CreateModal 
     }
     CreateModal::new(format!("oab_task_prompt:{action}"), title)
         .components(vec![CreateActionRow::InputText(input)])
+}
+
+fn task_action_modal(action: &DiscordProjectActionConfig) -> CreateModal {
+    let title = truncate_for_discord(
+        &format!("Quick action · {}", action.label.trim()),
+        45,
+    );
+    CreateModal::new("oab_task_prompt:action", title).components(vec![
+        CreateActionRow::InputText(
+            CreateInputText::new(
+                InputTextStyle::Paragraph,
+                "Review before sending to this session",
+                "prompt",
+            )
+            .placeholder("Adjust this repository action before continuing")
+            .value(truncate_for_discord(action.prompt.trim(), 4000))
+            .min_length(1)
+            .max_length(4000),
+        ),
+    ])
 }
 
 fn modal_input_value<'a>(
@@ -2384,6 +2537,8 @@ pub struct Handler {
     pub project_command_runs: tokio::sync::Mutex<HashSet<String>>,
     /// Optional client for the isolated Discord Admin Bot control plane.
     pub admin_control: Option<DiscordAdminClient>,
+    /// Optional client for the isolated Git push broker.
+    pub git_push_broker: Option<GitPushBrokerClient>,
 }
 
 struct DiscordCommandScope {
@@ -6457,6 +6612,43 @@ impl Handler {
             return;
         };
         let action = comp.data.custom_id.strip_prefix("oab_task:").unwrap_or("");
+        if action == "actions" || action == "commands" {
+            if task.state != TaskState::Ready {
+                let response = CreateInteractionResponse::Message(
+                    CreateInteractionResponseMessage::new()
+                        .content("⚠️ Task state changed. Refresh the card and try again.")
+                        .ephemeral(true),
+                );
+                let _ = comp.create_response(&ctx.http, response).await;
+                return;
+            }
+            let Some(binding) = self
+                .project_registry
+                .binding_for_channel(task.project_channel_id)
+            else {
+                let response = CreateInteractionResponse::Message(
+                    CreateInteractionResponseMessage::new()
+                        .content("⚠️ This task is no longer linked to an OpenAB project.")
+                        .ephemeral(true),
+                );
+                let _ = comp.create_response(&ctx.http, response).await;
+                return;
+            };
+            let message = if action == "actions" {
+                let actions = self.project_actions_for(&binding.workspace_alias);
+                task_actions_message(&task, &actions)
+            } else {
+                let commands = self.project_commands_for(&binding.workspace_alias);
+                task_commands_message(&task, &commands)
+            };
+            if let Err(error) = comp
+                .create_response(&ctx.http, CreateInteractionResponse::Message(message))
+                .await
+            {
+                tracing::error!(%error, action, "failed to show current task shortcuts");
+            }
+            return;
+        }
         if action == "continue" || action == "edit" {
             let expected = if action == "edit" {
                 TaskState::Failed
@@ -6786,17 +6978,17 @@ impl Handler {
             let _ = comp.create_response(&ctx.http, response).await;
             return;
         }
-        let Some(binding) = self
-            .project_registry
-            .binding_for_channel(comp.channel_id.get())
-        else {
-            let response = CreateInteractionResponse::Message(
-                CreateInteractionResponseMessage::new()
-                    .content("⚠️ This channel is no longer linked to an OpenAB project.")
-                    .ephemeral(true),
-            );
-            let _ = comp.create_response(&ctx.http, response).await;
-            return;
+        let binding = match self.project_binding_for_channel(ctx, comp.channel_id).await {
+            Ok((binding, _)) => binding,
+            Err(message) => {
+                let response = CreateInteractionResponse::Message(
+                    CreateInteractionResponseMessage::new()
+                        .content(format!("⚠️ {message}"))
+                        .ephemeral(true),
+                );
+                let _ = comp.create_response(&ctx.http, response).await;
+                return;
+            }
         };
         let selected_id = match &comp.data.kind {
             ComponentInteractionDataKind::StringSelect { values } => {
@@ -6808,13 +7000,40 @@ impl Handler {
             .and_then(|id| self.project_action_for(&binding.workspace_alias, id));
         let Some(action) = selected else {
             let actions = self.project_actions_for(&binding.workspace_alias);
-            let response = CreateInteractionResponse::Message(
-                project_actions_message(&binding, &actions)
-                    .content("⚠️ 這個 action 已移除，清單已重新整理。"),
-            );
+            let message = self
+                .task_registry
+                .task_for_thread(comp.channel_id.get())
+                .map_or_else(
+                    || project_actions_message(&binding, &actions),
+                    |task| task_actions_message(&task, &actions),
+                )
+                .content("⚠️ 這個 action 已移除，清單已重新整理。");
+            let response = CreateInteractionResponse::Message(message);
             let _ = comp.create_response(&ctx.http, response).await;
             return;
         };
+        let current_task = self.task_registry.task_for_thread(comp.channel_id.get());
+        if let Some(task) = current_task {
+            if task.state != TaskState::Ready {
+                let response = CreateInteractionResponse::Message(
+                    CreateInteractionResponseMessage::new()
+                        .content("⚠️ Task state changed. Refresh the card and try again.")
+                        .ephemeral(true),
+                );
+                let _ = comp.create_response(&ctx.http, response).await;
+                return;
+            }
+            if let Err(error) = comp
+                .create_response(
+                    &ctx.http,
+                    CreateInteractionResponse::Modal(task_action_modal(action)),
+                )
+                .await
+            {
+                tracing::error!(%error, action_id = %action.id, "failed to open current session action modal");
+            }
+            return;
+        }
         let title = if action.title.trim().is_empty() {
             action.label.trim()
         } else {
@@ -6864,25 +7083,41 @@ impl Handler {
             return;
         }
 
-        let aliases = self.router.workspace_aliases_map();
-        let workspace = resolve_workspace(
-            &format!("@{}", binding.workspace_alias),
-            &aliases,
-            &self.router.bot_home_path(),
-            &self.router.workspace_root_path(),
-        )
-        .map_err(anyhow::Error::msg);
-        let result = match workspace {
-            Ok(workspace) => {
+        let result = match command.runner {
+            DiscordProjectCommandRunner::GitPushBroker => {
                 tracing::info!(
                     workspace_alias = %binding.workspace_alias,
                     command_id = %command.id,
                     user_id = %comp.user.id,
-                    "repository command started"
+                    "brokered repository command started"
                 );
-                run_project_command(&command, &workspace).await
+                match &self.git_push_broker {
+                    Some(client) => client.push(&binding.workspace_alias).await,
+                    None => Err(anyhow::anyhow!("Git push broker is not configured")),
+                }
             }
-            Err(error) => Err(error),
+            DiscordProjectCommandRunner::Local => {
+                let aliases = self.router.workspace_aliases_map();
+                let workspace = resolve_workspace(
+                    &format!("@{}", binding.workspace_alias),
+                    &aliases,
+                    &self.router.bot_home_path(),
+                    &self.router.workspace_root_path(),
+                )
+                .map_err(anyhow::Error::msg);
+                match workspace {
+                    Ok(workspace) => {
+                        tracing::info!(
+                            workspace_alias = %binding.workspace_alias,
+                            command_id = %command.id,
+                            user_id = %comp.user.id,
+                            "repository command started"
+                        );
+                        run_project_command(&command, &workspace).await
+                    }
+                    Err(error) => Err(error),
+                }
+            }
         };
         {
             let mut running = self.project_command_runs.lock().await;
@@ -6948,17 +7183,17 @@ impl Handler {
             let _ = comp.create_response(&ctx.http, response).await;
             return;
         }
-        let Some(binding) = self
-            .project_registry
-            .binding_for_channel(comp.channel_id.get())
-        else {
-            let response = CreateInteractionResponse::Message(
-                CreateInteractionResponseMessage::new()
-                    .content("⚠️ This channel is no longer linked to an OpenAB project.")
-                    .ephemeral(true),
-            );
-            let _ = comp.create_response(&ctx.http, response).await;
-            return;
+        let binding = match self.project_binding_for_channel(ctx, comp.channel_id).await {
+            Ok((binding, _)) => binding,
+            Err(message) => {
+                let response = CreateInteractionResponse::Message(
+                    CreateInteractionResponseMessage::new()
+                        .content(format!("⚠️ {message}"))
+                        .ephemeral(true),
+                );
+                let _ = comp.create_response(&ctx.http, response).await;
+                return;
+            }
         };
         let selected_id = match &comp.data.kind {
             ComponentInteractionDataKind::StringSelect { values } => values.first(),
@@ -7034,17 +7269,17 @@ impl Handler {
             let _ = comp.create_response(&ctx.http, response).await;
             return;
         };
-        let Some(binding) = self
-            .project_registry
-            .binding_for_channel(comp.channel_id.get())
-        else {
-            let response = CreateInteractionResponse::Message(
-                CreateInteractionResponseMessage::new()
-                    .content("⚠️ This channel is no longer linked to an OpenAB project.")
-                    .ephemeral(true),
-            );
-            let _ = comp.create_response(&ctx.http, response).await;
-            return;
+        let binding = match self.project_binding_for_channel(ctx, comp.channel_id).await {
+            Ok((binding, _)) => binding,
+            Err(message) => {
+                let response = CreateInteractionResponse::Message(
+                    CreateInteractionResponseMessage::new()
+                        .content(format!("⚠️ {message}"))
+                        .ephemeral(true),
+                );
+                let _ = comp.create_response(&ctx.http, response).await;
+                return;
+            }
         };
         let command = self.project_command_for(&binding.workspace_alias, command_id);
         let Some(command) = command.cloned() else {
@@ -9477,6 +9712,7 @@ mod tests {
             id: id.into(),
             label: format!("Command {id}"),
             description: format!("Run {id}"),
+            runner: DiscordProjectCommandRunner::Local,
             program: "git".into(),
             args: vec!["status".into(), "--short".into()],
             timeout_seconds: 30,
@@ -9562,6 +9798,8 @@ mod tests {
         let ready =
             serde_json::to_string(&task_control_rows(&ui_task(TaskState::Ready, None))).unwrap();
         assert!(ready.contains("oab_task:continue"));
+        assert!(ready.contains("oab_task:actions"));
+        assert!(ready.contains("oab_task:commands"));
         assert!(ready.contains("oab_session:detach"));
         assert!(!ready.contains("oab_task:retry"));
 
@@ -9569,6 +9807,7 @@ mod tests {
             serde_json::to_string(&task_control_rows(&ui_task(TaskState::Running, None))).unwrap();
         assert!(running.contains("oab_session:cancel"));
         assert!(!running.contains("oab_session:detach"));
+        assert!(!running.contains("oab_task:actions"));
 
         let failed = serde_json::to_string(&task_control_rows(&ui_task(
             TaskState::Failed,
@@ -9597,6 +9836,7 @@ mod tests {
         assert!(project.contains("oab_project:sessions"));
         assert!(project.contains("oab_project:actions"));
         assert!(project.contains("oab_project:commands"));
+        assert!(project.contains("Task templates"));
 
         let admin = serde_json::to_string(&admin_navigation_buttons()).unwrap();
         assert!(admin.contains("oab_admin:cleanup"));
@@ -9684,6 +9924,20 @@ mod tests {
         .unwrap();
         assert!(modal.contains("Task test"));
         assert!(modal.contains("Run the test workflow without changing files."));
+
+        let current = serde_json::to_string(&task_actions_message(
+            &ui_task(TaskState::Ready, None),
+            &[&action],
+        ))
+        .unwrap();
+        assert!(current.contains("Continue · Fix API"));
+        assert!(current.contains("不會建立新 thread"));
+        assert!(current.contains("oab_project_actions"));
+
+        let continue_modal = serde_json::to_string(&task_action_modal(&action)).unwrap();
+        assert!(continue_modal.contains("oab_task_prompt:action"));
+        assert!(continue_modal.contains("Quick action · Action test"));
+        assert!(continue_modal.contains("Run the test workflow without changing files."));
     }
 
     #[test]
@@ -9702,6 +9956,15 @@ mod tests {
         assert!(value
             .to_string()
             .contains("顯示前 25 個，共 30 個 commands"));
+
+        let current = serde_json::to_string(&task_commands_message(
+            &ui_task(TaskState::Ready, None),
+            &[&commands[0]],
+        ))
+        .unwrap();
+        assert!(current.contains("Repository tools · Fix API"));
+        assert!(current.contains("Cursor session stays unchanged"));
+        assert!(current.contains("oab_project_commands"));
 
         let confirmation = serde_json::to_string(&project_command_confirmation_message(
             &ui_binding(),

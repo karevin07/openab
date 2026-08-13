@@ -28,6 +28,8 @@ pub mod project_registry;
 #[cfg(feature = "discord")]
 pub mod project_command;
 #[cfg(feature = "discord")]
+pub mod git_push_broker;
+#[cfg(feature = "discord")]
 pub mod task_registry;
 pub mod secrets;
 pub mod setup;

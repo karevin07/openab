@@ -1703,6 +1703,11 @@ async fn main() -> anyhow::Result<()> {
             .as_ref()
             .map(openab_core::discord_admin::DiscordAdminClient::from_config)
             .transpose()?;
+        let git_push_broker = discord_cfg
+            .git_push_broker
+            .as_ref()
+            .map(openab_core::git_push_broker::GitPushBrokerClient::from_config)
+            .transpose()?;
         let project_category_id = discord_cfg
             .project_category_id
             .as_deref()
@@ -1745,6 +1750,7 @@ async fn main() -> anyhow::Result<()> {
             project_actions = discord_cfg.project_actions.len(),
             project_commands = discord_cfg.project_commands.len(),
             admin_control_enabled = admin_control.is_some(),
+            git_push_broker_enabled = git_push_broker.is_some(),
             "starting discord adapter"
         );
 
@@ -1820,6 +1826,7 @@ async fn main() -> anyhow::Result<()> {
             project_commands: discord_cfg.project_commands,
             project_command_runs: tokio::sync::Mutex::new(std::collections::HashSet::new()),
             admin_control,
+            git_push_broker,
         };
 
         let intents = GatewayIntents::GUILD_MESSAGES
