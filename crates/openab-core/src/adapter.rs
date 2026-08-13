@@ -19,6 +19,24 @@ use crate::reactions::StatusReactionController;
 pub struct OutputDirectives {
     /// Message ID to reply to (Discord: message_reference)
     pub reply_to: Option<String>,
+    /// Workspace-relative PNG paths to upload after the text reply.
+    pub attachments: Vec<String>,
+}
+
+impl OutputDirectives {
+    fn merge(&mut self, other: Self) {
+        if self.reply_to.is_none() {
+            self.reply_to = other.reply_to;
+        }
+        for path in other.attachments {
+            if self.attachments.len() >= 5 {
+                break;
+            }
+            if !self.attachments.contains(&path) {
+                self.attachments.push(path);
+            }
+        }
+    }
 }
 
 /// Chunk limit for delivering a reply on `platform`. ACP is a WebSocket transport with
@@ -55,6 +73,17 @@ pub fn parse_output_directives(content: &str) -> (OutputDirectives, String) {
                             // Validate: non-empty, reasonable length, no whitespace/control chars
                             if !v.is_empty() && v.len() <= 64 && v.chars().all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '-' || c == '_') {
                                 directives.reply_to = Some(v.to_string());
+                            }
+                        }
+                        "attach" => {
+                            let path = value.trim();
+                            if !path.is_empty()
+                                && path.len() <= 512
+                                && !path.chars().any(char::is_control)
+                                && directives.attachments.len() < 5
+                                && !directives.attachments.iter().any(|item| item == path)
+                            {
+                                directives.attachments.push(path.to_string());
                             }
                         }
                         _ => {
@@ -152,10 +181,10 @@ pub fn select_delivery_text(full: &str, answer_start: usize, keep_full: bool) ->
 /// [`select_delivery_text`] discards — so we parse directives from the **full**
 /// buffer (preserving them) and then take the body from the delivered slice.
 ///
-/// The delivered slice is re-parsed to strip the directive header only when it
-/// still starts at byte 0 (`answer_start == 0` or `keep_full`). When
-/// `answer_start > 0` the slice is mid-buffer text; any `[[…]]` there is reply
-/// content, not a directive header, and must not be stripped.
+/// The delivered slice is also inspected because attachment directives are
+/// normally emitted in the final answer after the last tool call. A post-tool
+/// slice is stripped only when it actually contains an attachment directive,
+/// preserving the prior behavior for ordinary `[[...]]` reply content.
 ///
 /// Note: directive preservation assumes the turn buffer starts with the
 /// directive. A session-reset turn seeds the buffer with the expiry notice
@@ -165,16 +194,17 @@ pub fn split_delivery(
     answer_start: usize,
     keep_full: bool,
 ) -> (OutputDirectives, String) {
-    let (directives, _) = parse_output_directives(full);
+    let (mut directives, _) = parse_output_directives(full);
     let delivered = select_delivery_text(full, answer_start, keep_full);
-    // Strip the directive header from the body only when the delivered slice
-    // begins at byte 0 (no tools ran, or keep_full). When answer_start > 0,
-    // delivered is the post-last-tool suffix — don't re-parse it.
-    let body = if answer_start == 0 || keep_full {
-        parse_output_directives(delivered).1
-    } else {
-        delivered.to_owned()
-    };
+    // Agents normally emit attachment directives in the final answer after
+    // their tool calls. Parse the delivered slice as well as the full stream,
+    // then merge without duplicating directives in streaming mode. Preserve
+    // post-tool bracketed reply content unless an attachment was actually found.
+    let (delivered_directives, body) = parse_output_directives(delivered);
+    if answer_start > 0 && !keep_full && delivered_directives.attachments.is_empty() {
+        return (directives, delivered.to_owned());
+    }
+    directives.merge(delivered_directives);
     (directives, body)
 }
 
@@ -308,6 +338,9 @@ pub struct SenderContext {
     /// Enables agents to identify themselves when multiple agents share the same backend.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub receiver_id: Option<String>,
+    /// Platform-specific, non-secret instructions for structured agent output.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub output_instructions: Option<Vec<String>>,
 }
 
 /// Platform-neutral task lifecycle events emitted by the dispatcher.
@@ -333,6 +366,19 @@ pub trait ChatAdapter: Send + Sync + 'static {
 
     /// Send a new message, returns a reference to the sent message.
     async fn send_message(&self, channel: &ChannelRef, content: &str) -> Result<MessageRef>;
+
+    /// Upload workspace-local files requested through structured output directives.
+    /// The platform implementation must validate paths before reading them.
+    async fn send_workspace_attachments(
+        &self,
+        _channel: &ChannelRef,
+        _workspace: &str,
+        _paths: &[String],
+    ) -> Result<()> {
+        Err(anyhow::anyhow!(
+            "workspace attachments are not supported on this platform"
+        ))
+    }
 
     /// Create a thread from a trigger message, returns the thread channel ref.
     async fn create_thread(
@@ -818,6 +864,7 @@ impl AdapterRouter {
         let platform_is_acp = thread_channel.platform == "acp";
         let prompt_hard_timeout = self.prompt_hard_timeout;
         let liveness_check_interval = self.liveness_check_interval;
+        let session_working_dir = self.pool.session_snapshot(thread_key).await.working_dir;
 
         self.pool
             .with_connection(thread_key, |conn| {
@@ -1431,6 +1478,33 @@ impl AdapterRouter {
                         }
                     }
 
+                    if !directives.attachments.is_empty() {
+                        let attachment_result = match session_working_dir.as_deref() {
+                            Some(workspace) => {
+                                adapter
+                                    .send_workspace_attachments(
+                                        &thread_channel,
+                                        workspace,
+                                        &directives.attachments,
+                                    )
+                                    .await
+                            }
+                            None => Err(anyhow::anyhow!(
+                                "current session workspace is unavailable"
+                            )),
+                        };
+                        if let Err(error) = attachment_result {
+                            tracing::warn!(
+                                %error,
+                                platform = %thread_channel.platform,
+                                "workspace attachment delivery failed"
+                            );
+                            return Err(anyhow::anyhow!(
+                                "workspace PNG attachment failed: {error}"
+                            ));
+                        }
+                    }
+
                     if delivery_failed {
                         Err(anyhow::anyhow!(
                             "streaming finalization had delivery failures; user view is incomplete"
@@ -1921,6 +1995,28 @@ mod tests {
         let (directives, body) = split_delivery(full, 5, true);
         assert_eq!(directives.reply_to.as_deref(), Some("7"));
         assert_eq!(body, "narration then answer");
+    }
+
+    #[test]
+    fn split_delivery_parses_attachment_from_final_answer_after_tools() {
+        let full = "I will inspect it.[tool][[attach:artifacts/preview.png]]\nHere it is.";
+        let answer_start = "I will inspect it.[tool]".len();
+
+        let (directives, body) = split_delivery(full, answer_start, false);
+
+        assert_eq!(directives.attachments, vec!["artifacts/preview.png"]);
+        assert_eq!(body, "Here it is.");
+    }
+
+    #[test]
+    fn split_delivery_keeps_non_attachment_brackets_after_tools() {
+        let full = "I will inspect it.[tool][[example:value]]\nVisible content.";
+        let answer_start = "I will inspect it.[tool]".len();
+
+        let (directives, body) = split_delivery(full, answer_start, false);
+
+        assert!(directives.attachments.is_empty());
+        assert_eq!(body, "[[example:value]]\nVisible content.");
     }
 
     // --- finalize_body: four-corner truth table for the reset re-prepend ---
@@ -2465,6 +2561,18 @@ mod directive_tests {
         let (directives, content) = parse_output_directives(input);
         assert_eq!(directives.reply_to, Some("123456".to_string()));
         assert_eq!(content, "Content here");
+    }
+
+    #[test]
+    fn parse_workspace_attachment_directives_deduplicates_paths() {
+        let input = "[[attach:artifacts/one.png]]\n[[attach:artifacts/two.png]]\n[[attach:artifacts/one.png]]\nImages attached";
+        let (directives, content) = parse_output_directives(input);
+
+        assert_eq!(
+            directives.attachments,
+            vec!["artifacts/one.png", "artifacts/two.png"]
+        );
+        assert_eq!(content, "Images attached");
     }
 
     #[test]

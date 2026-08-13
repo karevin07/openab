@@ -727,6 +727,7 @@ async fn fire_cronjob(
         timestamp: Some(Utc::now().to_rfc3339()),
         message_id: None, // cron jobs don't originate from a message
         receiver_id: None, // cron jobs are self-triggered, no external receiver
+        output_instructions: None,
     };
     let sender_json = match serde_json::to_string(&sender) {
         Ok(j) => j,
