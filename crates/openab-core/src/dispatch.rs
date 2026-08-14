@@ -8,13 +8,17 @@
 //! - I3: Broker structural fidelity — no merging, splitting, reordering, or
 //!   semantic transformation of arrival events.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet, VecDeque};
+use std::fs::OpenOptions;
+use std::io::Write;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::Result;
 use async_trait::async_trait;
+use serde::{Deserialize, Serialize};
 use tracing::{debug, error, info, info_span, warn};
 
 use crate::acp::ContentBlock;
@@ -30,6 +34,7 @@ use crate::reactions::StatusReactionController;
 // ---------------------------------------------------------------------------
 
 /// One arrival event buffered for a future ACP turn.
+#[derive(Clone)]
 pub struct BufferedMessage {
     /// Serialised SenderContext JSON (already built by the platform adapter).
     pub sender_json: String,
@@ -57,6 +62,34 @@ pub struct BufferedMessage {
     /// mode's native streaming is active. `None` for non-Slack platforms and
     /// bot-authored turns.
     pub recipient: Option<(String, String)>,
+}
+
+/// User-facing snapshot of one message that has not been handed to the ACP
+/// agent yet. Queue payloads remain private to the dispatcher; adapters only
+/// receive the fields required to render queue-management controls.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PendingMessage {
+    pub id: u64,
+    pub sender_id: String,
+    pub sender_name: String,
+    pub prompt: String,
+    pub attachment_count: usize,
+    pub waiting_seconds: u64,
+    /// True when this request was active during the previous process lifetime
+    /// and was conservatively requeued after restart.
+    pub recovered_from_active: bool,
+}
+
+/// Snapshot of one request that has crossed the queue boundary and is being
+/// dispatched to the agent. The prompt is retained only for control-plane UI;
+/// the authoritative payload remains in the in-flight consumer frame.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ActiveMessage {
+    pub id: u64,
+    pub sender_id: String,
+    pub sender_name: String,
+    pub prompt: String,
+    pub attachment_count: usize,
 }
 
 /// How `thread_key` is built for the dispatcher's per-thread map.
@@ -96,20 +129,734 @@ impl std::error::Error for DispatchError {}
 // Internal types
 // ---------------------------------------------------------------------------
 
+#[derive(Default)]
+struct PendingQueue {
+    inner: Mutex<PendingQueueInner>,
+}
+
+#[derive(Default)]
+struct PendingQueueInner {
+    entries: HashMap<u64, BufferedMessage>,
+    order: VecDeque<u64>,
+    recovered_from_active: HashSet<u64>,
+}
+
+#[derive(Clone)]
+struct QueuedMessage {
+    id: u64,
+    message: BufferedMessage,
+}
+
+enum BatchTake {
+    Taken(Box<QueuedMessage>),
+    TooLarge,
+    Missing,
+}
+
+impl PendingQueue {
+    fn insert(&self, id: u64, message: BufferedMessage, front: bool) {
+        self.insert_with_recovery(id, message, front, false);
+    }
+
+    fn insert_with_recovery(
+        &self,
+        id: u64,
+        message: BufferedMessage,
+        front: bool,
+        recovered_from_active: bool,
+    ) {
+        let mut inner = self.inner.lock().unwrap();
+        inner.entries.insert(id, message);
+        if recovered_from_active {
+            inner.recovered_from_active.insert(id);
+        } else {
+            inner.recovered_from_active.remove(&id);
+        }
+        if front {
+            inner.order.push_front(id);
+        } else {
+            inner.order.push_back(id);
+        }
+    }
+
+    fn take(&self, id: u64) -> Option<BufferedMessage> {
+        let mut inner = self.inner.lock().unwrap();
+        let message = inner.entries.remove(&id)?;
+        inner.recovered_from_active.remove(&id);
+        inner.order.retain(|queued_id| *queued_id != id);
+        Some(message)
+    }
+
+    fn take_first(&self) -> Option<QueuedMessage> {
+        let mut inner = self.inner.lock().unwrap();
+        while let Some(id) = inner.order.pop_front() {
+            if let Some(message) = inner.entries.remove(&id) {
+                inner.recovered_from_active.remove(&id);
+                return Some(QueuedMessage { id, message });
+            }
+        }
+        None
+    }
+
+    fn take_front_for_batch(&self, current_tokens: usize, max_tokens: usize) -> BatchTake {
+        let mut inner = self.inner.lock().unwrap();
+        let Some(id) = inner.order.front().copied() else {
+            return BatchTake::Missing;
+        };
+        let Some(message) = inner.entries.get(&id) else {
+            inner.order.pop_front();
+            return BatchTake::Missing;
+        };
+        if current_tokens.saturating_add(message.estimated_tokens) > max_tokens {
+            return BatchTake::TooLarge;
+        }
+        inner.order.pop_front();
+        let message = inner
+            .entries
+            .remove(&id)
+            .expect("pending queue entry disappeared while locked");
+        inner.recovered_from_active.remove(&id);
+        BatchTake::Taken(Box::new(QueuedMessage { id, message }))
+    }
+
+    fn list(&self) -> Vec<PendingMessage> {
+        let inner = self.inner.lock().unwrap();
+        inner
+            .order
+            .iter()
+            .filter_map(|id| {
+                inner.entries.get(id).map(|message| PendingMessage {
+                    id: *id,
+                    sender_id: sender_id_from_json(&message.sender_json),
+                    sender_name: message.sender_name.clone(),
+                    prompt: message.prompt.clone(),
+                    attachment_count: message.extra_blocks.len(),
+                    waiting_seconds: message.arrived_at.elapsed().as_secs(),
+                    recovered_from_active: inner.recovered_from_active.contains(id),
+                })
+            })
+            .collect()
+    }
+
+    fn edit(&self, id: u64, prompt: &str) -> bool {
+        let mut inner = self.inner.lock().unwrap();
+        let Some(message) = inner.entries.get_mut(&id) else {
+            return false;
+        };
+        message.prompt = prompt.to_string();
+        message.estimated_tokens = estimate_tokens(prompt, &message.extra_blocks);
+        true
+    }
+
+    fn remove(&self, id: u64) -> bool {
+        self.take(id).is_some()
+    }
+
+    fn move_to_front(&self, id: u64) -> bool {
+        let mut inner = self.inner.lock().unwrap();
+        if !inner.entries.contains_key(&id) {
+            return false;
+        }
+        inner.order.retain(|queued_id| *queued_id != id);
+        inner.order.push_front(id);
+        true
+    }
+
+    fn clear_through(&self, max_id: u64) -> usize {
+        let mut inner = self.inner.lock().unwrap();
+        let ids = inner
+            .order
+            .iter()
+            .copied()
+            .filter(|id| *id <= max_id)
+            .collect::<Vec<_>>();
+        for id in &ids {
+            inner.entries.remove(id);
+            inner.recovered_from_active.remove(id);
+        }
+        inner.order.retain(|id| *id > max_id);
+        ids.len()
+    }
+
+    fn len(&self) -> usize {
+        self.inner.lock().unwrap().entries.len()
+    }
+
+    fn snapshot(&self) -> Vec<(QueuedMessage, bool)> {
+        let inner = self.inner.lock().unwrap();
+        inner
+            .order
+            .iter()
+            .filter_map(|id| {
+                inner.entries.get(id).map(|message| {
+                    (
+                        QueuedMessage {
+                            id: *id,
+                            message: message.clone(),
+                        },
+                        inner.recovered_from_active.contains(id),
+                    )
+                })
+            })
+            .collect()
+    }
+}
+
+fn sender_id_from_json(sender_json: &str) -> String {
+    serde_json::from_str::<serde_json::Value>(sender_json)
+        .ok()
+        .and_then(|value| value.get("sender_id")?.as_str().map(str::to_string))
+        .unwrap_or_default()
+}
+
+const QUEUE_STORE_VERSION: u32 = 1;
+
+/// Aggregate persisted work waiting for one logical platform thread.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PersistedQueueSummary {
+    pub platform: String,
+    pub thread_id: String,
+    pub queued_messages: usize,
+    pub recovered_active_messages: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct PersistedQueueFile {
+    version: u32,
+    next_message_id: u64,
+    #[serde(default)]
+    lanes: Vec<PersistedLane>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct PersistedLane {
+    key: String,
+    adapter_kind: String,
+    thread_channel: PersistedChannelRef,
+    #[serde(default)]
+    pending: Vec<PersistedMessage>,
+    #[serde(default)]
+    active: Vec<PersistedMessage>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct PersistedMessage {
+    id: u64,
+    sender_json: String,
+    sender_name: String,
+    prompt: String,
+    #[serde(default)]
+    extra_blocks: Vec<PersistedContentBlock>,
+    trigger_msg: PersistedMessageRef,
+    queued_at_unix_ms: u64,
+    other_bot_present: bool,
+    recipient: Option<(String, String)>,
+    #[serde(default)]
+    recovered_from_active: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+enum PersistedContentBlock {
+    Text { text: String },
+    Image { media_type: String, data: String },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct PersistedChannelRef {
+    platform: String,
+    channel_id: String,
+    thread_id: Option<String>,
+    parent_id: Option<String>,
+    origin_event_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct PersistedMessageRef {
+    channel: PersistedChannelRef,
+    message_id: String,
+}
+
+struct QueueStore {
+    path: PathBuf,
+    lanes: Mutex<HashMap<String, PersistedLane>>,
+    next_message_id: AtomicU64,
+}
+
+impl QueueStore {
+    fn load(path: PathBuf) -> Self {
+        let file = match std::fs::read_to_string(&path) {
+            Ok(data) => match serde_json::from_str::<PersistedQueueFile>(&data) {
+                Ok(file) if file.version == QUEUE_STORE_VERSION => file,
+                Ok(file) => {
+                    warn!(
+                        version = file.version,
+                        expected = QUEUE_STORE_VERSION,
+                        path = %path.display(),
+                        "unsupported queue store version, starting empty"
+                    );
+                    PersistedQueueFile {
+                        version: QUEUE_STORE_VERSION,
+                        next_message_id: 1,
+                        lanes: Vec::new(),
+                    }
+                }
+                Err(error) => {
+                    warn!(%error, path = %path.display(), "failed to parse queue store, starting empty");
+                    PersistedQueueFile {
+                        version: QUEUE_STORE_VERSION,
+                        next_message_id: 1,
+                        lanes: Vec::new(),
+                    }
+                }
+            },
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => PersistedQueueFile {
+                version: QUEUE_STORE_VERSION,
+                next_message_id: 1,
+                lanes: Vec::new(),
+            },
+            Err(error) => {
+                warn!(%error, path = %path.display(), "failed to read queue store, starting empty");
+                PersistedQueueFile {
+                    version: QUEUE_STORE_VERSION,
+                    next_message_id: 1,
+                    lanes: Vec::new(),
+                }
+            }
+        };
+        let max_id = file
+            .lanes
+            .iter()
+            .flat_map(|lane| lane.pending.iter().chain(&lane.active))
+            .map(|message| message.id)
+            .max()
+            .unwrap_or(0);
+        let next_message_id = file.next_message_id.max(max_id.saturating_add(1)).max(1);
+        let lanes = file
+            .lanes
+            .into_iter()
+            .map(|lane| (lane.key.clone(), lane))
+            .collect::<HashMap<_, _>>();
+        info!(
+            count = lanes.len(),
+            path = %path.display(),
+            "loaded persistent dispatch queue"
+        );
+        Self {
+            path,
+            lanes: Mutex::new(lanes),
+            next_message_id: AtomicU64::new(next_message_id),
+        }
+    }
+
+    fn next_message_id(&self) -> u64 {
+        self.next_message_id.load(Ordering::Relaxed)
+    }
+
+    fn record_next_message_id(&self, next_message_id: u64) {
+        self.next_message_id
+            .fetch_max(next_message_id, Ordering::Relaxed);
+    }
+
+    fn summaries(&self) -> Vec<PersistedQueueSummary> {
+        let lanes = self.lanes.lock().unwrap();
+        let mut summaries = HashMap::<(String, String), PersistedQueueSummary>::new();
+        for lane in lanes.values() {
+            let platform = lane.thread_channel.platform.clone();
+            let thread_id = lane
+                .thread_channel
+                .thread_id
+                .clone()
+                .unwrap_or_else(|| lane.thread_channel.channel_id.clone());
+            let summary = summaries
+                .entry((platform.clone(), thread_id.clone()))
+                .or_insert(PersistedQueueSummary {
+                    platform,
+                    thread_id,
+                    queued_messages: 0,
+                    recovered_active_messages: 0,
+                });
+            summary.queued_messages += lane.pending.len() + lane.active.len();
+            summary.recovered_active_messages += lane.active.len();
+        }
+        let mut summaries = summaries.into_values().collect::<Vec<_>>();
+        summaries.sort_by(|a, b| {
+            a.platform
+                .cmp(&b.platform)
+                .then_with(|| a.thread_id.cmp(&b.thread_id))
+        });
+        summaries
+    }
+
+    fn lanes_for_adapter(&self, adapter_kind: &str) -> Vec<PersistedLane> {
+        let lanes = self.lanes.lock().unwrap();
+        let mut result = lanes
+            .values()
+            .filter(|lane| lane.adapter_kind == adapter_kind)
+            .cloned()
+            .collect::<Vec<_>>();
+        result.sort_by(|a, b| a.key.cmp(&b.key));
+        result
+    }
+
+    fn update_pending(
+        &self,
+        key: &str,
+        adapter_kind: &str,
+        thread_channel: &ChannelRef,
+        pending: Vec<(QueuedMessage, bool)>,
+    ) {
+        self.mutate(|lanes| {
+            let pending = pending
+                .into_iter()
+                .map(|(message, recovered)| PersistedMessage::from_queued(message, recovered))
+                .collect::<Vec<_>>();
+            let lane = lanes.entry(key.to_string()).or_insert_with(|| PersistedLane {
+                key: key.to_string(),
+                adapter_kind: adapter_kind.to_string(),
+                thread_channel: PersistedChannelRef::from(thread_channel),
+                pending: Vec::new(),
+                active: Vec::new(),
+            });
+            lane.adapter_kind = adapter_kind.to_string();
+            lane.thread_channel = PersistedChannelRef::from(thread_channel);
+            lane.pending = pending;
+            if lane.pending.is_empty() && lane.active.is_empty() {
+                lanes.remove(key);
+            }
+        });
+    }
+
+    fn mark_active(
+        &self,
+        key: &str,
+        adapter_kind: &str,
+        thread_channel: &ChannelRef,
+        pending: Vec<(QueuedMessage, bool)>,
+        active: &[QueuedMessage],
+    ) {
+        self.mutate(|lanes| {
+            lanes.insert(
+                key.to_string(),
+                PersistedLane {
+                    key: key.to_string(),
+                    adapter_kind: adapter_kind.to_string(),
+                    thread_channel: PersistedChannelRef::from(thread_channel),
+                    pending: pending
+                        .into_iter()
+                        .map(|(message, recovered)| {
+                            PersistedMessage::from_queued(message, recovered)
+                        })
+                        .collect(),
+                    active: active
+                        .iter()
+                        .cloned()
+                        .map(|message| PersistedMessage::from_queued(message, false))
+                        .collect(),
+                },
+            );
+        });
+    }
+
+    fn complete_active(&self, key: &str, pending: Vec<(QueuedMessage, bool)>) {
+        self.mutate(|lanes| {
+            let Some(lane) = lanes.get_mut(key) else {
+                return;
+            };
+            lane.active.clear();
+            lane.pending = pending
+                .into_iter()
+                .map(|(message, recovered)| PersistedMessage::from_queued(message, recovered))
+                .collect();
+            if lane.pending.is_empty() {
+                lanes.remove(key);
+            }
+        });
+    }
+
+    fn mark_requeued(&self, lane: &PersistedLane) {
+        self.mutate(|lanes| {
+            let mut restored = lane.clone();
+            let mut pending = restored
+                .active
+                .drain(..)
+                .map(|mut message| {
+                    message.recovered_from_active = true;
+                    message
+                })
+                .collect::<Vec<_>>();
+            pending.append(&mut restored.pending);
+            restored.pending = pending;
+            lanes.insert(restored.key.clone(), restored);
+        });
+    }
+
+    fn remove_lane(&self, key: &str) {
+        self.mutate(|lanes| {
+            lanes.remove(key);
+        });
+    }
+
+    fn mutate(&self, mutate: impl FnOnce(&mut HashMap<String, PersistedLane>)) {
+        let mut lanes = self.lanes.lock().unwrap();
+        mutate(&mut lanes);
+        if let Err(error) = self.persist_locked(&lanes) {
+            warn!(%error, path = %self.path.display(), "failed to persist dispatch queue");
+        }
+    }
+
+    fn persist_locked(&self, lanes: &HashMap<String, PersistedLane>) -> anyhow::Result<()> {
+        let mut entries = lanes.values().cloned().collect::<Vec<_>>();
+        entries.sort_by(|a, b| a.key.cmp(&b.key));
+        let file = PersistedQueueFile {
+            version: QUEUE_STORE_VERSION,
+            next_message_id: self.next_message_id(),
+            lanes: entries,
+        };
+        let data = serde_json::to_vec_pretty(&file)?;
+        atomic_write(&self.path, &data)?;
+        Ok(())
+    }
+}
+
+impl PersistedMessage {
+    fn from_queued(queued: QueuedMessage, recovered_from_active: bool) -> Self {
+        let queued_at_unix_ms = unix_time_ms().saturating_sub(
+            u64::try_from(queued.message.arrived_at.elapsed().as_millis()).unwrap_or(u64::MAX),
+        );
+        Self {
+            id: queued.id,
+            sender_json: queued.message.sender_json,
+            sender_name: queued.message.sender_name,
+            prompt: queued.message.prompt,
+            extra_blocks: queued
+                .message
+                .extra_blocks
+                .into_iter()
+                .map(PersistedContentBlock::from)
+                .collect(),
+            trigger_msg: PersistedMessageRef::from(&queued.message.trigger_msg),
+            queued_at_unix_ms,
+            other_bot_present: queued.message.other_bot_present,
+            recipient: queued.message.recipient,
+            recovered_from_active,
+        }
+    }
+
+    fn into_queued(self) -> (QueuedMessage, bool) {
+        let age = Duration::from_millis(unix_time_ms().saturating_sub(self.queued_at_unix_ms));
+        let now = Instant::now();
+        let arrived_at = now.checked_sub(age).unwrap_or(now);
+        let extra_blocks = self
+            .extra_blocks
+            .into_iter()
+            .map(ContentBlock::from)
+            .collect::<Vec<_>>();
+        let estimated_tokens = estimate_tokens(&self.prompt, &extra_blocks);
+        (
+            QueuedMessage {
+                id: self.id,
+                message: BufferedMessage {
+                    sender_json: self.sender_json,
+                    sender_name: self.sender_name,
+                    prompt: self.prompt,
+                    extra_blocks,
+                    trigger_msg: self.trigger_msg.into(),
+                    arrived_at,
+                    estimated_tokens,
+                    other_bot_present: self.other_bot_present,
+                    recipient: self.recipient,
+                },
+            },
+            self.recovered_from_active,
+        )
+    }
+}
+
+impl From<ContentBlock> for PersistedContentBlock {
+    fn from(value: ContentBlock) -> Self {
+        match value {
+            ContentBlock::Text { text } => Self::Text { text },
+            ContentBlock::Image { media_type, data } => Self::Image { media_type, data },
+        }
+    }
+}
+
+impl From<PersistedContentBlock> for ContentBlock {
+    fn from(value: PersistedContentBlock) -> Self {
+        match value {
+            PersistedContentBlock::Text { text } => Self::Text { text },
+            PersistedContentBlock::Image { media_type, data } => Self::Image { media_type, data },
+        }
+    }
+}
+
+impl From<&ChannelRef> for PersistedChannelRef {
+    fn from(value: &ChannelRef) -> Self {
+        Self {
+            platform: value.platform.clone(),
+            channel_id: value.channel_id.clone(),
+            thread_id: value.thread_id.clone(),
+            parent_id: value.parent_id.clone(),
+            origin_event_id: value.origin_event_id.clone(),
+        }
+    }
+}
+
+impl From<PersistedChannelRef> for ChannelRef {
+    fn from(value: PersistedChannelRef) -> Self {
+        Self {
+            platform: value.platform,
+            channel_id: value.channel_id,
+            thread_id: value.thread_id,
+            parent_id: value.parent_id,
+            origin_event_id: value.origin_event_id,
+        }
+    }
+}
+
+impl From<&MessageRef> for PersistedMessageRef {
+    fn from(value: &MessageRef) -> Self {
+        Self {
+            channel: PersistedChannelRef::from(&value.channel),
+            message_id: value.message_id.clone(),
+        }
+    }
+}
+
+impl From<PersistedMessageRef> for MessageRef {
+    fn from(value: PersistedMessageRef) -> Self {
+        Self {
+            channel: value.channel.into(),
+            message_id: value.message_id,
+        }
+    }
+}
+
+fn unix_time_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()
+        .try_into()
+        .unwrap_or(u64::MAX)
+}
+
+fn atomic_write(path: &Path, data: &[u8]) -> anyhow::Result<()> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let temp_path = path.with_extension("json.tmp");
+    let mut options = OpenOptions::new();
+    options.create(true).truncate(true).write(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut file = options.open(&temp_path)?;
+    #[cfg(unix)]
+    std::fs::set_permissions(&temp_path, {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::Permissions::from_mode(0o600)
+    })?;
+    file.write_all(data)?;
+    file.sync_all()?;
+    std::fs::rename(&temp_path, path)?;
+    if let Some(parent) = path.parent() {
+        let directory = std::fs::File::open(parent)?;
+        directory.sync_all()?;
+    }
+    Ok(())
+}
+
+#[derive(Default)]
+struct QueueActivity {
+    inner: Mutex<QueueActivityInner>,
+    changed: tokio::sync::Notify,
+}
+
+#[derive(Default)]
+struct QueueActivityInner {
+    active: Vec<ActiveMessage>,
+    replace_paused: bool,
+}
+
+impl QueueActivity {
+    fn set_active(&self, batch: &[QueuedMessage]) {
+        let mut inner = self.inner.lock().unwrap();
+        inner.active = batch
+            .iter()
+            .map(|item| ActiveMessage {
+                id: item.id,
+                sender_id: sender_id_from_json(&item.message.sender_json),
+                sender_name: item.message.sender_name.clone(),
+                prompt: item.message.prompt.clone(),
+                attachment_count: item.message.extra_blocks.len(),
+            })
+            .collect();
+    }
+
+    fn clear_active(&self) {
+        self.inner.lock().unwrap().active.clear();
+    }
+
+    fn list(&self) -> Vec<ActiveMessage> {
+        self.inner.lock().unwrap().active.clone()
+    }
+
+    fn claim_replace(&self, id: u64) -> bool {
+        let mut inner = self.inner.lock().unwrap();
+        if inner.replace_paused || !inner.active.iter().any(|item| item.id == id) {
+            return false;
+        }
+        inner.replace_paused = true;
+        true
+    }
+
+    fn release_replace(&self) {
+        let mut inner = self.inner.lock().unwrap();
+        inner.replace_paused = false;
+        drop(inner);
+        self.changed.notify_waiters();
+    }
+
+    async fn wait_until_unpaused(&self) {
+        loop {
+            let notified = self.changed.notified();
+            if !self.inner.lock().unwrap().replace_paused {
+                return;
+            }
+            notified.await;
+        }
+    }
+}
+
+struct ReplaceClaim {
+    key: String,
+    queue: Arc<PendingQueue>,
+    activity: Arc<QueueActivity>,
+    adapter_kind: String,
+    thread_channel: ChannelRef,
+}
+
 struct ThreadHandle {
-    tx: tokio::sync::mpsc::Sender<BufferedMessage>,
+    tx: tokio::sync::mpsc::Sender<u64>,
+    queue: Arc<PendingQueue>,
+    activity: Arc<QueueActivity>,
     consumer: tokio::task::JoinHandle<()>,
     /// Race-safe eviction counter (§2.5). Plain u64 — all reads/writes under per_thread lock.
     generation: u64,
     channel_id: String,
+    thread_channel: ChannelRef,
     adapter_kind: String,
 }
 
 impl ThreadHandle {
-    /// Approximate number of messages still buffered in the mpsc — used for
-    /// shutdown / cancel logging. Not exact: tokio's mpsc has no sync `.len()`.
+    /// Exact number of messages whose payload is still pending — used for
+    /// shutdown / cancel logging and queue-management UI reconciliation.
     fn pending_count(&self) -> usize {
-        self.tx.max_capacity() - self.tx.capacity()
+        self.queue.len()
     }
 }
 
@@ -271,6 +1018,10 @@ pub struct Dispatcher {
     /// every `submit` and consumed only when a fresh handle is inserted; wasted
     /// values are fine because generations need only be monotonic, not contiguous.
     next_generation: AtomicU64,
+    /// Stable IDs for pending messages exposed through queue-management UIs.
+    next_message_id: AtomicU64,
+    replace_claims: Mutex<HashMap<u64, ReplaceClaim>>,
+    queue_store: Option<Arc<QueueStore>>,
     target: Arc<dyn DispatchTarget>,
     max_buffered_messages: usize,
     max_batch_tokens: usize,
@@ -292,12 +1043,108 @@ impl Dispatcher {
         Self {
             per_thread: Mutex::new(HashMap::new()),
             next_generation: AtomicU64::new(0),
+            next_message_id: AtomicU64::new(1),
+            replace_claims: Mutex::new(HashMap::new()),
+            queue_store: None,
             target,
             max_buffered_messages,
             max_batch_tokens,
             grouping,
             idle_timeout,
         }
+    }
+
+    /// Enable durable queue snapshots. The store is loaded synchronously so
+    /// callers can reconcile external UI metadata before restored consumers
+    /// are started with `restore_persisted`.
+    pub fn with_persistence(mut self, path: PathBuf) -> Self {
+        let store = Arc::new(QueueStore::load(path));
+        self.next_message_id
+            .store(store.next_message_id(), Ordering::Relaxed);
+        self.queue_store = Some(store);
+        self
+    }
+
+    pub fn persisted_queue_summaries(&self) -> Vec<PersistedQueueSummary> {
+        self.queue_store
+            .as_ref()
+            .map(|store| store.summaries())
+            .unwrap_or_default()
+    }
+
+    /// Requeue work loaded from disk and lazily restart one consumer per lane.
+    /// Requests that were active at shutdown are placed before prior pending
+    /// work and marked as recovered, providing at-least-once delivery.
+    pub fn restore_persisted(&self, adapter: Arc<dyn ChatAdapter>) -> usize {
+        let Some(store) = &self.queue_store else {
+            return 0;
+        };
+        let lanes = store.lanes_for_adapter(adapter.platform());
+        let mut restored_count = 0;
+        for mut lane in lanes {
+            let stored_lane = lane.clone();
+            let mut restored = lane
+                .active
+                .drain(..)
+                .map(|mut message| {
+                    message.recovered_from_active = true;
+                    message
+                })
+                .collect::<Vec<_>>();
+            restored.append(&mut lane.pending);
+            if restored.is_empty() {
+                store.remove_lane(&lane.key);
+                continue;
+            }
+
+            if self.per_thread.lock().unwrap().contains_key(&lane.key) {
+                continue;
+            }
+
+            let queue = Arc::new(PendingQueue::default());
+            let lane_count = restored.len();
+            for message in restored {
+                let (queued, recovered) = message.into_queued();
+                queue.insert_with_recovery(queued.id, queued.message, false, recovered);
+            }
+            let activity = Arc::new(QueueActivity::default());
+            let thread_channel: ChannelRef = lane.thread_channel.clone().into();
+            let cap = self.max_buffered_messages.max(queue.len()).max(1);
+            let (tx, rx) = tokio::sync::mpsc::channel(cap);
+            let generation = self.next_generation.fetch_add(1, Ordering::Relaxed);
+            store.mark_requeued(&stored_lane);
+            let consumer = tokio::spawn(consumer_loop(
+                lane.key.clone(),
+                thread_channel.clone(),
+                rx,
+                Arc::clone(&queue),
+                Arc::clone(&activity),
+                Arc::clone(&self.target),
+                Arc::clone(&adapter),
+                cap,
+                self.max_batch_tokens,
+                self.idle_timeout,
+                self.queue_store.clone(),
+            ));
+            let handle = ThreadHandle {
+                tx,
+                queue,
+                activity,
+                consumer,
+                generation,
+                channel_id: thread_channel.channel_id.clone(),
+                thread_channel,
+                adapter_kind: adapter.platform().to_string(),
+            };
+            let mut map = self.per_thread.lock().unwrap();
+            if let std::collections::hash_map::Entry::Vacant(entry) = map.entry(lane.key) {
+                entry.insert(handle);
+                restored_count += lane_count;
+            } else {
+                handle.consumer.abort();
+            }
+        }
+        restored_count
     }
 
     /// Build the dispatcher key for a (platform, thread, sender) tuple.
@@ -327,6 +1174,31 @@ impl Dispatcher {
         format!("{}:{}", thread_channel.platform, logical_thread_id)
     }
 
+    fn allocate_message_id(&self) -> u64 {
+        let id = self.next_message_id.fetch_add(1, Ordering::Relaxed);
+        if let Some(store) = &self.queue_store {
+            store.record_next_message_id(id.saturating_add(1));
+        }
+        id
+    }
+
+    fn persist_pending_queue(
+        &self,
+        key: &str,
+        adapter_kind: &str,
+        thread_channel: &ChannelRef,
+        queue: &PendingQueue,
+    ) {
+        if let Some(store) = &self.queue_store {
+            store.update_pending(
+                key,
+                adapter_kind,
+                thread_channel,
+                queue.snapshot(),
+            );
+        }
+    }
+
     /// Submit one arrival event for the given thread.
     ///
     /// - If the thread has no active consumer, one is spawned lazily.
@@ -354,7 +1226,8 @@ impl Dispatcher {
         // Wasted if the entry already exists; generations need only be monotonic.
         let next_g = self.next_generation.fetch_add(1, Ordering::Relaxed);
 
-        let (tx, my_generation) = {
+        let message_id = self.allocate_message_id();
+        let (tx, queue, my_generation) = {
             // SAFETY: no .await while this guard is held — guard drops at end of block.
             let mut map = self.per_thread.lock().unwrap();
 
@@ -370,28 +1243,44 @@ impl Dispatcher {
 
             let entry = map.entry(thread_key.clone()).or_insert_with(|| {
                 let (tx, rx) = tokio::sync::mpsc::channel(cap);
+                let queue = Arc::new(PendingQueue::default());
+                let activity = Arc::new(QueueActivity::default());
                 let consumer = tokio::spawn(consumer_loop(
                     thread_key.clone(),
                     thread_channel.clone(),
                     rx,
+                    Arc::clone(&queue),
+                    Arc::clone(&activity),
                     Arc::clone(&target),
                     Arc::clone(&adapter),
                     cap,
                     max_tokens,
                     idle_timeout,
+                    self.queue_store.clone(),
                 ));
                 ThreadHandle {
                     tx,
+                    queue,
+                    activity,
                     consumer,
                     generation: next_g,
                     channel_id: thread_channel.channel_id.clone(),
+                    thread_channel: thread_channel.clone(),
                     adapter_kind: adapter.platform().to_string(),
                 }
             });
-            (entry.tx.clone(), entry.generation)
+            (entry.tx.clone(), Arc::clone(&entry.queue), entry.generation)
         };
 
-        if let Err(e) = tx.send(msg).await {
+        queue.insert(message_id, msg, false);
+        self.persist_pending_queue(
+            &thread_key,
+            adapter.platform(),
+            &thread_channel,
+            &queue,
+        );
+
+        if let Err(e) = tx.send(message_id).await {
             // Consumer has exited between our check and the send — race-safe
             // eviction under lock (§2.5), then transparent retry once.
             //
@@ -404,51 +1293,85 @@ impl Dispatcher {
                 let mut map = self.per_thread.lock().unwrap();
                 Self::try_evict_locked(&mut map, &thread_key, my_generation);
             }
-            let failed_msg = e.0;
+            let failed_id = e.0;
+            let Some(failed_msg) = queue.take(failed_id) else {
+                // The message was removed through the queue manager while this
+                // producer was waiting for channel capacity.
+                return Ok(());
+            };
 
             // Retry: spawn a fresh consumer and re-send. If this also fails,
             // surface the error to the user.
             let retry_g = self.next_generation.fetch_add(1, Ordering::Relaxed);
-            let (retry_tx, retry_gen) = {
+            let (retry_tx, retry_queue, retry_gen) = {
                 // SAFETY: no .await while this guard is held — guard drops at end of block.
                 let mut map = self.per_thread.lock().unwrap();
                 let entry = map.entry(thread_key.clone()).or_insert_with(|| {
                     let (tx, rx) = tokio::sync::mpsc::channel(cap);
+                    let queue = Arc::new(PendingQueue::default());
+                    let activity = Arc::new(QueueActivity::default());
                     let consumer = tokio::spawn(consumer_loop(
                         thread_key.clone(),
                         thread_channel.clone(),
                         rx,
+                        Arc::clone(&queue),
+                        Arc::clone(&activity),
                         Arc::clone(&target),
                         Arc::clone(&adapter),
                         cap,
                         max_tokens,
                         idle_timeout,
+                        self.queue_store.clone(),
                     ));
                     ThreadHandle {
                         tx,
+                        queue,
+                        activity,
                         consumer,
                         generation: retry_g,
                         channel_id: thread_channel.channel_id.clone(),
+                        thread_channel: thread_channel.clone(),
                         adapter_kind: adapter.platform().to_string(),
                     }
                 });
-                (entry.tx.clone(), entry.generation)
+                (
+                    entry.tx.clone(),
+                    Arc::clone(&entry.queue),
+                    entry.generation,
+                )
             };
 
-            if let Err(e2) = retry_tx.send(failed_msg).await {
+            retry_queue.insert(failed_id, failed_msg, false);
+            self.persist_pending_queue(
+                &thread_key,
+                adapter.platform(),
+                &thread_channel,
+                &retry_queue,
+            );
+
+            if let Err(e2) = retry_tx.send(failed_id).await {
                 // Retry also failed — truly unexpected. Surface error.
                 {
                     // SAFETY: no .await while this guard is held.
                     let mut map = self.per_thread.lock().unwrap();
                     Self::try_evict_locked(&mut map, &thread_key, retry_gen);
                 }
-                let failed_msg = e2.0;
-                let _ = adapter
-                    .add_reaction(
-                        &failed_msg.trigger_msg,
-                        &self.target.reactions_config().emojis.error,
-                    )
-                    .await;
+                let failed_id = e2.0;
+                let failed_msg = retry_queue.take(failed_id);
+                self.persist_pending_queue(
+                    &thread_key,
+                    adapter.platform(),
+                    &thread_channel,
+                    &retry_queue,
+                );
+                if let Some(failed_msg) = failed_msg.as_ref() {
+                    let _ = adapter
+                        .add_reaction(
+                            &failed_msg.trigger_msg,
+                            &self.target.reactions_config().emojis.error,
+                        )
+                        .await;
+                }
                 let _ = adapter
                     .send_message(
                         &thread_channel,
@@ -462,6 +1385,221 @@ impl Dispatcher {
             }
         }
         Ok(())
+    }
+
+    /// Return all messages still waiting to be handed to the agent for a
+    /// logical platform thread. Entries across sender lanes are ordered by
+    /// their process-local monotonic ID.
+    pub fn pending_messages(&self, platform: &str, thread_id: &str) -> Vec<PendingMessage> {
+        let queues = self.pending_queues(platform, thread_id);
+        if queues.len() == 1 {
+            return queues[0].list();
+        }
+        let mut messages = queues
+            .iter()
+            .flat_map(|queue| queue.list())
+            .collect::<Vec<_>>();
+        messages.sort_by_key(|message| message.id);
+        messages
+    }
+
+    /// Edit a pending text prompt. Returns false when the message has already
+    /// started, was removed, or does not belong to this thread.
+    pub fn edit_pending_message(
+        &self,
+        platform: &str,
+        thread_id: &str,
+        message_id: u64,
+        prompt: &str,
+    ) -> bool {
+        for (key, queue, adapter_kind, thread_channel) in
+            self.pending_queue_handles(platform, thread_id)
+        {
+            if queue.edit(message_id, prompt) {
+                self.persist_pending_queue(&key, &adapter_kind, &thread_channel, &queue);
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Remove one pending message without interrupting the active ACP turn.
+    pub fn remove_pending_message(
+        &self,
+        platform: &str,
+        thread_id: &str,
+        message_id: u64,
+    ) -> bool {
+        for (key, queue, adapter_kind, thread_channel) in
+            self.pending_queue_handles(platform, thread_id)
+        {
+            if queue.remove(message_id) {
+                self.persist_pending_queue(&key, &adapter_kind, &thread_channel, &queue);
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Move one pending message to the front of its dispatch lane.
+    pub fn move_pending_message_to_front(
+        &self,
+        platform: &str,
+        thread_id: &str,
+        message_id: u64,
+    ) -> bool {
+        for (key, queue, adapter_kind, thread_channel) in
+            self.pending_queue_handles(platform, thread_id)
+        {
+            if queue.move_to_front(message_id) {
+                self.persist_pending_queue(&key, &adapter_kind, &thread_channel, &queue);
+                return true;
+            }
+        }
+        false
+    }
+
+    pub fn active_messages(&self, platform: &str, thread_id: &str) -> Vec<ActiveMessage> {
+        let prefix = format!("{platform}:{thread_id}");
+        let lane_prefix = format!("{prefix}:");
+        let activities = self
+            .per_thread
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(key, _)| key.as_str() == prefix || key.starts_with(&lane_prefix))
+            .map(|(_, handle)| Arc::clone(&handle.activity))
+            .collect::<Vec<_>>();
+        let mut active = activities
+            .iter()
+            .flat_map(|activity| activity.list())
+            .collect::<Vec<_>>();
+        active.sort_by_key(|message| message.id);
+        active
+    }
+
+    /// Atomically verify that `message_id` is still active and pause this lane
+    /// before it can begin another turn. The claim must be released on every
+    /// caller path.
+    pub fn claim_active_for_replace(
+        &self,
+        platform: &str,
+        thread_id: &str,
+        message_id: u64,
+    ) -> bool {
+        let prefix = format!("{platform}:{thread_id}");
+        let lane_prefix = format!("{prefix}:");
+        let target = self
+            .per_thread
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(key, _)| key.as_str() == prefix || key.starts_with(&lane_prefix))
+            .find_map(|(key, handle)| {
+                handle.activity.claim_replace(message_id).then(|| ReplaceClaim {
+                    key: key.clone(),
+                    queue: Arc::clone(&handle.queue),
+                    activity: Arc::clone(&handle.activity),
+                    adapter_kind: handle.adapter_kind.clone(),
+                    thread_channel: handle.thread_channel.clone(),
+                })
+            });
+        let Some(target) = target else {
+            return false;
+        };
+        self.replace_claims
+            .lock()
+            .unwrap()
+            .insert(message_id, target);
+        true
+    }
+
+    /// Insert the revised request ahead of existing pending work while an
+    /// active replacement claim is held.
+    pub fn enqueue_claimed_replacement(
+        &self,
+        active_message_id: u64,
+        message: BufferedMessage,
+    ) -> Result<u64, DispatchError> {
+        let claims = self.replace_claims.lock().unwrap();
+        let Some(claim) = claims.get(&active_message_id) else {
+            return Err(DispatchError::ConsumerDead);
+        };
+        let new_id = self.allocate_message_id();
+        claim.queue.insert(new_id, message, true);
+        self.persist_pending_queue(
+            &claim.key,
+            &claim.adapter_kind,
+            &claim.thread_channel,
+            &claim.queue,
+        );
+        Ok(new_id)
+    }
+
+    pub fn release_active_replace(&self, active_message_id: u64) {
+        if let Some(claim) = self
+            .replace_claims
+            .lock()
+            .unwrap()
+            .remove(&active_message_id)
+        {
+            claim.activity.release_replace();
+        }
+    }
+
+    /// Remove every pending message without interrupting the active ACP turn.
+    pub fn clear_pending_messages(&self, platform: &str, thread_id: &str) -> usize {
+        self.clear_pending_messages_through(platform, thread_id, u64::MAX)
+    }
+
+    /// Remove pending messages that existed at confirmation time while keeping
+    /// newer arrivals. Used by Discord's destructive-action confirmation card.
+    pub fn clear_pending_messages_through(
+        &self,
+        platform: &str,
+        thread_id: &str,
+        max_message_id: u64,
+    ) -> usize {
+        self.pending_queue_handles(platform, thread_id)
+            .into_iter()
+            .map(|(key, queue, adapter_kind, thread_channel)| {
+                let removed = queue.clear_through(max_message_id);
+                if removed > 0 {
+                    self.persist_pending_queue(&key, &adapter_kind, &thread_channel, &queue);
+                }
+                removed
+            })
+            .sum()
+    }
+
+    fn pending_queues(&self, platform: &str, thread_id: &str) -> Vec<Arc<PendingQueue>> {
+        self.pending_queue_handles(platform, thread_id)
+            .into_iter()
+            .map(|(_, queue, _, _)| queue)
+            .collect()
+    }
+
+    fn pending_queue_handles(
+        &self,
+        platform: &str,
+        thread_id: &str,
+    ) -> Vec<(String, Arc<PendingQueue>, String, ChannelRef)> {
+        let prefix = format!("{platform}:{thread_id}");
+        let lane_prefix = format!("{prefix}:");
+        self.per_thread
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(key, _)| key.as_str() == prefix || key.starts_with(&lane_prefix))
+            .map(|(key, handle)| {
+                (
+                    key.clone(),
+                    Arc::clone(&handle.queue),
+                    handle.adapter_kind.clone(),
+                    handle.thread_channel.clone(),
+                )
+            })
+            .collect()
     }
 
     /// Drop all per-thread handles whose key belongs to `(platform, thread_id)`,
@@ -488,7 +1626,23 @@ impl Dispatcher {
         let mut dropped = 0;
         for k in keys {
             if let Some(handle) = map.remove(&k) {
-                dropped += handle.pending_count();
+                // Clear payloads before aborting so producers already parked in
+                // `tx.send()` cannot recover and retry messages that the caller
+                // explicitly requested to discard.
+                dropped += handle.queue.clear_through(u64::MAX);
+                if let Some(store) = &self.queue_store {
+                    store.remove_lane(&k);
+                }
+                for active in handle.activity.list() {
+                    if let Some(claim) = self
+                        .replace_claims
+                        .lock()
+                        .unwrap()
+                        .remove(&active.id)
+                    {
+                        claim.activity.release_replace();
+                    }
+                }
                 handle.consumer.abort();
             }
         }
@@ -533,15 +1687,29 @@ impl Dispatcher {
         for (thread_id, handle) in map.iter() {
             let pending = handle.pending_count();
             if pending > 0 {
-                warn!(
-                    thread_id = %thread_id,
-                    channel   = %handle.channel_id,
-                    adapter   = %handle.adapter_kind,
-                    buffered_lost = pending,
-                    "shutdown dropped pending messages without dispatch",
-                );
+                if self.queue_store.is_some() {
+                    info!(
+                        thread_id = %thread_id,
+                        channel   = %handle.channel_id,
+                        adapter   = %handle.adapter_kind,
+                        buffered_preserved = pending,
+                        "shutdown preserved pending messages for restart",
+                    );
+                } else {
+                    warn!(
+                        thread_id = %thread_id,
+                        channel   = %handle.channel_id,
+                        adapter   = %handle.adapter_kind,
+                        buffered_lost = pending,
+                        "shutdown dropped pending messages without dispatch",
+                    );
+                }
             }
+            handle.queue.clear_through(u64::MAX);
             handle.consumer.abort();
+        }
+        for (_, claim) in self.replace_claims.lock().unwrap().drain() {
+            claim.activity.release_replace();
         }
         map.clear();
     }
@@ -555,63 +1723,76 @@ impl Dispatcher {
 async fn consumer_loop(
     thread_key: String,
     thread_channel: ChannelRef,
-    mut rx: tokio::sync::mpsc::Receiver<BufferedMessage>,
+    mut rx: tokio::sync::mpsc::Receiver<u64>,
+    queue: Arc<PendingQueue>,
+    activity: Arc<QueueActivity>,
     target: Arc<dyn DispatchTarget>,
     adapter: Arc<dyn ChatAdapter>,
     max_batch: usize,
     max_tokens: usize,
     idle_timeout: Duration,
+    queue_store: Option<Arc<QueueStore>>,
 ) {
-    // `pending` holds a message that exceeded the token cap for the current batch;
-    // it becomes the first message of the next batch, preserving FIFO.
-    let mut pending: Option<BufferedMessage> = None;
-
     loop {
-        // I1: block until at least one message arrives (zero latency for first message).
-        // Idle timeout: if no message arrives within `idle_timeout` the consumer
-        // exits, freeing the task and mpsc. The next `submit` for this thread_key
-        // will observe `SendError`, evict the stale entry, and lazily spawn a
-        // fresh consumer (§2.5 generation check prevents mis-eviction).
-        let first = match pending.take() {
-            Some(msg) => msg,
-            None => match tokio::time::timeout(idle_timeout, rx.recv()).await {
-                Ok(Some(msg)) => msg,
-                Ok(None) => {
-                    // All senders dropped → shutdown() or cancel_buffered_thread().
-                    break;
-                }
+        activity.wait_until_unpaused().await;
+
+        // Prefer the explicit order so queue-manager promotion and claimed
+        // replacements take effect even though the mpsc still contains older
+        // wakeup IDs. When empty, mpsc remains the zero-latency wakeup edge.
+        let first = loop {
+            if let Some(first) = queue.take_first() {
+                break first;
+            }
+            match tokio::time::timeout(idle_timeout, rx.recv()).await {
+                Ok(Some(_wakeup_id)) => continue,
+                Ok(None) => return,
                 Err(_elapsed) => {
                     debug!(
                         thread_key = %thread_key,
                         channel = %thread_channel.channel_id,
                         "consumer idle timeout, exiting"
                     );
-                    break;
+                    return;
                 }
-            },
+            }
         };
 
         // Greedy drain up to max_batch messages or max_tokens.
         let mut batch = vec![first];
-        let mut cumulative_tokens = batch[0].estimated_tokens;
+        let mut cumulative_tokens = batch[0].message.estimated_tokens;
 
         while batch.len() < max_batch {
             match rx.try_recv() {
-                Ok(more) => {
-                    if cumulative_tokens + more.estimated_tokens > max_tokens {
-                        // Token cap — save for next turn (FIFO preserved).
-                        pending = Some(more);
-                        break;
+                Ok(_wakeup_id) => match queue.take_front_for_batch(cumulative_tokens, max_tokens) {
+                    BatchTake::Taken(more) => {
+                        cumulative_tokens += more.message.estimated_tokens;
+                        batch.push(*more);
                     }
-                    cumulative_tokens += more.estimated_tokens;
-                    batch.push(more);
-                }
+                    BatchTake::TooLarge => break,
+                    BatchTake::Missing => continue,
+                },
                 Err(_) => break,
             }
         }
 
+        activity.set_active(&batch);
+        if let Some(store) = &queue_store {
+            store.mark_active(
+                &thread_key,
+                adapter.platform(),
+                &thread_channel,
+                queue.snapshot(),
+                &batch,
+            );
+        }
+
         // §2.6: read the freshest snapshot in the batch (batch is non-empty).
-        let bot_present = batch.last().unwrap().other_bot_present;
+        let bot_present = batch.last().unwrap().message.other_bot_present;
+
+        let batch = batch
+            .into_iter()
+            .map(|queued| queued.message)
+            .collect::<Vec<_>>();
 
         dispatch_batch(
             &thread_key,
@@ -622,6 +1803,10 @@ async fn consumer_loop(
             bot_present,
         )
         .await;
+        activity.clear_active();
+        if let Some(store) = &queue_store {
+            store.complete_active(&thread_key, queue.snapshot());
+        }
     }
 }
 
@@ -1206,13 +2391,16 @@ mod tests {
     // unit-test the eviction predicate in isolation. End-to-end consumer-death
     // recovery is exercised by the manual staging smoke documented in the ADR.
     fn dummy_handle(generation: u64) -> ThreadHandle {
-        let (tx, _rx) = tokio::sync::mpsc::channel::<BufferedMessage>(1);
+        let (tx, _rx) = tokio::sync::mpsc::channel::<u64>(1);
         let consumer = tokio::spawn(async {});
         ThreadHandle {
             tx,
+            queue: Arc::new(PendingQueue::default()),
+            activity: Arc::new(QueueActivity::default()),
             consumer,
             generation,
             channel_id: "C".into(),
+            thread_channel: make_channel("C"),
             adapter_kind: "discord".into(),
         }
     }
@@ -1298,25 +2486,46 @@ mod tests {
         assert_eq!(d.key("slack", "T2", "userA"), "slack:T2:userA");
     }
 
-    fn insert_dummy_handle(d: &Dispatcher, key: &str) {
-        let (tx, _rx) = tokio::sync::mpsc::channel::<BufferedMessage>(10);
+    fn insert_dummy_handle(d: &Dispatcher, key: &str) -> Arc<PendingQueue> {
+        let (tx, _rx) = tokio::sync::mpsc::channel::<u64>(10);
         let consumer = tokio::spawn(async {});
+        let queue = Arc::new(PendingQueue::default());
         let handle = ThreadHandle {
             tx,
+            queue: Arc::clone(&queue),
+            activity: Arc::new(QueueActivity::default()),
             consumer,
             generation: 0,
             channel_id: "c".into(),
+            thread_channel: make_channel("c"),
             adapter_kind: "discord".into(),
         };
         d.per_thread.lock().unwrap().insert(key.to_string(), handle);
+        queue
     }
 
     #[tokio::test]
     async fn cancel_buffered_thread_drops_per_thread_key() {
         let d = make_dispatcher(BatchGrouping::Thread);
-        insert_dummy_handle(&d, "discord:T1");
-        insert_dummy_handle(&d, "discord:T2"); // different thread, must survive
-        assert_eq!(d.cancel_buffered_thread("discord", "T1"), 0); // no buffered msgs
+        let queue = insert_dummy_handle(&d, "discord:T1");
+        let _ = insert_dummy_handle(&d, "discord:T2"); // different thread, must survive
+        queue.insert(1, make_msg("drop me", 10), false);
+        let activity = d
+            .per_thread
+            .lock()
+            .unwrap()
+            .get("discord:T1")
+            .map(|handle| Arc::clone(&handle.activity))
+            .unwrap();
+        activity.set_active(&[QueuedMessage {
+            id: 2,
+            message: make_msg("active", 10),
+        }]);
+        assert!(d.claim_active_for_replace("discord", "T1", 2));
+        assert_eq!(d.cancel_buffered_thread("discord", "T1"), 1);
+        assert!(queue.list().is_empty());
+        assert!(!activity.inner.lock().unwrap().replace_paused);
+        assert!(d.replace_claims.lock().unwrap().is_empty());
         let map = d.per_thread.lock().unwrap();
         assert!(!map.contains_key("discord:T1"));
         assert!(map.contains_key("discord:T2"));
@@ -1325,10 +2534,10 @@ mod tests {
     #[tokio::test]
     async fn cancel_buffered_thread_drops_all_lanes() {
         let d = make_dispatcher(BatchGrouping::Lane);
-        insert_dummy_handle(&d, "discord:T1:userA");
-        insert_dummy_handle(&d, "discord:T1:userB");
-        insert_dummy_handle(&d, "discord:T2:userA"); // different thread
-        insert_dummy_handle(&d, "slack:T1:userA"); // different platform
+        let _ = insert_dummy_handle(&d, "discord:T1:userA");
+        let _ = insert_dummy_handle(&d, "discord:T1:userB");
+        let _ = insert_dummy_handle(&d, "discord:T2:userA"); // different thread
+        let _ = insert_dummy_handle(&d, "slack:T1:userA"); // different platform
         d.cancel_buffered_thread("discord", "T1");
         let map = d.per_thread.lock().unwrap();
         assert!(!map.contains_key("discord:T1:userA"));
@@ -1341,26 +2550,282 @@ mod tests {
     async fn cancel_buffered_thread_does_not_match_thread_id_prefix() {
         // T1 must not match T10 / T11 (substring trap).
         let d = make_dispatcher(BatchGrouping::Lane);
-        insert_dummy_handle(&d, "discord:T1:userA");
-        insert_dummy_handle(&d, "discord:T10:userA");
+        let _ = insert_dummy_handle(&d, "discord:T1:userA");
+        let _ = insert_dummy_handle(&d, "discord:T10:userA");
         d.cancel_buffered_thread("discord", "T1");
         let map = d.per_thread.lock().unwrap();
         assert!(!map.contains_key("discord:T1:userA"));
         assert!(map.contains_key("discord:T10:userA"));
     }
 
+    #[tokio::test]
+    async fn pending_queue_can_list_edit_remove_and_clear_across_lanes() {
+        let d = make_dispatcher(BatchGrouping::Lane);
+        let queue_a = insert_dummy_handle(&d, "discord:T1:userA");
+        let queue_b = insert_dummy_handle(&d, "discord:T1:userB");
+        queue_a.insert(2, make_msg("second", 10), false);
+        queue_b.insert(1, make_msg("first", 10), false);
+
+        let pending = d.pending_messages("discord", "T1");
+        assert_eq!(
+            pending.iter().map(|item| item.id).collect::<Vec<_>>(),
+            vec![1, 2]
+        );
+        assert!(d.edit_pending_message("discord", "T1", 2, "updated"));
+        assert_eq!(
+            d.pending_messages("discord", "T1")[1].prompt,
+            "updated"
+        );
+        assert!(d.remove_pending_message("discord", "T1", 1));
+        assert!(!d.remove_pending_message("discord", "T1", 1));
+        queue_b.insert(3, make_msg("new arrival", 10), false);
+        assert_eq!(
+            d.clear_pending_messages_through("discord", "T1", 2),
+            1
+        );
+        assert_eq!(d.pending_messages("discord", "T1")[0].id, 3);
+        assert_eq!(d.clear_pending_messages("discord", "T1"), 1);
+        assert!(d.pending_messages("discord", "T1").is_empty());
+    }
+
+    #[tokio::test]
+    async fn pending_queue_move_to_front_changes_thread_dispatch_order() {
+        let d = make_dispatcher(BatchGrouping::Thread);
+        let queue = insert_dummy_handle(&d, "discord:T1");
+        queue.insert(1, make_msg("first", 10), false);
+        queue.insert(2, make_msg("second", 10), false);
+        queue.insert(3, make_msg("third", 10), false);
+
+        assert!(d.move_pending_message_to_front("discord", "T1", 3));
+        assert_eq!(
+            d.pending_messages("discord", "T1")
+                .iter()
+                .map(|item| item.id)
+                .collect::<Vec<_>>(),
+            vec![3, 1, 2]
+        );
+    }
+
+    #[tokio::test]
+    async fn active_replace_claim_pauses_lane_and_inserts_replacement_first() {
+        let d = make_dispatcher(BatchGrouping::Thread);
+        let queue = insert_dummy_handle(&d, "discord:T1");
+        queue.insert(20, make_msg("existing pending", 10), false);
+        let activity = d
+            .per_thread
+            .lock()
+            .unwrap()
+            .get("discord:T1")
+            .map(|handle| Arc::clone(&handle.activity))
+            .unwrap();
+        activity.set_active(&[QueuedMessage {
+            id: 10,
+            message: make_msg("active", 10),
+        }]);
+
+        assert_eq!(d.active_messages("discord", "T1")[0].id, 10);
+        assert!(d.claim_active_for_replace("discord", "T1", 10));
+        assert!(!d.claim_active_for_replace("discord", "T1", 10));
+        let replacement_id = d
+            .enqueue_claimed_replacement(10, make_msg("replacement", 10))
+            .unwrap();
+        assert_eq!(
+            d.pending_messages("discord", "T1")[0].id,
+            replacement_id
+        );
+        assert!(activity.inner.lock().unwrap().replace_paused);
+        let waiter_activity = Arc::clone(&activity);
+        let waiter = tokio::spawn(async move { waiter_activity.wait_until_unpaused().await });
+        tokio::task::yield_now().await;
+        assert!(!waiter.is_finished());
+
+        d.release_active_replace(10);
+        assert!(!activity.inner.lock().unwrap().replace_paused);
+        tokio::time::timeout(Duration::from_secs(1), waiter)
+            .await
+            .expect("replace release should wake the lane")
+            .unwrap();
+    }
+
+    #[test]
+    fn persistent_queue_requeues_active_before_pending_and_preserves_payloads() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("queue.json");
+        let store = QueueStore::load(path.clone());
+        let channel = make_channel("T1");
+        let queue = PendingQueue::default();
+        let mut pending = make_msg("pending", 10);
+        pending.extra_blocks.push(ContentBlock::Image {
+            media_type: "image/png".into(),
+            data: "base64-data".into(),
+        });
+        queue.insert(12, pending, false);
+        let active = vec![QueuedMessage {
+            id: 11,
+            message: make_msg("active", 10),
+        }];
+        store.record_next_message_id(13);
+        store.mark_active("mock:T1", "mock", &channel, queue.snapshot(), &active);
+        drop(store);
+
+        let restored = QueueStore::load(path.clone());
+        assert_eq!(
+            restored.summaries(),
+            vec![PersistedQueueSummary {
+                platform: "mock".into(),
+                thread_id: "T1".into(),
+                queued_messages: 2,
+                recovered_active_messages: 1,
+            }]
+        );
+        let lane = restored.lanes_for_adapter("mock").remove(0);
+        restored.mark_requeued(&lane);
+        drop(restored);
+
+        let reloaded = QueueStore::load(path);
+        let lane = reloaded.lanes_for_adapter("mock").remove(0);
+        assert!(lane.active.is_empty());
+        assert_eq!(
+            lane.pending
+                .iter()
+                .map(|message| message.id)
+                .collect::<Vec<_>>(),
+            vec![11, 12]
+        );
+        assert!(lane.pending[0].recovered_from_active);
+        assert!(!lane.pending[1].recovered_from_active);
+        assert!(matches!(
+            lane.pending[1].extra_blocks.first(),
+            Some(PersistedContentBlock::Image { media_type, data })
+                if media_type == "image/png" && data == "base64-data"
+        ));
+        assert_eq!(reloaded.next_message_id(), 13);
+        assert!(!dir.path().join("queue.json.tmp").exists());
+    }
+
+    #[tokio::test]
+    async fn dispatcher_restores_and_drains_persistent_queue() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("queue.json");
+        let store = QueueStore::load(path.clone());
+        let channel = make_channel("T1");
+        let queue = PendingQueue::default();
+        queue.insert(2, make_msg("pending", 10), false);
+        store.mark_active(
+            "mock:T1",
+            "mock",
+            &channel,
+            queue.snapshot(),
+            &[QueuedMessage {
+                id: 1,
+                message: make_msg("interrupted", 10),
+            }],
+        );
+        drop(store);
+
+        let mock = Arc::new(MockDispatchTarget::new());
+        let target: Arc<dyn DispatchTarget> = mock.clone();
+        let dispatcher = Dispatcher::with_idle_timeout(
+            target,
+            1,
+            24_000,
+            BatchGrouping::Thread,
+            Duration::from_secs(60),
+        )
+        .with_persistence(path);
+        let adapter: Arc<dyn ChatAdapter> = Arc::new(MockChatAdapter);
+        assert_eq!(dispatcher.restore_persisted(adapter), 2);
+
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if mock.calls().len() == 2 {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("restored requests should dispatch");
+        let calls = mock.calls();
+        assert!(calls[0]
+            .text_blocks
+            .iter()
+            .any(|text| text == "interrupted"));
+        assert!(calls[1]
+            .text_blocks
+            .iter()
+            .any(|text| text == "pending"));
+
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if dispatcher.persisted_queue_summaries().is_empty() {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("completed restored requests should leave no durable queue");
+        dispatcher.shutdown();
+    }
+
+    #[tokio::test]
+    async fn shutdown_preserves_persistent_pending_queue() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("queue.json");
+        let dispatcher = make_dispatcher(BatchGrouping::Thread).with_persistence(path.clone());
+        let queue = insert_dummy_handle(&dispatcher, "discord:T1");
+        queue.insert(1, make_msg("keep after shutdown", 10), false);
+        dispatcher.persist_pending_queue(
+            "discord:T1",
+            "discord",
+            &make_channel("T1"),
+            &queue,
+        );
+
+        dispatcher.shutdown();
+
+        let restored = QueueStore::load(path);
+        assert_eq!(restored.summaries()[0].queued_messages, 1);
+        assert_eq!(
+            restored.lanes_for_adapter("discord")[0].pending[0].prompt,
+            "keep after shutdown"
+        );
+    }
+
+    #[tokio::test]
+    async fn cancel_removes_persistent_pending_queue() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("queue.json");
+        let dispatcher = make_dispatcher(BatchGrouping::Thread).with_persistence(path.clone());
+        let queue = insert_dummy_handle(&dispatcher, "discord:T1");
+        queue.insert(1, make_msg("discard", 10), false);
+        dispatcher.persist_pending_queue(
+            "discord:T1",
+            "discord",
+            &make_channel("T1"),
+            &queue,
+        );
+
+        assert_eq!(dispatcher.cancel_buffered_thread("discord", "T1"), 1);
+        assert!(QueueStore::load(path).summaries().is_empty());
+    }
+
     // Long-running consumer that parks until aborted — used by sweep_stale /
     // shutdown tests to exercise the "still alive" path.
     fn alive_consumer_handle() -> ThreadHandle {
-        let (tx, _rx) = tokio::sync::mpsc::channel::<BufferedMessage>(10);
+        let (tx, _rx) = tokio::sync::mpsc::channel::<u64>(10);
         let consumer = tokio::spawn(async {
             std::future::pending::<()>().await;
         });
         ThreadHandle {
             tx,
+            queue: Arc::new(PendingQueue::default()),
+            activity: Arc::new(QueueActivity::default()),
             consumer,
             generation: 0,
             channel_id: "c".into(),
+            thread_channel: make_channel("c"),
             adapter_kind: "discord".into(),
         }
     }
@@ -1368,8 +2833,8 @@ mod tests {
     #[tokio::test]
     async fn sweep_stale_removes_finished_consumers() {
         let d = make_dispatcher(BatchGrouping::Thread);
-        insert_dummy_handle(&d, "discord:T1");
-        insert_dummy_handle(&d, "discord:T2");
+        let _ = insert_dummy_handle(&d, "discord:T1");
+        let _ = insert_dummy_handle(&d, "discord:T2");
         // Yield so the empty-body spawned tasks actually run to completion
         // before is_finished() is checked.
         tokio::time::sleep(Duration::from_millis(10)).await;
@@ -1397,9 +2862,9 @@ mod tests {
     #[tokio::test]
     async fn shutdown_clears_all_handles() {
         let d = make_dispatcher(BatchGrouping::Thread);
-        insert_dummy_handle(&d, "k1");
-        insert_dummy_handle(&d, "k2");
-        insert_dummy_handle(&d, "k3");
+        let _ = insert_dummy_handle(&d, "k1");
+        let _ = insert_dummy_handle(&d, "k2");
+        let _ = insert_dummy_handle(&d, "k3");
         d.shutdown();
         assert!(d.per_thread.lock().unwrap().is_empty());
     }
@@ -1433,6 +2898,7 @@ mod tests {
     #[derive(Clone)]
     struct RecordedDispatch {
         block_count: usize,
+        text_blocks: Vec<String>,
         other_bot_present: bool,
         dispatch_channel: ChannelRef,
     }
@@ -1521,8 +2987,16 @@ mod tests {
             other_bot_present: bool,
             _recipient: Option<(String, String)>,
         ) -> Result<()> {
+            let text_blocks = content_blocks
+                .iter()
+                .filter_map(|block| match block {
+                    ContentBlock::Text { text } => Some(text.clone()),
+                    _ => None,
+                })
+                .collect();
             self.calls.lock().unwrap().push(RecordedDispatch {
                 block_count: content_blocks.len(),
+                text_blocks,
                 other_bot_present,
                 dispatch_channel: thread_channel.clone(),
             });
@@ -1612,9 +3086,12 @@ mod tests {
         let mock = Arc::new(MockDispatchTarget::new());
         let target: Arc<dyn DispatchTarget> = mock.clone();
         let adapter: Arc<dyn ChatAdapter> = Arc::new(MockChatAdapter);
-        let (tx, rx) = tokio::sync::mpsc::channel::<BufferedMessage>(msgs.len().max(1));
-        for m in msgs {
-            tx.send(m).await.unwrap();
+        let (tx, rx) = tokio::sync::mpsc::channel::<u64>(msgs.len().max(1));
+        let queue = Arc::new(PendingQueue::default());
+        for (index, message) in msgs.into_iter().enumerate() {
+            let id = index as u64 + 1;
+            queue.insert(id, message, false);
+            tx.send(id).await.unwrap();
         }
         drop(tx);
 
@@ -1622,15 +3099,88 @@ mod tests {
             "mock:T".into(),
             make_channel("T"),
             rx,
+            queue,
+            Arc::new(QueueActivity::default()),
             target,
             adapter,
             max_batch,
             max_tokens,
             Duration::from_secs(60),
+            None,
         )
         .await;
 
         mock.calls()
+    }
+
+    #[tokio::test]
+    async fn consumer_skips_queue_ids_removed_before_dispatch() {
+        let mock = Arc::new(MockDispatchTarget::new());
+        let target: Arc<dyn DispatchTarget> = mock.clone();
+        let adapter: Arc<dyn ChatAdapter> = Arc::new(MockChatAdapter);
+        let queue = Arc::new(PendingQueue::default());
+        let (tx, rx) = tokio::sync::mpsc::channel::<u64>(2);
+        queue.insert(1, make_msg("removed", 10), false);
+        queue.insert(2, make_msg("kept", 10), false);
+        tx.send(1).await.unwrap();
+        tx.send(2).await.unwrap();
+        assert!(queue.remove(1));
+        drop(tx);
+
+        consumer_loop(
+            "mock:T".into(),
+            make_channel("T"),
+            rx,
+            queue,
+            Arc::new(QueueActivity::default()),
+            target,
+            adapter,
+            10,
+            24_000,
+            Duration::from_secs(60),
+            None,
+        )
+        .await;
+
+        let calls = mock.calls();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].block_count, 2);
+    }
+
+    #[tokio::test]
+    async fn consumer_dispatches_promoted_message_next() {
+        let mock = Arc::new(MockDispatchTarget::new());
+        let target: Arc<dyn DispatchTarget> = mock.clone();
+        let adapter: Arc<dyn ChatAdapter> = Arc::new(MockChatAdapter);
+        let queue = Arc::new(PendingQueue::default());
+        let (tx, rx) = tokio::sync::mpsc::channel::<u64>(3);
+        queue.insert(1, make_msg("first", 10), false);
+        queue.insert(2, make_msg("second", 10), false);
+        queue.insert(3, make_msg("promoted", 10), false);
+        assert!(queue.move_to_front(3));
+        for id in 1..=3 {
+            tx.send(id).await.unwrap();
+        }
+        drop(tx);
+
+        consumer_loop(
+            "mock:T".into(),
+            make_channel("T"),
+            rx,
+            queue,
+            Arc::new(QueueActivity::default()),
+            target,
+            adapter,
+            1,
+            24_000,
+            Duration::from_secs(60),
+            None,
+        )
+        .await;
+
+        let calls = mock.calls();
+        assert_eq!(calls.len(), 3);
+        assert!(calls[0].text_blocks.iter().any(|text| text == "promoted"));
     }
 
     #[tokio::test]
@@ -1731,7 +3281,8 @@ mod tests {
         let mock = Arc::new(MockDispatchTarget::new());
         let target: Arc<dyn DispatchTarget> = mock.clone();
         let adapter: Arc<dyn ChatAdapter> = Arc::new(MockChatAdapter);
-        let (tx, rx) = tokio::sync::mpsc::channel::<BufferedMessage>(1);
+        let (tx, rx) = tokio::sync::mpsc::channel::<u64>(1);
+        let queue = Arc::new(PendingQueue::default());
 
         let mut msg = make_msg("hi", 10);
         msg.trigger_msg.channel = ChannelRef {
@@ -1741,7 +3292,8 @@ mod tests {
             parent_id: None,
             origin_event_id: Some("evt-fresh".into()),
         };
-        tx.send(msg).await.unwrap();
+        queue.insert(1, msg, false);
+        tx.send(1).await.unwrap();
         drop(tx);
 
         consumer_loop(
@@ -1754,11 +3306,14 @@ mod tests {
                 origin_event_id: Some("evt-stale".into()),
             },
             rx,
+            queue,
+            Arc::new(QueueActivity::default()),
             target,
             adapter,
             10,
             24_000,
             Duration::from_secs(60),
+            None,
         )
         .await;
 
@@ -1787,16 +3342,20 @@ mod tests {
         let mock = Arc::new(MockDispatchTarget::new());
         let target: Arc<dyn DispatchTarget> = mock.clone();
         let adapter: Arc<dyn ChatAdapter> = Arc::new(MockChatAdapter);
-        let (tx, rx) = tokio::sync::mpsc::channel::<BufferedMessage>(1);
+        let (tx, rx) = tokio::sync::mpsc::channel::<u64>(1);
+        let queue = Arc::new(PendingQueue::default());
         let consumer = tokio::spawn(consumer_loop(
             "mock:T".into(),
             make_channel("T"),
             rx,
+            queue,
+            Arc::new(QueueActivity::default()),
             target,
             adapter,
             10,
             24_000,
             Duration::from_millis(50),
+            None,
         ));
         // Wait enough for the timeout branch + a tick for the task to finish.
         tokio::time::sleep(Duration::from_millis(150)).await;
@@ -1828,15 +3387,18 @@ mod tests {
 
         let key = "mock:T".to_string();
         let parked = {
-            let (tx, rx) = tokio::sync::mpsc::channel::<BufferedMessage>(10);
+            let (tx, rx) = tokio::sync::mpsc::channel::<u64>(10);
             drop(rx); // closes the channel → next tx.send() yields SendError
             let consumer = tokio::spawn(std::future::pending::<()>());
             let abort = consumer.abort_handle();
             let handle = ThreadHandle {
                 tx,
+                queue: Arc::new(PendingQueue::default()),
+                activity: Arc::new(QueueActivity::default()),
                 consumer,
                 generation: 999,
                 channel_id: "T".into(),
+                thread_channel: make_channel("T"),
                 adapter_kind: "mock".into(),
             };
             d.per_thread.lock().unwrap().insert(key.clone(), handle);

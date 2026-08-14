@@ -124,6 +124,60 @@ impl TaskRegistry {
         })
     }
 
+    /// Reconcile task metadata after pending queue entries are removed through
+    /// the Discord queue manager. An active turn remains Running; an idle task
+    /// whose queue becomes empty returns to Ready.
+    pub fn discard_queued(
+        &self,
+        thread_id: u64,
+        count: usize,
+    ) -> anyhow::Result<TaskRecord> {
+        self.update(thread_id, |task| {
+            task.queued_messages = task.queued_messages.saturating_sub(count);
+            if task.state == TaskState::Queued && task.queued_messages == 0 {
+                task.state = TaskState::Ready;
+            }
+        })
+    }
+
+    /// Replace stale process-local queue metadata with the complete durable
+    /// dispatcher snapshot loaded at startup. Missing Running/Queued tasks are
+    /// returned to Ready; present tasks receive the exact recovered depth.
+    pub fn reconcile_restored_queues(
+        &self,
+        restored: &HashMap<u64, usize>,
+    ) -> anyhow::Result<Vec<TaskRecord>> {
+        let mut tasks = self
+            .tasks
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let original = tasks.clone();
+        let now = Utc::now();
+        let mut changed = Vec::new();
+        for task in tasks.values_mut() {
+            let queued_messages = restored.get(&task.thread_id).copied().unwrap_or(0);
+            let previous = task.clone();
+            task.queued_messages = queued_messages;
+            if queued_messages > 0 {
+                task.state = TaskState::Queued;
+                task.last_error = None;
+            } else if matches!(task.state, TaskState::Queued | TaskState::Running) {
+                task.state = TaskState::Ready;
+            }
+            if *task != previous {
+                task.updated_at = now;
+                changed.push(task.clone());
+            }
+        }
+        if !changed.is_empty() {
+            if let Err(error) = self.persist_locked(&tasks) {
+                *tasks = original;
+                return Err(error);
+            }
+        }
+        Ok(changed)
+    }
+
     pub fn finish_turn(&self, thread_id: u64, error: Option<String>) -> anyhow::Result<TaskRecord> {
         self.update(thread_id, |task| {
             if let Some(error) = error {
@@ -295,6 +349,61 @@ mod tests {
 
         let restored = TaskRegistry::load(path);
         assert_eq!(restored.task_for_thread(20).unwrap(), failed);
+    }
+
+    #[test]
+    fn discarding_pending_messages_preserves_running_turn() {
+        let dir = tempfile::tempdir().unwrap();
+        let registry = TaskRegistry::load(dir.path().join("tasks.json"));
+        registry.ensure(task(20)).unwrap();
+        registry.enqueue(20).unwrap();
+        registry.enqueue(20).unwrap();
+        registry.start_turn(20, 1).unwrap();
+
+        let running = registry.discard_queued(20, 1).unwrap();
+        assert_eq!(running.state, TaskState::Running);
+        assert_eq!(running.queued_messages, 0);
+
+        registry.finish_turn(20, None).unwrap();
+        registry.enqueue(20).unwrap();
+        let ready = registry.discard_queued(20, 1).unwrap();
+        assert_eq!(ready.state, TaskState::Ready);
+        assert_eq!(ready.queued_messages, 0);
+    }
+
+    #[test]
+    fn restored_queue_reconciles_stale_running_metadata() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("tasks.json");
+        let registry = TaskRegistry::load(path.clone());
+        registry.ensure(task(20)).unwrap();
+        registry.enqueue(20).unwrap();
+        registry.start_turn(20, 1).unwrap();
+
+        let mut queues = HashMap::new();
+        queues.insert(20, 3);
+        let recovered = registry.reconcile_restored_queues(&queues).unwrap();
+        assert_eq!(recovered[0].state, TaskState::Queued);
+        assert_eq!(recovered[0].queued_messages, 3);
+
+        let restored = TaskRegistry::load(path).task_for_thread(20).unwrap();
+        assert_eq!(restored.state, TaskState::Queued);
+        assert_eq!(restored.queued_messages, 3);
+    }
+
+    #[test]
+    fn startup_reconciliation_clears_stale_queue_without_snapshot() {
+        let dir = tempfile::tempdir().unwrap();
+        let registry = TaskRegistry::load(dir.path().join("tasks.json"));
+        registry.ensure(task(20)).unwrap();
+        registry.enqueue(20).unwrap();
+        registry.start_turn(20, 1).unwrap();
+
+        let changed = registry
+            .reconcile_restored_queues(&HashMap::new())
+            .unwrap();
+        assert_eq!(changed[0].state, TaskState::Ready);
+        assert_eq!(changed[0].queued_messages, 0);
     }
 
     #[test]
