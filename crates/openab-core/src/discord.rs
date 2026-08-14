@@ -266,6 +266,7 @@ fn session_control_card(
     snapshot: &SessionSnapshot,
     aliases: &HashMap<String, String>,
     channel_id: u64,
+    task: Option<&TaskRecord>,
     note: Option<String>,
 ) -> InteractionCard {
     let (state, colour, guidance) =
@@ -310,12 +311,18 @@ fn session_control_card(
             .label("? Help")
             .style(ButtonStyle::Secondary),
     ]);
+    let mut components = vec![buttons];
+    if let Some(task) = task.filter(|task| {
+        task.queued_messages > 0 || matches!(task.state, TaskState::Queued | TaskState::Running)
+    }) {
+        components.push(CreateActionRow::Buttons(vec![queue_manager_button(task)]));
+    }
     InteractionCard {
         content: note
             .map(|value| truncate_for_discord(&value, 1900))
             .unwrap_or_default(),
         embed,
-        components: vec![buttons],
+        components,
     }
 }
 
@@ -323,18 +330,20 @@ fn session_control_message(
     snapshot: &SessionSnapshot,
     aliases: &HashMap<String, String>,
     channel_id: u64,
+    task: Option<&TaskRecord>,
     note: Option<String>,
 ) -> CreateInteractionResponseMessage {
-    session_control_card(snapshot, aliases, channel_id, note).into_message()
+    session_control_card(snapshot, aliases, channel_id, task, note).into_message()
 }
 
 fn session_control_edit(
     snapshot: &SessionSnapshot,
     aliases: &HashMap<String, String>,
     channel_id: u64,
+    task: Option<&TaskRecord>,
     note: Option<String>,
 ) -> EditInteractionResponse {
-    session_control_card(snapshot, aliases, channel_id, note).into_edit()
+    session_control_card(snapshot, aliases, channel_id, task, note).into_edit()
 }
 
 fn project_access_display(binding: &ProjectBinding) -> String {
@@ -393,7 +402,10 @@ fn task_status_embed(task: &TaskRecord) -> CreateEmbed {
     if task.queued_messages > 0 {
         embed = embed.field(
             "Queue",
-            format!("{} message(s) waiting", task.queued_messages),
+            format!(
+                "{} message(s) waiting\n使用下方「📋 管理 Queue」查看或調整。",
+                task.queued_messages
+            ),
             true,
         );
     }
@@ -455,9 +467,7 @@ fn task_control_rows(task: &TaskRecord) -> Vec<CreateActionRow> {
     }
     let buttons = match task.state {
         TaskState::Queued => vec![
-            CreateButton::new("oab_queue:open")
-                .label(format!("📋 Queue ({})", task.queued_messages))
-                .style(ButtonStyle::Primary),
+            queue_manager_button(task),
             CreateButton::new("oab_session:refresh")
                 .label("↻ Check status")
                 .style(ButtonStyle::Secondary),
@@ -467,9 +477,7 @@ fn task_control_rows(task: &TaskRecord) -> Vec<CreateActionRow> {
             CreateButton::new("oab_session:cancel")
                 .label("■ Stop")
                 .style(ButtonStyle::Danger),
-            CreateButton::new("oab_queue:open")
-                .label(format!("📋 Queue ({})", task.queued_messages))
-                .style(ButtonStyle::Primary),
+            queue_manager_button(task),
             CreateButton::new("oab_session:refresh")
                 .label("↻ Refresh")
                 .style(ButtonStyle::Secondary),
@@ -517,6 +525,42 @@ fn task_control_rows(task: &TaskRecord) -> Vec<CreateActionRow> {
         rows.push(CreateActionRow::Buttons(vec![project(), help()]));
     }
     rows
+}
+
+fn queue_manager_button(task: &TaskRecord) -> CreateButton {
+    CreateButton::new("oab_queue:open")
+        .label(format!("📋 管理 Queue（{}）", task.queued_messages))
+        .style(ButtonStyle::Primary)
+}
+
+fn should_post_queue_notice(previous: &TaskRecord) -> bool {
+    matches!(
+        (previous.state, previous.queued_messages),
+        (TaskState::Running, 0) | (TaskState::Queued, 1)
+    )
+}
+
+fn queue_enqueued_notice(task: &TaskRecord) -> CreateMessage {
+    CreateMessage::new()
+        .embed(
+            CreateEmbed::new()
+                .title("📥 新需求已加入 Queue")
+                .description(
+                    "Cursor 正在處理其他需求。這則需求會依序執行，可從下方開啟 Queue Manager 查看、編輯或移除。",
+                )
+                .colour(0xF1C40F)
+                .field(
+                    "等待中",
+                    format!("**{}** request(s)", task.queued_messages),
+                    true,
+                )
+                .footer(CreateEmbedFooter::new(
+                    "後續排隊需求只會更新 Task Status，避免重複通知",
+                )),
+        )
+        .components(vec![CreateActionRow::Buttons(vec![queue_manager_button(
+            task,
+        )])])
 }
 
 fn queue_wait_display(seconds: u64) -> String {
@@ -1426,11 +1470,7 @@ fn help_action_center(
                     .style(ButtonStyle::Secondary),
             ]));
         } else if matches!(task.state, TaskState::Queued | TaskState::Running) {
-            components.push(CreateActionRow::Buttons(vec![
-                CreateButton::new("oab_queue:open")
-                    .label(format!("📋 Manage queue ({})", task.queued_messages))
-                    .style(ButtonStyle::Primary),
-            ]));
+            components.push(CreateActionRow::Buttons(vec![queue_manager_button(task)]));
         }
     }
     components.push(CreateActionRow::Buttons(vec![
@@ -2746,9 +2786,11 @@ impl ChatAdapter for DiscordAdapter {
             return Ok(());
         };
         let thread_id: u64 = Self::resolve_channel(channel).parse()?;
-        if registry.task_for_thread(thread_id).is_none() {
+        let Some(previous) = registry.task_for_thread(thread_id) else {
             return Ok(());
-        }
+        };
+        let post_queue_notice =
+            matches!(&event, TaskLifecycleEvent::Enqueued) && should_post_queue_notice(&previous);
         let task = match event {
             TaskLifecycleEvent::Enqueued => registry.enqueue(thread_id)?,
             TaskLifecycleEvent::Started { batch_size } => {
@@ -2759,7 +2801,16 @@ impl ChatAdapter for DiscordAdapter {
                 registry.finish_turn(thread_id, Some(truncate_for_discord(&message, 900)))?
             }
         };
-        self.refresh_task_ui(&task).await
+        self.refresh_task_ui(&task).await?;
+        if post_queue_notice {
+            if let Err(error) = ChannelId::new(task.thread_id)
+                .send_message(&self.http, queue_enqueued_notice(&task))
+                .await
+            {
+                tracing::warn!(%error, thread_id, "failed to post Queue Manager shortcut");
+            }
+        }
+        Ok(())
     }
 
     async fn edit_message(&self, msg: &MessageRef, content: &str) -> anyhow::Result<()> {
@@ -6693,11 +6744,13 @@ impl Handler {
                 .pool()
                 .session_snapshot(&scope.session_key)
                 .await;
+            let task = self.task_registry.task_for_thread(cmd.channel_id.get());
             let response = CreateInteractionResponse::Message(
                 session_control_message(
                     &snapshot,
                     &self.router.workspace_aliases(),
                     cmd.channel_id.get(),
+                    task.as_ref(),
                     None,
                 )
                 .ephemeral(true),
@@ -7608,6 +7661,7 @@ impl Handler {
                 &snapshot,
                 &self.router.workspace_aliases(),
                 comp.channel_id.get(),
+                None,
                 note,
             ),
         };
@@ -10942,6 +10996,48 @@ mod tests {
         assert!(failed.contains("oab_task:retry"));
         assert!(failed.contains("oab_task:edit"));
         assert!(failed.contains("oab_task:error"));
+    }
+
+    #[test]
+    fn queue_shortcuts_are_consistent_and_notices_are_debounced() {
+        let mut running = ui_task(TaskState::Running, None);
+        let task_controls = serde_json::to_string(&task_control_rows(&running)).unwrap();
+        assert!(task_controls.contains("📋 管理 Queue（0）"));
+
+        let snapshot = SessionSnapshot {
+            state: SessionState::Active,
+            working_dir: Some("/work/api".into()),
+            externally_detached: false,
+        };
+        let session = serde_json::to_string(
+            &session_control_card(
+                &snapshot,
+                &HashMap::new(),
+                running.thread_id,
+                Some(&running),
+                None,
+            )
+            .into_message(),
+        )
+        .unwrap();
+        assert!(session.contains("oab_queue:open"));
+        assert!(session.contains("📋 管理 Queue（0）"));
+
+        assert!(should_post_queue_notice(&running));
+        running.queued_messages = 1;
+        let notice = serde_json::to_string(&queue_enqueued_notice(&running)).unwrap();
+        assert!(notice.contains("新需求已加入 Queue"));
+        assert!(notice.contains("oab_queue:open"));
+        assert!(notice.contains("📋 管理 Queue（1）"));
+
+        assert!(!should_post_queue_notice(&running));
+        running.state = TaskState::Queued;
+        assert!(should_post_queue_notice(&running));
+        running.queued_messages = 2;
+        assert!(!should_post_queue_notice(&running));
+
+        let ready = ui_task(TaskState::Ready, None);
+        assert!(!should_post_queue_notice(&ready));
     }
 
     #[test]
