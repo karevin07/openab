@@ -90,6 +90,9 @@ pub struct ActiveMessage {
     pub sender_name: String,
     pub prompt: String,
     pub attachment_count: usize,
+    /// True when this request was active during a previous process lifetime
+    /// and is now being replayed after restart.
+    pub recovered_from_active: bool,
 }
 
 /// How `thread_key` is built for the dispatcher's per-thread map.
@@ -145,6 +148,7 @@ struct PendingQueueInner {
 struct QueuedMessage {
     id: u64,
     message: BufferedMessage,
+    recovered_from_active: bool,
 }
 
 enum BatchTake {
@@ -191,8 +195,12 @@ impl PendingQueue {
         let mut inner = self.inner.lock().unwrap();
         while let Some(id) = inner.order.pop_front() {
             if let Some(message) = inner.entries.remove(&id) {
-                inner.recovered_from_active.remove(&id);
-                return Some(QueuedMessage { id, message });
+                let recovered_from_active = inner.recovered_from_active.remove(&id);
+                return Some(QueuedMessage {
+                    id,
+                    message,
+                    recovered_from_active,
+                });
             }
         }
         None
@@ -215,8 +223,12 @@ impl PendingQueue {
             .entries
             .remove(&id)
             .expect("pending queue entry disappeared while locked");
-        inner.recovered_from_active.remove(&id);
-        BatchTake::Taken(Box::new(QueuedMessage { id, message }))
+        let recovered_from_active = inner.recovered_from_active.remove(&id);
+        BatchTake::Taken(Box::new(QueuedMessage {
+            id,
+            message,
+            recovered_from_active,
+        }))
     }
 
     fn list(&self) -> Vec<PendingMessage> {
@@ -293,6 +305,7 @@ impl PendingQueue {
                         QueuedMessage {
                             id: *id,
                             message: message.clone(),
+                            recovered_from_active: inner.recovered_from_active.contains(id),
                         },
                         inner.recovered_from_active.contains(id),
                     )
@@ -551,7 +564,10 @@ impl QueueStore {
                     active: active
                         .iter()
                         .cloned()
-                        .map(|message| PersistedMessage::from_queued(message, false))
+                        .map(|message| {
+                            let recovered_from_active = message.recovered_from_active;
+                            PersistedMessage::from_queued(message, recovered_from_active)
+                        })
                         .collect(),
                 },
             );
@@ -667,6 +683,7 @@ impl PersistedMessage {
                     other_bot_present: self.other_bot_present,
                     recipient: self.recipient,
                 },
+                recovered_from_active: self.recovered_from_active,
             },
             self.recovered_from_active,
         )
@@ -793,6 +810,7 @@ impl QueueActivity {
                 sender_name: item.message.sender_name.clone(),
                 prompt: item.message.prompt.clone(),
                 attachment_count: item.message.extra_blocks.len(),
+                recovered_from_active: item.recovered_from_active,
             })
             .collect();
     }
@@ -2520,6 +2538,7 @@ mod tests {
         activity.set_active(&[QueuedMessage {
             id: 2,
             message: make_msg("active", 10),
+            recovered_from_active: false,
         }]);
         assert!(d.claim_active_for_replace("discord", "T1", 2));
         assert_eq!(d.cancel_buffered_thread("discord", "T1"), 1);
@@ -2621,6 +2640,7 @@ mod tests {
         activity.set_active(&[QueuedMessage {
             id: 10,
             message: make_msg("active", 10),
+            recovered_from_active: false,
         }]);
 
         assert_eq!(d.active_messages("discord", "T1")[0].id, 10);
@@ -2648,6 +2668,44 @@ mod tests {
     }
 
     #[test]
+    fn active_queue_snapshot_preserves_restart_recovery_marker() {
+        let activity = QueueActivity::default();
+        activity.set_active(&[QueuedMessage {
+            id: 10,
+            message: make_msg("replayed request", 10),
+            recovered_from_active: true,
+        }]);
+
+        let active = activity.list();
+        assert_eq!(active.len(), 1);
+        assert!(active[0].recovered_from_active);
+    }
+
+    #[test]
+    fn persistent_active_snapshot_preserves_restart_recovery_marker() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("queue.json");
+        let store = QueueStore::load(path.clone());
+        let channel = make_channel("T1");
+        store.mark_active(
+            "mock:T1",
+            "mock",
+            &channel,
+            Vec::new(),
+            &[QueuedMessage {
+                id: 10,
+                message: make_msg("replayed request", 10),
+                recovered_from_active: true,
+            }],
+        );
+        drop(store);
+
+        let restored = QueueStore::load(path);
+        let lane = restored.lanes_for_adapter("mock").remove(0);
+        assert!(lane.active[0].recovered_from_active);
+    }
+
+    #[test]
     fn persistent_queue_requeues_active_before_pending_and_preserves_payloads() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("queue.json");
@@ -2663,6 +2721,7 @@ mod tests {
         let active = vec![QueuedMessage {
             id: 11,
             message: make_msg("active", 10),
+            recovered_from_active: false,
         }];
         store.record_next_message_id(13);
         store.mark_active("mock:T1", "mock", &channel, queue.snapshot(), &active);
@@ -2719,6 +2778,7 @@ mod tests {
             &[QueuedMessage {
                 id: 1,
                 message: make_msg("interrupted", 10),
+                recovered_from_active: false,
             }],
         );
         drop(store);

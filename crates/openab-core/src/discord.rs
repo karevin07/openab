@@ -557,13 +557,19 @@ fn queue_manager_card(
         .field("Waiting", format!("**{}** request(s)", items.len()), true);
 
     if let Some(active_item) = active_item {
+        let recovery_note = if active_item.recovered_from_active {
+            "\n♻️ **Replayed after OpenAB restart**"
+        } else {
+            ""
+        };
         embed = embed.field(
             "Active request",
             format!(
-                "**#{} · {}**\n{}",
+                "**#{} · {}**\n{}{}",
                 active_item.id,
                 suppress_mentions(&active_item.sender_name),
-                suppress_mentions(&truncate_for_discord(&active_item.prompt, 900))
+                suppress_mentions(&truncate_for_discord(&active_item.prompt, 900)),
+                recovery_note,
             ),
             false,
         );
@@ -702,7 +708,9 @@ fn queue_manager_card(
             );
         }
     }
-    rows.push(CreateActionRow::Buttons(primary));
+    if !primary.is_empty() {
+        rows.push(CreateActionRow::Buttons(primary));
+    }
     let mut maintenance = vec![
         CreateButton::new("oab_queue:refresh")
             .label("↻ Refresh")
@@ -7383,7 +7391,7 @@ impl Handler {
             let _ = modal.create_response(&ctx.http, response).await;
             return;
         }
-        if let Err(error) = modal.defer_ephemeral(&ctx.http).await {
+        if let Err(error) = modal.defer(&ctx.http).await {
             self.dispatcher.release_active_replace(active_id);
             tracing::error!(%error, active_id, "failed to defer Stop & Replace modal");
             return;
@@ -10966,6 +10974,7 @@ mod tests {
             sender_name: "Alice".into(),
             prompt: "Implement queue management".into(),
             attachment_count: 0,
+            recovered_from_active: true,
         }];
 
         let card = serde_json::to_string(
@@ -10980,6 +10989,7 @@ mod tests {
         assert!(card.contains("oab_queue:replace:10"));
         assert!(card.contains("Fix the failing API test"));
         assert!(card.contains("recovered after restart"));
+        assert!(card.contains("Replayed after OpenAB restart"));
 
         let reordered = serde_json::to_string(
             &queue_manager_card(&task, &active_items, &items, Some(12), None).into_message(),
@@ -11000,6 +11010,29 @@ mod tests {
         .unwrap();
         assert!(confirmation.contains("oab_queue:confirm_clear:12"));
         assert!(confirmation.contains("2"));
+    }
+
+    #[test]
+    fn empty_queue_manager_never_renders_an_empty_action_row() {
+        let task = ui_task(TaskState::Ready, None);
+        let card = serde_json::to_value(
+            queue_manager_card(&task, &[], &[], None, None).into_message(),
+        )
+        .unwrap();
+        let rows = card
+            .get("components")
+            .and_then(serde_json::Value::as_array)
+            .expect("queue manager should render action rows");
+
+        assert!(!rows.is_empty());
+        assert!(rows.iter().all(|row| {
+            row.get("components")
+                .and_then(serde_json::Value::as_array)
+                .is_some_and(|components| !components.is_empty())
+        }));
+        assert!(serde_json::to_string(&card)
+            .unwrap()
+            .contains("oab_queue:refresh"));
     }
 
     #[test]
