@@ -1758,13 +1758,66 @@ async fn main() -> anyhow::Result<()> {
             &discord_cfg.message_processing_mode,
             discord_cfg.max_buffered_messages,
         );
-        let discord_dispatcher = Arc::new(dispatch::Dispatcher::with_idle_timeout(
-            router.clone(),
-            discord_cap,
-            discord_cfg.max_batch_tokens,
-            discord_grouping,
-            discord_idle,
+        let discord_queue_path = std::env::var("HOME")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_default()
+            .join(".openab")
+            .join("discord-queue.json");
+        let discord_dispatcher = Arc::new(
+            dispatch::Dispatcher::with_idle_timeout(
+                router.clone(),
+                discord_cap,
+                discord_cfg.max_batch_tokens,
+                discord_grouping,
+                discord_idle,
+            )
+            .with_persistence(discord_queue_path),
+        );
+        let mut restored_queue_counts = std::collections::HashMap::new();
+        for summary in discord_dispatcher.persisted_queue_summaries() {
+            if summary.platform != "discord" {
+                continue;
+            }
+            let Ok(thread_id) = summary.thread_id.parse::<u64>() else {
+                warn!(thread_id = %summary.thread_id, "ignored invalid persisted Discord queue thread ID");
+                continue;
+            };
+            restored_queue_counts.insert(thread_id, summary.queued_messages);
+            if summary.recovered_active_messages > 0 {
+                warn!(
+                    thread_id,
+                    recovered = summary.recovered_active_messages,
+                    "requeuing Discord requests that were active before restart"
+                );
+            }
+        }
+        let reconciled_tasks =
+            match task_registry.reconcile_restored_queues(&restored_queue_counts) {
+                Ok(changed) if !changed.is_empty() => {
+                    info!(tasks = changed.len(), "reconciled Discord task queue metadata");
+                    changed
+                }
+                Ok(_) => Vec::new(),
+                Err(error) => {
+                    warn!(%error, "failed to reconcile restored Discord queue metadata");
+                    Vec::new()
+                }
+            };
+        let recovery_adapter = Arc::new(discord::DiscordAdapter::with_task_ui(
+            Arc::new(serenity::http::Http::new(&discord_cfg.bot_token)),
+            task_registry.clone(),
+            project_registry.clone(),
         ));
+        for task in &reconciled_tasks {
+            if let Err(error) = recovery_adapter.refresh_task_ui(task).await {
+                warn!(%error, thread_id = task.thread_id, "failed to refresh recovered Discord task UI");
+            }
+        }
+        let recovery_adapter: Arc<dyn adapter::ChatAdapter> = recovery_adapter;
+        let restored_messages = discord_dispatcher.restore_persisted(recovery_adapter);
+        if restored_messages > 0 {
+            info!(restored_messages, "restored persistent Discord dispatch queue");
+        }
         dispatchers.lock().unwrap().push(discord_dispatcher.clone());
 
         // Initialize reminder store

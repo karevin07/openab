@@ -48,7 +48,7 @@ Per-thread scope is required because conversation scope in openab = thread; per-
 | Pre-turn debouncing | Rejected; see §5.1. |
 | Topic detection / semantic grouping | Deferred to ACP agent (it has the context and inference budget). |
 | Cancelling / restarting in-flight turns | Existing `/cancel` semantics unchanged. `/cancel-all` covers buffered-message drop (Phase 1, §4.4). |
-| Persisting buffer across pod restarts | Buffer only exists during in-flight turn — restart loses the in-flight turn anyway, so buffered messages share its fate. |
+| Multi-host durable queue / exactly-once execution | The local JSON snapshot provides single-host at-least-once recovery; distributed coordination and side-effect deduplication remain out of scope. |
 | Replacing the per-connection mutex | Mutex stays exactly as RFC #78 §2b describes it. |
 
 ---
@@ -246,16 +246,15 @@ Implications for the dispatcher:
 
 **`per_thread` uses `std::sync::Mutex`, not `tokio::Mutex`.** The critical section is a synchronous `HashMap` get/insert/remove with no `.await` inside; the async-machinery cost of `tokio::Mutex` buys nothing. `generation: u64` is plain (not atomic) because every read and write happens inside the `per_thread` lock — the surrounding mutex provides ordering.
 
+**Pending payloads are explicit and addressable.** The mpsc carries stable monotonic message IDs as wakeup edges while a `PendingQueue` owned by the thread handle stores each `BufferedMessage` until the consumer takes it. Dispatch order comes from the explicit deque, so platform UI can list, edit, remove, or promote messages that have not crossed the ACP turn boundary. Removed IDs may remain in the mpsc temporarily; the consumer treats them as tombstones and skips them. Active message IDs are exposed separately; a replace claim pauses the lane after its active turn so cancellation cannot accidentally target the next request.
+
+**Discord queue persistence.** A versioned `~/.openab/discord-queue.json` snapshot stores pending and active payloads, stable IDs, lane order, routing metadata, and attachment blocks. Mutations write a mode-`0600` temporary file, flush it, then atomically rename it. On startup, prior pending messages retain their order; prior active messages are marked recovered and prepended. This is at-least-once delivery: a process failure after an agent side effect but before active completion is persisted can replay that request. Cursor tool execution itself is not checkpointed.
+
 **Disjoint from `/cancel-all`** (§4.4). `cancel_buffered_thread` removes the handle from `per_thread` *before* aborting the consumer, so any *fresh* `submit` arriving after lands on the lazily-constructed new handle — no `SendError` on that path. Producers already parked in `tx.send().await` wake with `Err` and enter the SendError → retry path; the retry's `or_insert_with` constructs a fresh consumer (the cancel removed the old entry), and the retry succeeds.
 
 **`/cancel-all` race with concurrent `submit` is intentional.** If a `submit` arrives in the window between `cancel_buffered_thread` removing the old handle and the next `submit` constructing a new one, that new `submit` creates a fresh consumer via the normal lazy-insert path. This is by design: `cancel_buffered_thread` clears only the messages buffered at cancel time; messages that arrive after the cancel are treated as a fresh conversation start.
 
-**Residual losses (same shape as a pod restart mid-turn):**
-
-- **In-flight batch in the dead consumer's frame.** Lost when the panic unwinds. These messages can't be reacted from the SendError path because their `submit` already returned `Ok` before the consumer died.
-- **Already-enqueued mpsc messages** (in the queue but not yet drained). Lost when `Receiver` drops.
-
-A future supervisor catching consumer-task panic could iterate the in-flight batch and react ❌ on each; out of Phase 1 scope.
+**Residual risk:** an in-process consumer panic does not currently restart that lane immediately. Its durable active/pending snapshot remains available for process restart, where normal recovery requeues it. A future supervisor could restart the lane without a process restart.
 
 ### 2.6 `other_bot_present` freshness
 
@@ -806,7 +805,7 @@ The rules below operationalize I3 (broker structural fidelity). Together they fo
 
 7. **Splitting only at message boundaries.** When the token-budget cap (`max_batch_tokens`) forces a batch to split across multiple ACP turns, the split must occur between two arrival events — never inside a single arrival event. A single oversized message dispatches alone; the broker does not truncate or summarize it.
 
-8. **No silent failure on consumer death (retry-failed case).** When `submit` observes `SendError` (consumer task death), it first attempts a transparent retry — evict the dead consumer, spawn a fresh one, and re-send (§2.5). The first `SendError` is absorbed silently because the dominant cause is the benign first-message-after-idle race. Only when the **retry also fails** must the failure surface as ❌ on `msg.trigger_msg` **and** `⚠️ {format_user_error}` text in the channel **and** `Err` propagated to the caller. Already-enqueued messages whose `submit` already returned `Ok` are residual loss equivalent to a pod restart mid-turn (documented; out of Phase 1 scope to recover). Messages in the consumer's in-flight batch at the time of the panic are also residual loss — their `submit` already returned `Ok` before the consumer died, so they cannot be reacted from the `SendError` path.
+8. **No silent failure on consumer death (retry-failed case).** When `submit` observes `SendError` (consumer task death), it first attempts a transparent retry — evict the dead consumer, spawn a fresh one, and re-send (§2.5). The first `SendError` is absorbed silently because the dominant cause is the benign first-message-after-idle race. Only when the **retry also fails** must the failure surface as ❌ on `msg.trigger_msg` **and** `⚠️ {format_user_error}` text in the channel **and** `Err` propagated to the caller. With persistence enabled, already-enqueued and active payloads remain in the durable snapshot for restart recovery; without it, the original residual-loss behavior remains.
 
 9. **`bot_turns` runs at ingest, not at dispatch.** Multi-bot loop guards (`slack.rs:672-696`) execute before `submit`; batching is downstream and cannot bypass them. Bot-turn-limit counts batches as turns (one ACP invocation = one logical turn); the per-message ingest counter is unchanged.
 
@@ -872,7 +871,7 @@ Applies to all batches including `batch.len() == 1` — the loop runs once for a
 
 ### 6.8 Graceful shutdown
 
-On `SIGTERM`, `Dispatcher::shutdown()` iterates active threads and logs `thread_id=…, channel=…, adapter=…, buffered_lost=N` per thread before drop. `ThreadHandle` carries `channel_id: String` and `adapter_kind: String` (set at consumer-spawn time) so the shutdown log can identify which channel lost messages without iterating `BufferedMessage` contents.
+On `SIGTERM`, `Dispatcher::shutdown()` iterates active threads and logs `buffered_preserved=N` when persistence is enabled, or `buffered_lost=N` for memory-only dispatchers. `ThreadHandle` carries `channel_id: String` and `adapter_kind: String` (set at consumer-spawn time) so the shutdown log identifies the affected channel without iterating `BufferedMessage` contents.
 
 ```rust
 // in Dispatcher::shutdown()
@@ -885,8 +884,8 @@ for (thread_id, handle) in map.iter_mut() {
             thread_id     = %thread_id,
             channel       = %handle.channel_id,
             adapter       = %handle.adapter_kind,
-            buffered_lost = pending.len(),
-            "shutdown drained pending messages without dispatch",
+            buffered_preserved = pending.len(),
+            "shutdown preserved pending messages for restart",
         );
     }
 }
@@ -894,7 +893,7 @@ for (thread_id, handle) in map.iter_mut() {
 
 `Dispatcher::shutdown()` is placed after adapter handles are joined and before `pool.shutdown()` in the `main.rs` cleanup sequence. It is synchronous (`std::sync::Mutex` + synchronous drain) — no `await`, no timeout required.
 
-Buffered state is in-memory only; pod restart loses it by design (no on-disk WAL, no Redis-backed buffer). Ops decide per `buffered_lost > 0` event whether to ask users to re-send.
+Discord buffered state is persisted to the agent home volume. `Dispatcher::shutdown()` aborts consumers without deleting the snapshot; startup restores pending work and requeues any active batch. Other adapters remain memory-only unless their dispatcher is constructed with a persistence path.
 
 ### 6.9 Scenario D smoke matrix (Phase 1 must-do)
 
