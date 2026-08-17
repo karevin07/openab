@@ -888,12 +888,22 @@ timezone = "UTC"
 |-----|------|---------|-------------|
 | `enabled` | bool | `true` | Set `false` to disable without removing the entry. |
 | `schedule` | string | *required* | Cron expression (minute, hour, day-of-month, month, day-of-week). |
-| `channel` | string | *required* | Target Discord channel/thread ID or Slack channel ID. |
-| `message` | string | *required* | Message sent to the agent as a prompt. |
+| `channel` | string | — | Target Discord/Slack channel ID. Required unless `workspace_alias` is set. |
+| `workspace_alias` | string | — | Project workspace alias without `@`. Resolved to a parent channel at fire time. |
+| `message` | string | — | Prompt sent to the agent. Required unless `action_id` is set. |
+| `action_id` | string | — | `[[discord.project_actions]]` id; workspace-local actions win over `*`. |
+| `thread_policy` | string | `"new-each-run"` | `"new-each-run"` or `"sticky"`. Sticky requires `id` and persists the thread in `$HOME/.openab/cron-threads.json`. |
+| `skip_if_handoff` | bool | `false` | Skip this tick when the target session is held by an external Cursor UI. |
+| `skip_if_busy` | bool | `false` | Skip this tick when the target session currently has an in-flight prompt. |
 | `platform` | string | `"discord"` | Target platform (`"discord"` or `"slack"`). |
 | `sender_name` | string | `"openab-cron"` | Sender attribution shown in the prompt context. |
 | `timezone` | string | `"UTC"` | IANA timezone for schedule evaluation (e.g. `"America/New_York"`, `"Europe/Berlin"`). |
 | `thread_id` | string | `""` | Optional thread ID to post into an existing thread. |
+| `id` | string | — | Stable job ID. Required for sticky baseline jobs, Discord Schedules toggles, and usercron writeback. |
+
+Discord Project Home can overlay `enabled` for jobs that have an `id` via
+`$HOME/.openab/cron-toggles.json` (no `config.toml` rewrite, no restart). Missing
+keys fall back to the TOML `enabled` value.
 
 The external `cronjob.toml` uses `[[jobs]]` (same fields). See [Usercron docs](cronjob.md#usercron--hot-reload-with-cronjobtoml) for details.
 

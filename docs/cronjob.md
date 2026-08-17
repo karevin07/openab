@@ -32,8 +32,8 @@ Each `[[cron.jobs]]` entry supports these fields:
 [[cron.jobs]]
 enabled = true                               # optional, default: true
 schedule = "0 9 * * 1-5"                    # required: cron expression
-channel = "123456789012345678"               # required: target channel ID
-message = "summarize yesterday's merged PRs" # required: prompt for the agent
+channel = "123456789012345678"               # required unless workspace_alias is set
+message = "summarize yesterday's merged PRs" # required unless action_id is set
 platform = "discord"                         # optional, default: "discord"
 sender_name = "DailyOps"                     # optional, default: "openab-cron"
 timezone = "America/New_York"                     # optional, default: "UTC"
@@ -44,12 +44,22 @@ thread_id = ""                               # optional: post to existing thread
 |-------|----------|---------|-------------|
 | `enabled` | | `true` | Set `false` to disable without removing the entry |
 | `schedule` | ✅ | — | 5-field POSIX cron expression |
-| `channel` | ✅ | — | Discord channel/thread ID, Slack channel ID, Telegram chat ID, Google Chat space name, or LINE WORKS channel ID / `user:<userId>` |
-| `message` | ✅ | — | Message sent to the agent as a prompt |
+| `channel` | | — | Discord channel/thread ID, Slack channel ID, Telegram chat ID, Google Chat space name, or LINE WORKS channel ID / `user:<userId>`. Required unless `workspace_alias` is set. |
+| `message` | | — | Message sent to the agent as a prompt. Required unless `action_id` is set. |
 | `platform` | | `"discord"` | `"discord"`, `"slack"`, `"telegram"`, `"googlechat"`, or `"lineworks"` (non-default platforms require their feature) |
 | `sender_name` | | `"openab-cron"` | Attribution shown in prompt context |
 | `timezone` | | `"UTC"` | IANA timezone (e.g. `"America/New_York"`, `"Europe/Berlin"`) |
 | `thread_id` | | — | Post into an existing thread instead of the channel |
+| `workspace_alias` | | — | Resolve the parent channel from a project/workspace alias |
+| `action_id` | | — | Use a `[[discord.project_actions]]` prompt instead of `message` |
+| `thread_policy` | | `"new-each-run"` | `"sticky"` reuses one thread; requires `id` |
+| `skip_if_handoff` | | `false` | Skip when Cursor terminal currently owns the session |
+| `skip_if_busy` | | `false` | Skip when the session already has an in-flight prompt |
+| `id` | sticky / Discord toggle | — | Stable job ID. Required for sticky threads and Project Home Schedules |
+
+Discord Project Home can pause/resume baseline jobs with an `id` via
+`$HOME/.openab/cron-toggles.json` without rewriting `config.toml`. Usercron stays
+off in deployments that must not let the agent write schedules.
 
 ## Cron Expression Format
 

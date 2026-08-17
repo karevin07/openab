@@ -806,6 +806,24 @@ impl AdapterRouter {
             .and_then(|channels| channels.remove(channel_id))
     }
 
+    /// Reverse-lookup a parent channel ID for a workspace alias (`openab` or `@openab`).
+    pub fn channel_id_for_workspace_alias(&self, platform: &str, alias: &str) -> Option<String> {
+        let wanted = alias.trim().trim_start_matches('@');
+        if wanted.is_empty() {
+            return None;
+        }
+        self.workspace_channels
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(platform)
+            .and_then(|channels| {
+                channels.iter().find_map(|(channel_id, spec)| {
+                    let spec_alias = spec.trim().trim_start_matches('@');
+                    (spec_alias == wanted).then_some(channel_id.clone())
+                })
+            })
+    }
+
     /// Pack one arrival event into ContentBlocks. Per-arrival layout:
     ///   Text { "<sender_context>\n{json}\n</sender_context>" }   <- delimiter
     ///   [Text blocks from extra_blocks (e.g. STT transcripts)]

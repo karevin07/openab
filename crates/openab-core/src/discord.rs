@@ -5,8 +5,11 @@ use crate::adapter::{
 };
 use crate::bot_turns::{BotTurnTracker, TurnAction, TurnSeverity, BOT_TURN_LIMIT_WARNING_PREFIX};
 use crate::config::{
-    AllowBots, AllowUsers, DiscordProjectActionConfig, DiscordProjectCommandConfig,
-    DiscordProjectCommandRunner, SttConfig,
+    resolve_project_action, AllowBots, AllowUsers, CronJobConfig, DiscordProjectActionConfig,
+    DiscordProjectCommandConfig, DiscordProjectCommandRunner, SttConfig,
+};
+use crate::cron::{
+    job_applies_to_project, next_run_unix, sticky_thread_id_for, CronToggleStore,
 };
 use crate::discord_admin::{
     AdminInventory, AdminStatus, CategoryPlan, ChannelPlan, CleanupCandidates, CreatedCategory,
@@ -45,6 +48,7 @@ use serenity::model::id::{ChannelId, MessageId, UserId};
 use serenity::model::permissions::Permissions;
 use serenity::prelude::*;
 use std::collections::{HashMap, HashSet};
+use std::path::PathBuf;
 use std::sync::LazyLock;
 use std::sync::{Arc, OnceLock};
 use tracing::{debug, error, info, warn};
@@ -940,6 +944,9 @@ fn project_welcome_components(tasks: &[TaskRecord]) -> Vec<CreateActionRow> {
         CreateButton::new("oab_project:commands")
             .label("⌨ Repository commands")
             .style(ButtonStyle::Secondary),
+        CreateButton::new("oab_project:schedules")
+            .label("📅 Schedules")
+            .style(ButtonStyle::Secondary),
     ]));
     if !tasks.is_empty() {
         let options = tasks
@@ -963,6 +970,159 @@ fn project_welcome_components(tasks: &[TaskRecord]) -> Vec<CreateActionRow> {
         ));
     }
     rows
+}
+
+#[derive(Debug, Clone)]
+struct CronScheduleView {
+    id: String,
+    label: String,
+    enabled: bool,
+    summary: String,
+    next_unix: Option<i64>,
+    thread_id: Option<String>,
+}
+
+fn describe_cron_schedule(schedule: &str, timezone: &str) -> String {
+    let parts: Vec<_> = schedule.split_whitespace().collect();
+    if parts.len() == 5 && parts[2] == "*" && parts[3] == "*" {
+        let minute = parts[0];
+        let hour = parts[1];
+        if minute.chars().all(|c| c.is_ascii_digit()) && hour.chars().all(|c| c.is_ascii_digit()) {
+            let when = match parts[4] {
+                "*" => "每天",
+                "1-5" => "週一至週五",
+                "0" | "7" => "每週日",
+                _ => {
+                    return format!("{schedule} · {timezone}");
+                }
+            };
+            return format!("{when} {hour:0>2}:{minute:0>2}（{timezone}）");
+        }
+    }
+    format!("{schedule} · {timezone}")
+}
+
+fn cron_job_label(job: &CronJobConfig, actions: &[DiscordProjectActionConfig]) -> String {
+    if let Some(action_id) = job.normalized_action_id() {
+        let alias = job.normalized_workspace_alias().unwrap_or("*");
+        if let Some(action) = resolve_project_action(actions, alias, action_id) {
+            let label = action.label.trim();
+            if !label.is_empty() {
+                return label.to_string();
+            }
+        }
+    }
+    if !job.sender_name.trim().is_empty() {
+        return job.sender_name.trim().to_string();
+    }
+    job.sticky_key().unwrap_or("schedule").to_string()
+}
+
+fn cron_schedule_views(
+    jobs: &[CronJobConfig],
+    toggles: &CronToggleStore,
+    actions: &[DiscordProjectActionConfig],
+    sticky_path: Option<&std::path::Path>,
+    workspace_alias: &str,
+    channel_id: &str,
+) -> Vec<CronScheduleView> {
+    let channel = channel_id.to_string();
+    jobs.iter()
+        .filter(|job| job_applies_to_project(job, workspace_alias, &channel))
+        .filter_map(|job| {
+            let id = job.sticky_key()?.to_string();
+            Some(CronScheduleView {
+                id: id.clone(),
+                label: cron_job_label(job, actions),
+                enabled: toggles.effective_enabled(job),
+                summary: describe_cron_schedule(&job.schedule, &job.timezone),
+                next_unix: next_run_unix(&job.schedule, &job.timezone),
+                thread_id: sticky_path.and_then(|path| sticky_thread_id_for(path, &id)),
+            })
+        })
+        .collect()
+}
+
+fn schedules_message(
+    binding: &ProjectBinding,
+    views: &[CronScheduleView],
+) -> CreateInteractionResponseMessage {
+    let mut embed = CreateEmbed::new()
+        .title(format!("📅 @{} · Schedules", binding.workspace_alias))
+        .description(
+            "打開後會在排程時間寫入同一個 sticky thread。關掉只跳過之後的執行，不會刪除舊摘要。Run now 可立刻跑一輪，不必先打開排程。",
+        )
+        .colour(0x1ABC9C)
+        .field(
+            "Repository",
+            inline_code(&format!("@{}", binding.workspace_alias)),
+            true,
+        );
+    if views.is_empty() {
+        return CreateInteractionResponseMessage::new()
+            .embed(embed.field(
+                "尚未設定",
+                "這個 repository 沒有可管理的 `[[cron.jobs]]`。請由管理者在設定檔加入帶 `id` 的 job。",
+                false,
+            ))
+            .ephemeral(true);
+    }
+
+    let mut rows = Vec::new();
+    for view in views.iter().take(5) {
+        let status = if view.enabled { "On" } else { "Off" };
+        let next = view
+            .next_unix
+            .map(|ts| format!("<t:{ts}:t> · <t:{ts}:R>"))
+            .unwrap_or_else(|| "—".into());
+        let thread = view
+            .thread_id
+            .as_deref()
+            .map(|id| format!("<#{}>", id))
+            .unwrap_or_else(|| "_尚未建立_".into());
+        embed = embed.field(
+            format!("{} · {status}", view.label),
+            format!("{}\n下次：{next}\nThread：{thread}", view.summary),
+            false,
+        );
+        if format!("oab_cron:toggle:{}", view.id).len() > 100
+            || format!("oab_cron:run:{}", view.id).len() > 100
+        {
+            continue;
+        }
+        rows.push(CreateActionRow::Buttons(vec![
+            CreateButton::new(format!("oab_cron:toggle:{}", view.id))
+                .label(truncate_for_discord(
+                    &format!(
+                        "{} · {}",
+                        view.label,
+                        if view.enabled { "On" } else { "Off" }
+                    ),
+                    80,
+                ))
+                .style(if view.enabled {
+                    ButtonStyle::Success
+                } else {
+                    ButtonStyle::Secondary
+                }),
+            CreateButton::new(format!("oab_cron:run:{}", view.id))
+                .label("Run now")
+                .style(ButtonStyle::Primary),
+        ]));
+    }
+    if views.len() > 5 {
+        embed = embed.footer(CreateEmbedFooter::new(format!(
+            "顯示前 5 個，共 {} 個 schedules",
+            views.len()
+        )));
+    }
+    let mut message = CreateInteractionResponseMessage::new()
+        .embed(embed)
+        .ephemeral(true);
+    if !rows.is_empty() {
+        message = message.components(rows);
+    }
+    message
 }
 
 fn project_actions_message(
@@ -2955,6 +3115,14 @@ pub struct Handler {
     pub project_commands: Vec<DiscordProjectCommandConfig>,
     /// Prevent duplicate clicks from running the same command concurrently.
     pub project_command_runs: tokio::sync::Mutex<HashSet<String>>,
+    /// Baseline cron jobs from config.toml (Discord Schedules UI).
+    pub cron_jobs: Vec<CronJobConfig>,
+    /// Discord overlay for cron `enabled` (persisted outside config.toml).
+    pub cron_toggles: Arc<CronToggleStore>,
+    /// Request an immediate cron firing from the scheduler.
+    pub cron_run_now: Option<tokio::sync::mpsc::UnboundedSender<String>>,
+    /// Sticky cron thread map path (`~/.openab/cron-threads.json`).
+    pub cron_sticky_path: Option<PathBuf>,
     /// Optional client for the isolated Discord Admin Bot control plane.
     pub admin_control: Option<DiscordAdminClient>,
     /// Optional client for the isolated Git push broker.
@@ -4532,6 +4700,9 @@ impl EventHandler for Handler {
             {
                 self.handle_project_command_control(&ctx, &comp).await;
             }
+            Interaction::Component(comp) if comp.data.custom_id.starts_with("oab_cron:") => {
+                self.handle_cron_component(&ctx, &comp).await;
+            }
             Interaction::Component(comp) if comp.data.custom_id.starts_with("oab_project:") => {
                 self.handle_project_component(&ctx, &comp).await;
             }
@@ -4648,6 +4819,17 @@ impl Handler {
 
     fn project_commands_for(&self, workspace_alias: &str) -> Vec<&DiscordProjectCommandConfig> {
         project_commands_for_workspace(&self.project_commands, workspace_alias)
+    }
+
+    fn cron_views_for(&self, binding: &ProjectBinding) -> Vec<CronScheduleView> {
+        cron_schedule_views(
+            &self.cron_jobs,
+            &self.cron_toggles,
+            &self.project_actions,
+            self.cron_sticky_path.as_deref(),
+            &binding.workspace_alias,
+            &binding.channel_id.to_string(),
+        )
     }
 
     fn project_command_for(
@@ -7979,6 +8161,152 @@ impl Handler {
             .await;
     }
 
+    async fn handle_cron_component(
+        &self,
+        ctx: &Context,
+        comp: &serenity::model::application::ComponentInteraction,
+    ) {
+        let content = if comp.user.bot {
+            Some("🤖 Bots cannot use schedule controls.".to_string())
+        } else if is_denied_user(
+            false,
+            self.allow_all_users,
+            &self.allowed_users,
+            comp.user.id.get(),
+        ) {
+            Some("🚫 You are not allowed to use this bot.".to_string())
+        } else {
+            None
+        };
+        if let Some(content) = content {
+            let response = CreateInteractionResponse::Message(
+                CreateInteractionResponseMessage::new()
+                    .content(content)
+                    .ephemeral(true),
+            );
+            let _ = comp.create_response(&ctx.http, response).await;
+            return;
+        }
+
+        let Some(binding) = self
+            .project_registry
+            .binding_for_channel(comp.channel_id.get())
+        else {
+            let response = CreateInteractionResponse::Message(
+                CreateInteractionResponseMessage::new()
+                    .content("⚠️ This channel is no longer linked to an OpenAB project.")
+                    .ephemeral(true),
+            );
+            let _ = comp.create_response(&ctx.http, response).await;
+            return;
+        };
+
+        let rest = comp
+            .data
+            .custom_id
+            .strip_prefix("oab_cron:")
+            .unwrap_or("");
+        let (action, job_id) = rest
+            .split_once(':')
+            .map(|(action, id)| (action, id.trim()))
+            .unwrap_or(("", ""));
+        if job_id.is_empty()
+            || job_id.contains(':')
+            || !job_id
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
+        {
+            let response = CreateInteractionResponse::Message(
+                CreateInteractionResponseMessage::new()
+                    .content("⚠️ Unknown schedule control.")
+                    .ephemeral(true),
+            );
+            let _ = comp.create_response(&ctx.http, response).await;
+            return;
+        }
+
+        let Some(job) = self.cron_jobs.iter().find(|job| job.sticky_key() == Some(job_id))
+        else {
+            let response = CreateInteractionResponse::Message(
+                CreateInteractionResponseMessage::new()
+                    .content("⚠️ That schedule no longer exists.")
+                    .ephemeral(true),
+            );
+            let _ = comp.create_response(&ctx.http, response).await;
+            return;
+        };
+        if !job_applies_to_project(job, &binding.workspace_alias, &binding.channel_id.to_string())
+        {
+            let response = CreateInteractionResponse::Message(
+                CreateInteractionResponseMessage::new()
+                    .content("⚠️ That schedule belongs to another project.")
+                    .ephemeral(true),
+            );
+            let _ = comp.create_response(&ctx.http, response).await;
+            return;
+        }
+
+        match action {
+            "toggle" => {
+                let next = !self.cron_toggles.effective_enabled(job);
+                if let Err(error) = self.cron_toggles.set_enabled(job_id, next) {
+                    let response = CreateInteractionResponse::Message(
+                        CreateInteractionResponseMessage::new()
+                            .content(format!("⚠️ Could not save schedule toggle: {error}"))
+                            .ephemeral(true),
+                    );
+                    let _ = comp.create_response(&ctx.http, response).await;
+                    return;
+                }
+                info!(
+                    id = job_id,
+                    enabled = next,
+                    user = comp.user.id.get(),
+                    "discord cron toggle"
+                );
+                let views = self.cron_views_for(&binding);
+                let response =
+                    CreateInteractionResponse::UpdateMessage(schedules_message(&binding, &views));
+                if let Err(error) = comp.create_response(&ctx.http, response).await {
+                    tracing::error!(%error, "failed to refresh schedules after toggle");
+                }
+            }
+            "run" => {
+                let label = cron_job_label(job, &self.project_actions);
+                let content = match &self.cron_run_now {
+                    Some(tx) => match tx.send(job_id.to_string()) {
+                        Ok(()) => {
+                            info!(
+                                id = job_id,
+                                user = comp.user.id.get(),
+                                "discord cron run-now"
+                            );
+                            format!(
+                                "✅ 已送出 **{label}**。結果會寫在這個 project 的 sticky thread。"
+                            )
+                        }
+                        Err(_) => "⚠️ 排程器目前無法執行，請查看 openab-cursor logs。".into(),
+                    },
+                    None => "⚠️ 排程器未啟動。".into(),
+                };
+                let response = CreateInteractionResponse::Message(
+                    CreateInteractionResponseMessage::new()
+                        .content(content)
+                        .ephemeral(true),
+                );
+                let _ = comp.create_response(&ctx.http, response).await;
+            }
+            _ => {
+                let response = CreateInteractionResponse::Message(
+                    CreateInteractionResponseMessage::new()
+                        .content("⚠️ Unknown schedule control.")
+                        .ephemeral(true),
+                );
+                let _ = comp.create_response(&ctx.http, response).await;
+            }
+        }
+    }
+
     async fn handle_project_component(
         &self,
         ctx: &Context,
@@ -8067,6 +8395,14 @@ impl Handler {
             ));
             if let Err(error) = comp.create_response(&ctx.http, response).await {
                 tracing::error!(%error, "failed to open repository commands");
+            }
+            return;
+        }
+        if action == "schedules" {
+            let views = self.cron_views_for(&binding);
+            let response = CreateInteractionResponse::Message(schedules_message(&binding, &views));
+            if let Err(error) = comp.create_response(&ctx.http, response).await {
+                tracing::error!(%error, "failed to open project schedules");
             }
             return;
         }
@@ -11179,11 +11515,45 @@ mod tests {
         assert!(project.contains("oab_project:sessions"));
         assert!(project.contains("oab_project:actions"));
         assert!(project.contains("oab_project:commands"));
+        assert!(project.contains("oab_project:schedules"));
         assert!(project.contains("Task templates"));
+        assert!(project.contains("Schedules"));
 
         let admin = serde_json::to_string(&admin_navigation_buttons()).unwrap();
         assert!(admin.contains("oab_admin:cleanup"));
         assert!(admin.contains("oab_admin:channel_setup"));
+    }
+
+    #[test]
+    fn schedules_card_exposes_toggle_and_run_now() {
+        let binding = ui_binding();
+        let views = vec![CronScheduleView {
+            id: "api-daily".into(),
+            label: "Daily summary".into(),
+            enabled: false,
+            summary: "每天 09:00（Asia/Taipei）".into(),
+            next_unix: Some(1_700_000_000),
+            thread_id: Some("99".into()),
+        }];
+        let card = serde_json::to_string(&schedules_message(&binding, &views)).unwrap();
+        assert!(card.contains("oab_cron:toggle:api-daily"));
+        assert!(card.contains("oab_cron:run:api-daily"));
+        assert!(card.contains("Daily summary · Off"));
+        assert!(card.contains("Run now"));
+        assert!(card.contains("<#99>"));
+        assert!(card.contains("<t:1700000000:R>"));
+    }
+
+    #[test]
+    fn describe_cron_schedule_formats_daily_taipei() {
+        assert_eq!(
+            describe_cron_schedule("0 9 * * *", "Asia/Taipei"),
+            "每天 09:00（Asia/Taipei）"
+        );
+        assert_eq!(
+            describe_cron_schedule("0 9 * * 1-5", "Asia/Taipei"),
+            "週一至週五 09:00（Asia/Taipei）"
+        );
     }
 
     #[test]
