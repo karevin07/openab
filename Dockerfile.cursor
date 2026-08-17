@@ -1,6 +1,8 @@
 # --- Build stage ---
 FROM rust:1-bookworm AS builder
 WORKDIR /build
+# Discord-only worker: skip Slack, AWS/S3, AgentCore, and other default extras.
+ARG OPENAB_CARGO_FEATURES=discord
 COPY Cargo.toml Cargo.lock ./
 COPY crates/openab-core/Cargo.toml crates/openab-core/Cargo.toml
 COPY crates/openab-gateway/Cargo.toml crates/openab-gateway/Cargo.toml
@@ -10,38 +12,39 @@ RUN mkdir -p src crates/openab-core/src crates/openab-gateway/src crates/openab-
     && echo '' > crates/openab-core/src/lib.rs \
     && echo '' > crates/openab-gateway/src/lib.rs \
     && echo '' > crates/openab-mcp/src/lib.rs \
-    && cargo build --release \
+    && cargo build --release --no-default-features --features "${OPENAB_CARGO_FEATURES}" \
     && rm -rf src crates/openab-core/src crates/openab-gateway/src crates/openab-mcp/src
 COPY crates/ crates/
 COPY src/ src/
-RUN touch src/main.rs crates/openab-core/src/lib.rs crates/openab-gateway/src/lib.rs crates/openab-mcp/src/lib.rs && cargo build --release
+RUN touch src/main.rs crates/openab-core/src/lib.rs crates/openab-gateway/src/lib.rs crates/openab-mcp/src/lib.rs \
+    && cargo build --release --no-default-features --features "${OPENAB_CARGO_FEATURES}" \
+    && strip --strip-unneeded target/release/openab
 
 # --- Runtime stage ---
 FROM debian:trixie-slim
-RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates curl make procps python3-minimal ripgrep tini unzip && rm -rf /var/lib/apt/lists/*
-
-# Install Cursor Agent CLI (pinned version)
+# git is installed directly so local commits still work without the gh CLI.
+# curl/unzip are build-only: install Cursor CLI in this layer, then purge them.
+# Use Cursor's bundled rg instead of Debian ripgrep.
+#
 # Tarball source: https://downloads.cursor.com/lab/<version>/linux/<arch>/agent-cli-package.tar.gz
 # URL scheme scraped from Cursor's official downloads page — no apt/yum package exists.
 # If Cursor changes this pattern, the build fails with curl 404. Monitor
 # https://cursor.com/cli or https://docs.cursor.com/cli for version/URL updates.
 ARG CURSOR_VERSION=2026.06.19-20-24-33-653a7fb
-RUN ARCH=$(dpkg --print-architecture) && \
-    if [ "$ARCH" = "arm64" ]; then ARCH=arm64; else ARCH=x64; fi && \
-    curl -fSL "https://downloads.cursor.com/lab/${CURSOR_VERSION}/linux/${ARCH}/agent-cli-package.tar.gz" \
-      -o /tmp/cursor.tar.gz && \
-    tar xzf /tmp/cursor.tar.gz -C /opt && \
-    mv /opt/dist-package /opt/cursor-agent && \
-    ln -s /opt/cursor-agent/cursor-agent /usr/local/bin/cursor-agent && \
-    rm /tmp/cursor.tar.gz
-
-# Install gh CLI (for auth and token management)
-RUN curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg \
-      -o /usr/share/keyrings/githubcli-archive-keyring.gpg && \
-    echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/githubcli-archive-keyring.gpg] https://cli.github.com/packages stable main" \
-      > /etc/apt/sources.list.d/github-cli.list && \
-    apt-get update && apt-get install -y --no-install-recommends gh && \
-    rm -rf /var/lib/apt/lists/*
+RUN apt-get update && apt-get install -y --no-install-recommends \
+      ca-certificates curl git make procps python3-minimal tini unzip \
+    && ARCH=$(dpkg --print-architecture) \
+    && if [ "$ARCH" = "arm64" ]; then ARCH=arm64; else ARCH=x64; fi \
+    && curl -fSL "https://downloads.cursor.com/lab/${CURSOR_VERSION}/linux/${ARCH}/agent-cli-package.tar.gz" \
+         -o /tmp/cursor.tar.gz \
+    && tar xzf /tmp/cursor.tar.gz -C /opt \
+    && mv /opt/dist-package /opt/cursor-agent \
+    && ln -s /opt/cursor-agent/cursor-agent /usr/local/bin/cursor-agent \
+    && ln -s /opt/cursor-agent/rg /usr/local/bin/rg \
+    && rm /tmp/cursor.tar.gz \
+    && apt-get purge -y curl unzip \
+    && apt-get autoremove -y --purge \
+    && rm -rf /var/lib/apt/lists/*
 
 RUN useradd -m -s /bin/bash -u 1000 agent
 ENV HOME=/home/agent
