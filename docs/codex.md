@@ -210,76 +210,14 @@ kubectl exec -it deployment/openab-codex -- \
 
 ## Sending Generated Images Back to Discord
 
-OpenAB streams text over ACP only. It does **not** relay image attachments from
-Codex back to Discord. To send a generated image, Codex must call the Discord
-REST API directly. See [sendimages.md](sendimages.md) for the full protocol.
-
-The agent should:
-
-1. Read `thread_id` from OpenAB's `<sender_context>` and use it as the Discord
-   target channel. If `thread_id` is absent, fall back to `channel_id`.
-2. Upload the file with `POST /channels/{id}/messages` using multipart form
-   data.
-3. Read the token from `DISCORD_FILE_BOT_TOKEN` if available, otherwise
-   `DISCORD_BOT_TOKEN`.
-
-Example upload from inside the pod:
-
-```bash
-THREAD_ID="1499442140172910654"
-IMAGE="/home/node/sky-birds.png"
-
-curl -X POST "https://discord.com/api/v10/channels/${THREAD_ID}/messages" \
-  -H "Authorization: Bot ${DISCORD_FILE_BOT_TOKEN:-$DISCORD_BOT_TOKEN}" \
-  -F "content=Here is the generated image" \
-  -F "files[0]=@${IMAGE}"
-```
-
-### Agent Environment for Uploads
-
-The Discord bot token configured under `[discord]` is consumed by OpenAB itself.
-For safety, OpenAB clears the inherited environment before spawning the agent and
-only passes variables listed in `[agent].env`. If Codex should upload images
-itself, explicitly expose an upload token to the agent:
-
-```toml
-[agent]
-# command defaults from the image's OPENAB_AGENT_COMMAND
-# Only override if you need non-default behavior
-env = { DISCORD_FILE_BOT_TOKEN = "${DISCORD_FILE_BOT_TOKEN}" }
-```
-
-For production, prefer a dedicated "File Deliverer" Discord bot with only
-`Send Messages`, `Send Messages in Threads`, and `Attach Files` permissions.
-For small personal deployments, using the same bot token is simpler but gives
-the agent the same Discord permissions as the main OpenAB bot.
-
-## Recommended Skill
-
-For repeated image requests, save the imagegen + Discord upload workflow as a
-Codex skill under `/home/node/.codex/skills/`, for example:
+Save a PNG inside the current workspace, then begin the final reply with
+`[[attach:relative/path.png]]`. OpenAB uploads it. See
+[sendimages.md](sendimages.md). Do not pass a Discord bot token to the agent
+or call the Discord REST API.
 
 ```text
-/home/node/.codex/skills/discord-imagegen-deliver/
-+-- SKILL.md
-`-- scripts/
-    `-- send-discord-image.sh
-```
-
-The skill should instruct Codex to:
-
-- Use the built-in `imagegen` skill and `image_gen` tool for raster images.
-- Keep the generated image size as-is unless the user explicitly asks for
-  resizing.
-- Copy the selected file from `/home/node/.codex/generated_images/...` to a
-  stable path under `/home/node`.
-- Upload it to `thread_id` or `channel_id` using the Discord REST API.
-- Avoid printing token values.
-
-Example user prompt after creating such a skill:
-
-```text
-Use $discord-imagegen-deliver to generate a warm hand-painted sky with birds and send it back to this Discord thread.
+[[attach:sky-birds.png]]
+Here is the generated image.
 ```
 
 ## Direct Codex CLI Approval Policy & Auto-review
@@ -434,17 +372,11 @@ Check whether an image was generated even if the CLI has not returned yet:
 find /home/node/.codex/generated_images -type f -name '*.png' -printf '%T@ %p %s\n' | sort -n | tail
 ```
 
-If a file exists, copy it to a stable path and upload it manually with the
-Discord API command above.
+If a file exists, copy it into the workspace and send it with
+`[[attach:relative/path.png]]` (see [sendimages.md](sendimages.md)).
 
 ### No image upload appears in Discord
 
-Verify the agent can see an upload token:
-
-```bash
-kubectl exec -it deployment/openab-codex -- \
-  sh -lc 'test -n "$DISCORD_FILE_BOT_TOKEN$DISCORD_BOT_TOKEN" && echo token-present || echo token-missing'
-```
-
-Also confirm the bot has `Send Messages`, `Send Messages in Threads`, and
-`Attach Files` permissions in the target channel or thread.
+Confirm the final agent reply **starts** with `[[attach:relative/path.png]]`,
+the path is workspace-relative PNG, and the file exists. OpenAB uploads it;
+the agent does not need `DISCORD_BOT_TOKEN`.
