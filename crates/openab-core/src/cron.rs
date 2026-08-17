@@ -1,9 +1,10 @@
 use crate::adapter::{AdapterRouter, ChannelRef, ChatAdapter, SenderContext};
-use crate::config::CronJobConfig;
+use crate::config::{CronJobConfig, CronThreadPolicy};
 use crate::format;
 use chrono::{Timelike, Utc};
 use chrono_tz::Tz;
 use cron::Schedule;
+use serde::Serialize;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
@@ -246,8 +247,8 @@ const VALID_PLATFORMS: &[&str] = &["discord", "slack", "telegram", "googlechat",
 /// silently deliver to the flat channel instead.
 const CRON_THREADLESS_PLATFORMS: &[&str] = &["googlechat", "lineworks"];
 
-fn should_create_cron_thread(job: &CronJobConfig) -> bool {
-    job.thread_id.is_none() && !CRON_THREADLESS_PLATFORMS.contains(&job.platform.as_str())
+fn should_create_cron_thread(job: &CronJobConfig, resolved_thread_id: Option<&str>) -> bool {
+    resolved_thread_id.is_none() && !CRON_THREADLESS_PLATFORMS.contains(&job.platform.as_str())
 }
 
 fn cron_sender_thread_id(channel: &ChannelRef) -> Option<String> {
@@ -263,7 +264,9 @@ pub fn validate_cronjobs(
     configured_platforms: &[&str],
 ) -> anyhow::Result<()> {
     for (i, job) in cronjobs.iter().enumerate() {
-        if !job.enabled {
+        // Disabled jobs with an id can be turned on from Discord without a
+        // restart, so they still need a valid schedule and routing.
+        if !job.enabled && job.sticky_key().is_none() {
             continue;
         }
         parse_cron_expr(&job.schedule).map_err(|e| {
@@ -291,6 +294,29 @@ pub fn validate_cronjobs(
         if job.disable_on_success.is_some() {
             anyhow::bail!(
                 "cronjobs[{i}]: disable_on_success is only supported in usercron [[jobs]], not baseline [[cron.jobs]]"
+            );
+        }
+        validate_cronjob_routing(job).map_err(|e| anyhow::anyhow!("cronjobs[{i}]: {e}"))?;
+    }
+    Ok(())
+}
+
+fn validate_cronjob_routing(job: &CronJobConfig) -> Result<(), String> {
+    if !job.has_channel_target() {
+        return Err(
+            "set channel or workspace_alias so the scheduler knows where to post".into(),
+        );
+    }
+    if !job.has_prompt_source() {
+        return Err("set message or action_id so the scheduler has a prompt".into());
+    }
+    if job.thread_policy == CronThreadPolicy::Sticky && job.sticky_key().is_none() {
+        return Err("thread_policy = \"sticky\" requires id".into());
+    }
+    if let Some(alias) = job.workspace_alias.as_deref() {
+        if alias.trim().is_empty() || alias.trim() != alias || alias.starts_with('@') {
+            return Err(
+                "workspace_alias must be a non-empty trimmed alias without the leading @".into(),
             );
         }
     }
@@ -359,6 +385,10 @@ pub fn load_usercron_file(path: &Path, configured_platforms: &[&str]) -> Vec<Cro
                 return false;
             }
         }
+        if let Err(e) = validate_cronjob_routing(job) {
+            warn!(index = i, error = %e, "usercron: invalid routing, skipping");
+            return false;
+        }
         true
     }).map(|(_, job)| job).collect()
 }
@@ -366,6 +396,241 @@ pub fn load_usercron_file(path: &Path, configured_platforms: &[&str]) -> Vec<Cro
 /// Get file mtime, returns None if file doesn't exist or metadata fails.
 fn file_mtime(path: &Path) -> Option<SystemTime> {
     std::fs::metadata(path).ok().and_then(|m| m.modified().ok())
+}
+
+/// Optional runtime hooks so cron can resolve project channels, reuse action
+/// prompts, skip busy sessions, and honour Discord pause/resume overlays.
+#[derive(Clone, Default)]
+pub struct CronBindings {
+    pub resolve_channel: Option<Arc<dyn Fn(&str, &str) -> Option<String> + Send + Sync>>,
+    pub resolve_action_prompt: Option<Arc<dyn Fn(&str, &str) -> Option<String> + Send + Sync>>,
+    pub session: Option<Arc<dyn CronSessionView>>,
+    pub sticky_store_path: Option<PathBuf>,
+    pub toggles: Option<Arc<CronToggleStore>>,
+}
+
+/// Discord (or operator) overlay for `enabled`, persisted outside config.toml so
+/// Cursor cannot rewrite the schedule file. Missing keys fall back to the TOML value.
+#[derive(Debug)]
+pub struct CronToggleStore {
+    path: PathBuf,
+    inner: std::sync::RwLock<HashMap<String, bool>>,
+}
+
+impl CronToggleStore {
+    pub fn load(path: PathBuf) -> Self {
+        let map = load_json_map(&path);
+        Self {
+            path,
+            inner: std::sync::RwLock::new(map),
+        }
+    }
+
+    pub fn in_memory() -> Self {
+        Self {
+            path: PathBuf::new(),
+            inner: std::sync::RwLock::new(HashMap::new()),
+        }
+    }
+
+    fn read_map(&self) -> std::sync::RwLockReadGuard<'_, HashMap<String, bool>> {
+        self.inner
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    fn write_map(&self) -> std::sync::RwLockWriteGuard<'_, HashMap<String, bool>> {
+        self.inner
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    pub fn effective_enabled(&self, job: &CronJobConfig) -> bool {
+        match job.sticky_key() {
+            Some(id) => self.read_map().get(id).copied().unwrap_or(job.enabled),
+            None => job.enabled,
+        }
+    }
+
+    pub fn set_enabled(&self, id: &str, enabled: bool) -> std::io::Result<()> {
+        let mut map = self.write_map();
+        map.insert(id.to_string(), enabled);
+        if self.path.as_os_str().is_empty() {
+            return Ok(());
+        }
+        save_json_pretty(&self.path, &*map)
+    }
+}
+
+pub fn effective_job_enabled(job: &CronJobConfig, bindings: &CronBindings) -> bool {
+    match &bindings.toggles {
+        Some(store) => store.effective_enabled(job),
+        None => job.enabled,
+    }
+}
+
+/// True when this job belongs on a Discord project home.
+pub fn job_applies_to_project(
+    job: &CronJobConfig,
+    workspace_alias: &str,
+    channel_id: &str,
+) -> bool {
+    if job.platform != "discord" {
+        return false;
+    }
+    if let Some(alias) = job.normalized_workspace_alias() {
+        let wanted = workspace_alias.trim().trim_start_matches('@');
+        return alias == "*" || alias == wanted;
+    }
+    !channel_id.is_empty() && job.channel.trim() == channel_id
+}
+
+/// Next fire time as a Unix timestamp, or `None` if the schedule/timezone is invalid.
+pub fn next_run_unix(schedule: &str, timezone: &str) -> Option<i64> {
+    let parsed = parse_cron_expr(schedule).ok()?;
+    let tz: Tz = timezone.parse().ok()?;
+    let now = Utc::now().with_timezone(&tz);
+    parsed.after(&now).next().map(|when| when.timestamp())
+}
+
+pub fn sticky_thread_id_for(path: &Path, job_id: &str) -> Option<String> {
+    load_json_map::<String>(path).remove(job_id)
+}
+
+#[async_trait::async_trait]
+pub trait CronSessionView: Send + Sync {
+    async fn is_externally_detached(&self, thread_key: &str) -> bool;
+    async fn is_prompt_in_flight(&self, thread_key: &str) -> bool;
+}
+
+#[async_trait::async_trait]
+impl CronSessionView for crate::acp::pool::SessionPool {
+    async fn is_externally_detached(&self, thread_key: &str) -> bool {
+        self.session_snapshot(thread_key).await.externally_detached
+    }
+
+    async fn is_prompt_in_flight(&self, thread_key: &str) -> bool {
+        self.prompt_in_flight(thread_key).await
+    }
+}
+
+fn resolved_channel(job: &CronJobConfig, bindings: &CronBindings) -> Option<String> {
+    if let Some(alias) = job.normalized_workspace_alias() {
+        if let Some(resolve) = &bindings.resolve_channel {
+            if let Some(channel) = resolve(&job.platform, alias) {
+                return Some(channel);
+            }
+        }
+        if job.channel.trim().is_empty() {
+            return None;
+        }
+    }
+    let channel = job.channel.trim();
+    (!channel.is_empty()).then(|| channel.to_string())
+}
+
+fn resolved_prompt(job: &CronJobConfig, bindings: &CronBindings) -> Option<String> {
+    if let Some(action_id) = job.normalized_action_id() {
+        let alias = job.normalized_workspace_alias().unwrap_or("*");
+        if let Some(resolve) = &bindings.resolve_action_prompt {
+            if let Some(prompt) = resolve(alias, action_id) {
+                return Some(prompt);
+            }
+        }
+        if job.message.trim().is_empty() {
+            return None;
+        }
+    }
+    let message = job.message.trim();
+    (!message.is_empty()).then(|| job.message.clone())
+}
+
+fn sticky_thread_id(job: &CronJobConfig, bindings: &CronBindings) -> Option<String> {
+    if job.thread_policy != CronThreadPolicy::Sticky {
+        return None;
+    }
+    let key = job.sticky_key()?;
+    let path = bindings.sticky_store_path.as_ref()?;
+    load_sticky_threads(path).remove(key)
+}
+
+fn persist_sticky_thread(job: &CronJobConfig, bindings: &CronBindings, thread_id: &str) {
+    if job.thread_policy != CronThreadPolicy::Sticky {
+        return;
+    }
+    let Some(key) = job.sticky_key() else {
+        return;
+    };
+    let Some(path) = bindings.sticky_store_path.as_ref() else {
+        warn!(id = key, "sticky cronjob has no store path, thread_id will not persist");
+        return;
+    };
+    let mut map = load_sticky_threads(path);
+    map.insert(key.to_string(), thread_id.to_string());
+    if let Err(error) = save_sticky_threads(path, &map) {
+        warn!(id = key, %error, "failed to persist sticky cron thread");
+    }
+}
+
+fn load_sticky_threads(path: &Path) -> HashMap<String, String> {
+    load_json_map(path)
+}
+
+fn save_sticky_threads(path: &Path, map: &HashMap<String, String>) -> std::io::Result<()> {
+    save_json_pretty(path, map)
+}
+
+fn load_json_map<V: serde::de::DeserializeOwned>(path: &Path) -> HashMap<String, V> {
+    std::fs::read_to_string(path)
+        .ok()
+        .and_then(|body| serde_json::from_str(&body).ok())
+        .unwrap_or_default()
+}
+
+fn save_json_pretty<T: Serialize>(path: &Path, value: &T) -> std::io::Result<()> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let data = serde_json::to_vec_pretty(value)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+    let tmp = path.with_extension("json.tmp");
+    std::fs::write(&tmp, data)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600));
+    }
+    std::fs::rename(&tmp, path)
+}
+
+fn cron_session_key(platform: &str, thread_id: &str) -> String {
+    format!("{platform}:{thread_id}")
+}
+
+async fn session_should_skip(
+    job: &CronJobConfig,
+    bindings: &CronBindings,
+    thread_id: &str,
+) -> bool {
+    let Some(session) = &bindings.session else {
+        return false;
+    };
+    let session_key = cron_session_key(&job.platform, thread_id);
+    if job.skip_if_handoff && session.is_externally_detached(&session_key).await {
+        warn!(
+            id = job.sticky_key().unwrap_or(""),
+            "skipping cronjob, session is in Cursor handoff"
+        );
+        return true;
+    }
+    if job.skip_if_busy && session.is_prompt_in_flight(&session_key).await {
+        warn!(
+            id = job.sticky_key().unwrap_or(""),
+            "skipping cronjob, session prompt is in flight"
+        );
+        return true;
+    }
+    false
 }
 
 /// A parsed, ready-to-evaluate cron job.
@@ -376,18 +641,15 @@ struct ParsedJob {
     usercron_path: Option<PathBuf>,
 }
 
-/// Parse a list of CronJobConfig into ParsedJob, filtering out disabled/invalid entries.
+/// Parse a list of CronJobConfig into ParsedJob, keeping paused jobs so Discord
+/// can resume them without restarting the scheduler.
 fn parse_job_list(
     configs: &[CronJobConfig],
     source: &str,
     usercron_path: Option<&Path>,
+    toggles: Option<&CronToggleStore>,
 ) -> Vec<ParsedJob> {
-    configs.iter().filter(|job| {
-        if !job.enabled {
-            info!(schedule = %job.schedule, channel = %job.channel, source, "cronjob disabled, skipping");
-        }
-        job.enabled
-    }).filter_map(|job| {
+    configs.iter().filter_map(|job| {
         let schedule = match parse_cron_expr(&job.schedule) {
             Ok(s) => s,
             Err(e) => {
@@ -402,10 +664,19 @@ fn parse_job_list(
                 return None;
             }
         };
+        let paused = !toggles
+            .map(|store| store.effective_enabled(job))
+            .unwrap_or(job.enabled);
         info!(
-            schedule = %job.schedule, timezone = %job.timezone,
-            channel = %job.channel, platform = %job.platform,
-            message = %job.message, source,
+            id = job.sticky_key().unwrap_or(""),
+            schedule = %job.schedule,
+            timezone = %job.timezone,
+            channel = %job.channel,
+            workspace_alias = job.normalized_workspace_alias().unwrap_or(""),
+            action_id = job.normalized_action_id().unwrap_or(""),
+            platform = %job.platform,
+            paused,
+            source,
             "cronjob registered"
         );
         Some(ParsedJob {
@@ -419,18 +690,22 @@ fn parse_job_list(
 
 /// Run the internal cron scheduler. Evaluates cron expressions once per minute.
 /// `usercron_path` enables hot-reload of an external cronjob.toml file.
+/// `run_now_rx` lets Discord request an immediate firing without waiting for the schedule.
 pub async fn run_scheduler(
     cronjobs: Vec<CronJobConfig>,
     usercron_path: Option<PathBuf>,
     configured_platforms: Vec<String>,
     router: Arc<AdapterRouter>,
     adapters: HashMap<String, Arc<dyn ChatAdapter>>,
+    bindings: CronBindings,
     mut shutdown_rx: tokio::sync::watch::Receiver<bool>,
+    mut run_now_rx: Option<tokio::sync::mpsc::UnboundedReceiver<String>>,
 ) {
     let platform_refs: Vec<&str> = configured_platforms.iter().map(|s| s.as_str()).collect();
+    let toggles = bindings.toggles.as_deref();
 
     // Parse baseline jobs from config.toml
-    let baseline_jobs = parse_job_list(&cronjobs, "config.toml", None);
+    let baseline_jobs = parse_job_list(&cronjobs, "config.toml", None, toggles);
 
     // Load initial usercron jobs
     let mut usercron_jobs = if let Some(ref path) = usercron_path {
@@ -438,13 +713,13 @@ pub async fn run_scheduler(
         if !configs.is_empty() {
             info!(count = configs.len(), path = %path.display(), "loaded usercron jobs");
         }
-        parse_job_list(&configs, "cronjob.toml", Some(path.as_path()))
+        parse_job_list(&configs, "cronjob.toml", Some(path.as_path()), toggles)
     } else {
         vec![]
     };
     let mut last_usercron_mtime: Option<SystemTime> = usercron_path.as_deref().and_then(file_mtime);
 
-    if baseline_jobs.is_empty() && usercron_jobs.is_empty() {
+    if baseline_jobs.is_empty() && usercron_jobs.is_empty() && run_now_rx.is_none() {
         if usercron_path.is_some() {
             info!(
                 "no cronjobs yet, but usercron_path is set — scheduler will watch for cronjob.toml"
@@ -498,53 +773,69 @@ pub async fn run_scheduler(
                         // (thread_id or enabled=false) changes mtime deterministically;
                         // clearing usercron indices here would allow the same job to
                         // overlap on the next tick while its previous run is still active.
-                        usercron_jobs =
-                            parse_job_list(&configs, "cronjob.toml", Some(path.as_path()));
+                        usercron_jobs = parse_job_list(
+                            &configs,
+                            "cronjob.toml",
+                            Some(path.as_path()),
+                            bindings.toggles.as_deref(),
+                        );
                         last_usercron_mtime = current_mtime;
                     }
                 }
 
                 // Evaluate all jobs: baseline first, then usercron
-                let all_jobs = baseline_jobs.iter().chain(usercron_jobs.iter());
-                for (idx, job) in all_jobs.enumerate() {
+                let all_jobs: Vec<&ParsedJob> =
+                    baseline_jobs.iter().chain(usercron_jobs.iter()).collect();
+                for (idx, job) in all_jobs.iter().enumerate() {
                     if !should_fire(&job.schedule, job.tz) {
                         continue;
                     }
-                    {
-                        let running = in_flight.lock().await;
-                        if running.contains(&idx) {
-                            warn!(schedule = %job.config.schedule, channel = %job.config.channel, "skipping cronjob, previous execution still running");
-                            continue;
-                        }
+                    if !effective_job_enabled(&job.config, &bindings) {
+                        continue;
                     }
-                    info!(
-                        schedule = %job.config.schedule,
-                        channel = %job.config.channel,
-                        platform = %job.config.platform,
-                        message = %job.config.message,
-                        sender = %job.config.sender_name,
-                        "🔔 cronjob fired"
-                    );
-                    in_flight.lock().await.insert(idx);
-
-                    let config = job.config.clone();
-                    let usercron_path = job.usercron_path.clone();
-                    let router = router.clone();
-                    let adapters = adapters.clone();
-                    let in_flight = in_flight.clone();
-                    let usercron_write_lock = usercron_write_lock.clone();
-                    tasks.spawn(async move {
-                        fire_cronjob(
+                    queue_cron_fire(
+                        idx,
+                        job,
+                        &router,
+                        &adapters,
+                        &bindings,
+                        &in_flight,
+                        &usercron_write_lock,
+                        &mut tasks,
+                        false,
+                    )
+                    .await;
+                }
+                while tasks.try_join_next().is_some() {}
+            }
+            job_id = recv_run_now(&mut run_now_rx) => {
+                let Some(job_id) = job_id else {
+                    run_now_rx = None;
+                    continue;
+                };
+                let all_jobs: Vec<&ParsedJob> =
+                    baseline_jobs.iter().chain(usercron_jobs.iter()).collect();
+                match all_jobs.iter().enumerate().find(|(_, job)| {
+                    job.config.sticky_key() == Some(job_id.as_str())
+                }) {
+                    Some((idx, job)) => {
+                        info!(id = %job_id, "cronjob run-now requested");
+                        queue_cron_fire(
                             idx,
-                            &config,
-                            usercron_path,
+                            job,
                             &router,
                             &adapters,
-                            in_flight,
-                            usercron_write_lock,
+                            &bindings,
+                            &in_flight,
+                            &usercron_write_lock,
+                            &mut tasks,
+                            true,
                         )
                         .await;
-                    });
+                    }
+                    None => {
+                        warn!(id = %job_id, "cronjob run-now requested for unknown id");
+                    }
                 }
                 while tasks.try_join_next().is_some() {}
             }
@@ -558,6 +849,72 @@ pub async fn run_scheduler(
             }
         }
     }
+}
+
+async fn recv_run_now(
+    run_now_rx: &mut Option<tokio::sync::mpsc::UnboundedReceiver<String>>,
+) -> Option<String> {
+    match run_now_rx.as_mut() {
+        Some(rx) => rx.recv().await,
+        None => std::future::pending().await,
+    }
+}
+
+async fn queue_cron_fire(
+    idx: usize,
+    job: &ParsedJob,
+    router: &Arc<AdapterRouter>,
+    adapters: &HashMap<String, Arc<dyn ChatAdapter>>,
+    bindings: &CronBindings,
+    in_flight: &Arc<Mutex<HashSet<usize>>>,
+    usercron_write_lock: &Arc<Mutex<()>>,
+    tasks: &mut tokio::task::JoinSet<()>,
+    force: bool,
+) {
+    {
+        let running = in_flight.lock().await;
+        if running.contains(&idx) {
+            warn!(
+                id = job.config.sticky_key().unwrap_or(""),
+                schedule = %job.config.schedule,
+                "skipping cronjob, previous execution still running"
+            );
+            return;
+        }
+    }
+    info!(
+        id = job.config.sticky_key().unwrap_or(""),
+        schedule = %job.config.schedule,
+        channel = %job.config.channel,
+        workspace_alias = job.config.normalized_workspace_alias().unwrap_or(""),
+        platform = %job.config.platform,
+        sender = %job.config.sender_name,
+        force,
+        "🔔 cronjob fired"
+    );
+    in_flight.lock().await.insert(idx);
+
+    let config = job.config.clone();
+    let usercron_path = job.usercron_path.clone();
+    let router = router.clone();
+    let adapters = adapters.clone();
+    let bindings = bindings.clone();
+    let in_flight = in_flight.clone();
+    let usercron_write_lock = usercron_write_lock.clone();
+    tasks.spawn(async move {
+        fire_cronjob(
+            idx,
+            &config,
+            usercron_path,
+            &router,
+            &adapters,
+            &bindings,
+            in_flight,
+            usercron_write_lock,
+            force,
+        )
+        .await;
+    });
 }
 
 /// RAII guard that removes a job index from the in-flight set on drop.
@@ -582,13 +939,23 @@ async fn fire_cronjob(
     usercron_path: Option<PathBuf>,
     router: &Arc<AdapterRouter>,
     adapters: &HashMap<String, Arc<dyn ChatAdapter>>,
+    bindings: &CronBindings,
     in_flight: Arc<Mutex<HashSet<usize>>>,
     usercron_write_lock: Arc<Mutex<()>>,
+    force: bool,
 ) {
     let _guard = InFlightGuard {
         idx,
         set: in_flight,
     };
+
+    if !force && !effective_job_enabled(job, bindings) {
+        debug!(
+            id = job.sticky_key().unwrap_or(""),
+            "cronjob paused, skipping"
+        );
+        return;
+    }
 
     let adapter = match adapters.get(&job.platform) {
         Some(a) => a.clone(),
@@ -655,10 +1022,38 @@ async fn fire_cronjob(
         }
     }
 
+    let Some(channel_id) = resolved_channel(job, bindings) else {
+        warn!(
+            id = job.sticky_key().unwrap_or(""),
+            workspace_alias = job.normalized_workspace_alias().unwrap_or(""),
+            channel = %job.channel,
+            "cronjob channel could not be resolved, skipping"
+        );
+        return;
+    };
+    let Some(prompt) = resolved_prompt(job, bindings) else {
+        warn!(
+            id = job.sticky_key().unwrap_or(""),
+            action_id = job.normalized_action_id().unwrap_or(""),
+            "cronjob prompt could not be resolved, skipping"
+        );
+        return;
+    };
+
+    let configured_thread_id = non_empty_opt(job.thread_id.as_deref()).map(str::to_string);
+    let sticky_id = sticky_thread_id(job, bindings);
+    let resolved_thread_id = configured_thread_id.clone().or(sticky_id);
+
+    if let Some(thread_id) = resolved_thread_id.as_deref() {
+        if session_should_skip(job, bindings, thread_id).await {
+            return;
+        }
+    }
+
     let thread_channel = ChannelRef {
         platform: job.platform.clone(),
-        channel_id: job.channel.clone(),
-        thread_id: job.thread_id.clone(),
+        channel_id,
+        thread_id: resolved_thread_id.clone(),
         parent_id: None,
         origin_event_id: None,
     };
@@ -666,7 +1061,7 @@ async fn fire_cronjob(
     let trigger_msg = match adapter
         .send_message(
             &thread_channel,
-            &format!("🕐 [{}]: {}", job.sender_name, job.message),
+            &format!("🕐 [{}]: {}", job.sender_name, prompt),
         )
         .await
     {
@@ -677,21 +1072,26 @@ async fn fire_cronjob(
         }
     };
 
-    let reply_channel = if should_create_cron_thread(job) {
-        let thread_name = format::shorten_thread_name(&job.message);
+    let reply_channel = if should_create_cron_thread(job, resolved_thread_id.as_deref()) {
+        let thread_name = format::shorten_thread_name(&prompt);
         match adapter
             .create_thread(&thread_channel, &trigger_msg, &thread_name)
             .await
         {
             Ok(ch) => {
-                if let (Some(path), Some(id), Some(thread_id)) = (
-                    usercron_path.as_deref(),
-                    non_empty_opt(job.id.as_deref()),
-                    ch.thread_id.as_deref().or(Some(ch.channel_id.as_str())),
-                ) {
-                    let _write_guard = usercron_write_lock.lock().await;
-                    if let Err(e) = update_usercron_job(path, id, None, Some(thread_id)) {
-                        warn!(path = %path.display(), id, error = %e, "failed to persist usercron thread_id");
+                if let Some(thread_id) = ch
+                    .thread_id
+                    .as_deref()
+                    .or(Some(ch.channel_id.as_str()))
+                {
+                    persist_sticky_thread(job, bindings, thread_id);
+                    if let (Some(path), Some(id)) =
+                        (usercron_path.as_deref(), non_empty_opt(job.id.as_deref()))
+                    {
+                        let _write_guard = usercron_write_lock.lock().await;
+                        if let Err(e) = update_usercron_job(path, id, None, Some(thread_id)) {
+                            warn!(path = %path.display(), id, error = %e, "failed to persist usercron thread_id");
+                        }
                     }
                 }
                 ch
@@ -743,7 +1143,7 @@ async fn fire_cronjob(
             crate::adapter::MessageContext {
                 thread_channel: reply_channel.clone(),
                 sender_json,
-                prompt: job.message.clone(),
+                prompt: prompt.clone(),
                 extra_blocks: vec![],
                 trigger_msg,
                 other_bot_present: false,
@@ -1441,6 +1841,11 @@ disable_on_success = "echo SUCCESS"
             schedule: "* * * * *".into(),
             channel: "123".into(),
             message: "hi".into(),
+            workspace_alias: None,
+            action_id: None,
+            thread_policy: CronThreadPolicy::NewEachRun,
+            skip_if_handoff: false,
+            skip_if_busy: false,
             platform: "discord".into(),
             sender_name: "test".into(),
             thread_id: None,
@@ -1550,6 +1955,11 @@ message = "a"
             schedule: "* * * * *".into(),
             channel: "123".into(),
             message: "hi".into(),
+            workspace_alias: None,
+            action_id: None,
+            thread_policy: CronThreadPolicy::NewEachRun,
+            skip_if_handoff: false,
+            skip_if_busy: false,
             platform: "discord".into(),
             sender_name: "test".into(),
             thread_id: None,
@@ -1566,10 +1976,10 @@ message = "a"
         let mut job = test_cron_job();
         job.platform = "googlechat".into();
 
-        assert!(!should_create_cron_thread(&job));
+        assert!(!should_create_cron_thread(&job, job.thread_id.as_deref()));
 
         job.thread_id = Some("spaces/TEST/threads/THREAD".into());
-        assert!(!should_create_cron_thread(&job));
+        assert!(!should_create_cron_thread(&job, job.thread_id.as_deref()));
     }
 
     #[test]
@@ -1579,17 +1989,18 @@ message = "a"
         let mut job = test_cron_job();
         job.platform = "lineworks".into();
 
-        assert!(!should_create_cron_thread(&job));
+        assert!(!should_create_cron_thread(&job, job.thread_id.as_deref()));
 
         job.thread_id = Some("explicit-thread".into());
-        assert!(!should_create_cron_thread(&job));
+        assert!(!should_create_cron_thread(&job, job.thread_id.as_deref()));
     }
 
     #[test]
     fn thread_capable_cron_platform_creates_thread_when_unspecified() {
         let job = test_cron_job();
 
-        assert!(should_create_cron_thread(&job));
+        assert!(should_create_cron_thread(&job, job.thread_id.as_deref()));
+        assert!(!should_create_cron_thread(&job, Some("sticky-thread")));
     }
 
     #[test]
@@ -1644,6 +2055,11 @@ message = "a"
             schedule: "0 9 * * 1-5".into(),
             channel: "123".into(),
             message: "hi".into(),
+            workspace_alias: None,
+            action_id: None,
+            thread_policy: CronThreadPolicy::NewEachRun,
+            skip_if_handoff: false,
+            skip_if_busy: false,
             platform: "discord".into(),
             sender_name: "test".into(),
             thread_id: None,
@@ -1675,6 +2091,11 @@ message = "a"
             schedule: "bad".into(),
             channel: "123".into(),
             message: "hi".into(),
+            workspace_alias: None,
+            action_id: None,
+            thread_policy: CronThreadPolicy::NewEachRun,
+            skip_if_handoff: false,
+            skip_if_busy: false,
             platform: "discord".into(),
             sender_name: "test".into(),
             thread_id: None,
@@ -1696,6 +2117,11 @@ message = "a"
             schedule: "* * * * *".into(),
             channel: "123".into(),
             message: "hi".into(),
+            workspace_alias: None,
+            action_id: None,
+            thread_policy: CronThreadPolicy::NewEachRun,
+            skip_if_handoff: false,
+            skip_if_busy: false,
             platform: "discord".into(),
             sender_name: "test".into(),
             thread_id: None,
@@ -1717,6 +2143,11 @@ message = "a"
             schedule: "* * * * *".into(),
             channel: "123".into(),
             message: "hi".into(),
+            workspace_alias: None,
+            action_id: None,
+            thread_policy: CronThreadPolicy::NewEachRun,
+            skip_if_handoff: false,
+            skip_if_busy: false,
             platform: "matrix".into(),
             sender_name: "test".into(),
             thread_id: None,
@@ -1738,6 +2169,11 @@ message = "a"
             schedule: "* * * * *".into(),
             channel: "123".into(),
             message: "hi".into(),
+            workspace_alias: None,
+            action_id: None,
+            thread_policy: CronThreadPolicy::NewEachRun,
+            skip_if_handoff: false,
+            skip_if_busy: false,
             platform: "slack".into(),
             sender_name: "test".into(),
             thread_id: None,
@@ -1759,6 +2195,11 @@ message = "a"
             schedule: "bad".into(),
             channel: "123".into(),
             message: "hi".into(),
+            workspace_alias: None,
+            action_id: None,
+            thread_policy: CronThreadPolicy::NewEachRun,
+            skip_if_handoff: false,
+            skip_if_busy: false,
             platform: "discord".into(),
             sender_name: "test".into(),
             thread_id: None,
@@ -1779,6 +2220,11 @@ message = "a"
             schedule: "bad".into(),
             channel: "123".into(),
             message: "hi".into(),
+            workspace_alias: None,
+            action_id: None,
+            thread_policy: CronThreadPolicy::NewEachRun,
+            skip_if_handoff: false,
+            skip_if_busy: false,
             platform: "discord".into(),
             sender_name: "test".into(),
             thread_id: None,
@@ -1863,5 +2309,262 @@ command = "echo"
         std::fs::write(&path, "").unwrap();
         let jobs = load_usercron_file(&path, &["discord"]);
         assert!(jobs.is_empty());
+    }
+
+    #[test]
+    fn validate_cronjobs_accepts_workspace_alias_without_channel() {
+        let mut job = test_cron_job();
+        job.disable_on_success = None;
+        job.disable_on_success_match = None;
+        job.channel.clear();
+        job.workspace_alias = Some("novel-vault".into());
+        assert!(validate_cronjobs(&[job], &["discord"]).is_ok());
+    }
+
+    #[test]
+    fn validate_cronjobs_rejects_sticky_without_id() {
+        let mut job = test_cron_job();
+        job.disable_on_success = None;
+        job.disable_on_success_match = None;
+        job.id = None;
+        job.thread_policy = CronThreadPolicy::Sticky;
+        let err = validate_cronjobs(&[job], &["discord"]).unwrap_err();
+        assert!(err.to_string().contains("sticky"));
+    }
+
+    #[test]
+    fn validate_cronjobs_rejects_missing_target_and_prompt() {
+        let mut job = test_cron_job();
+        job.disable_on_success = None;
+        job.disable_on_success_match = None;
+        job.channel.clear();
+        job.message.clear();
+        let err = validate_cronjobs(&[job], &["discord"]).unwrap_err();
+        assert!(err.to_string().contains("channel or workspace_alias"));
+    }
+
+    #[test]
+    fn resolved_channel_uses_workspace_alias_binding() {
+        let mut job = test_cron_job();
+        job.workspace_alias = Some("novel-vault".into());
+        job.channel = "stale".into();
+        let bindings = CronBindings {
+            resolve_channel: Some(Arc::new(|platform, alias| {
+                (platform == "discord" && alias == "novel-vault")
+                    .then(|| "resolved-channel".into())
+            })),
+            ..CronBindings::default()
+        };
+        assert_eq!(
+            resolved_channel(&job, &bindings).as_deref(),
+            Some("resolved-channel")
+        );
+    }
+
+    #[test]
+    fn resolved_prompt_uses_action_id() {
+        let mut job = test_cron_job();
+        job.workspace_alias = Some("openab".into());
+        job.action_id = Some("daily_summary".into());
+        job.message = "fallback".into();
+        let bindings = CronBindings {
+            resolve_action_prompt: Some(Arc::new(|alias, action_id| {
+                (alias == "openab" && action_id == "daily_summary")
+                    .then(|| "from-action".into())
+            })),
+            ..CronBindings::default()
+        };
+        assert_eq!(
+            resolved_prompt(&job, &bindings).as_deref(),
+            Some("from-action")
+        );
+    }
+
+    #[test]
+    fn sticky_store_round_trips_thread_id() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("cron-threads.json");
+        let mut job = test_cron_job();
+        job.id = Some("novel-vault-daily".into());
+        job.thread_policy = CronThreadPolicy::Sticky;
+        job.disable_on_success = None;
+        let bindings = CronBindings {
+            sticky_store_path: Some(path.clone()),
+            ..CronBindings::default()
+        };
+        assert!(sticky_thread_id(&job, &bindings).is_none());
+        persist_sticky_thread(&job, &bindings, "thread-123");
+        assert_eq!(
+            sticky_thread_id(&job, &bindings).as_deref(),
+            Some("thread-123")
+        );
+        let persisted: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(persisted["novel-vault-daily"], "thread-123");
+    }
+
+    #[test]
+    fn toggle_store_overrides_toml_enabled() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("cron-toggles.json");
+        let store = CronToggleStore::load(path.clone());
+        let mut job = test_cron_job();
+        job.enabled = false;
+        job.id = Some("openab-daily".into());
+        job.disable_on_success = None;
+        assert!(!store.effective_enabled(&job));
+        store.set_enabled("openab-daily", true).unwrap();
+        assert!(store.effective_enabled(&job));
+        let reloaded = CronToggleStore::load(path);
+        assert!(reloaded.effective_enabled(&job));
+        reloaded.set_enabled("openab-daily", false).unwrap();
+        assert!(!reloaded.effective_enabled(&job));
+    }
+
+    #[test]
+    fn job_applies_to_project_matches_alias_or_channel() {
+        let mut job = test_cron_job();
+        job.workspace_alias = Some("novel-vault".into());
+        job.channel.clear();
+        job.disable_on_success = None;
+        assert!(job_applies_to_project(&job, "novel-vault", "999"));
+        assert!(job_applies_to_project(&job, "@novel-vault", "999"));
+        assert!(!job_applies_to_project(&job, "openab", "999"));
+        job.workspace_alias = Some("*".into());
+        assert!(job_applies_to_project(&job, "openab", "999"));
+        job.workspace_alias = None;
+        job.channel = "chan-1".into();
+        assert!(job_applies_to_project(&job, "openab", "chan-1"));
+        assert!(!job_applies_to_project(&job, "openab", "chan-2"));
+        job.platform = "slack".into();
+        assert!(!job_applies_to_project(&job, "openab", "chan-1"));
+    }
+
+    #[test]
+    fn next_run_unix_is_in_the_future() {
+        let next = next_run_unix("0 9 * * *", "Asia/Taipei").unwrap();
+        assert!(next > Utc::now().timestamp());
+    }
+
+    #[test]
+    fn validate_cronjobs_validates_disabled_jobs_with_id() {
+        let mut job = test_cron_job();
+        job.enabled = false;
+        job.schedule = "bad".into();
+        job.disable_on_success = None;
+        job.disable_on_success_match = None;
+        assert!(validate_cronjobs(&[job], &["discord"]).is_err());
+    }
+
+    #[test]
+    fn cron_config_parses_workspace_alias_and_action_id() {
+        use crate::config::Config;
+        let toml_str = r#"
+[agent]
+command = "echo"
+
+[[cron.jobs]]
+id = "novel-vault-daily"
+enabled = false
+schedule = "0 9 * * *"
+timezone = "Asia/Taipei"
+workspace_alias = "novel-vault"
+action_id = "daily_summary"
+thread_policy = "sticky"
+skip_if_handoff = true
+skip_if_busy = true
+sender_name = "DailySummary"
+"#;
+        let cfg: Config = toml::from_str(toml_str).unwrap();
+        let job = &cfg.cron.jobs[0];
+        assert_eq!(job.id.as_deref(), Some("novel-vault-daily"));
+        assert!(!job.enabled);
+        assert_eq!(job.workspace_alias.as_deref(), Some("novel-vault"));
+        assert_eq!(job.action_id.as_deref(), Some("daily_summary"));
+        assert_eq!(job.thread_policy, CronThreadPolicy::Sticky);
+        assert!(job.skip_if_handoff);
+        assert!(job.skip_if_busy);
+        assert!(job.channel.is_empty());
+        assert!(job.message.is_empty());
+    }
+
+    struct MockCronSession {
+        handoff: bool,
+        busy: bool,
+    }
+
+    #[async_trait::async_trait]
+    impl CronSessionView for MockCronSession {
+        async fn is_externally_detached(&self, _: &str) -> bool {
+            self.handoff
+        }
+
+        async fn is_prompt_in_flight(&self, _: &str) -> bool {
+            self.busy
+        }
+    }
+
+    #[tokio::test]
+    async fn session_should_skip_handoff_and_busy() {
+        let mut job = test_cron_job();
+        job.skip_if_handoff = true;
+        job.skip_if_busy = true;
+        let handoff = CronBindings {
+            session: Some(Arc::new(MockCronSession {
+                handoff: true,
+                busy: false,
+            })),
+            ..CronBindings::default()
+        };
+        let busy = CronBindings {
+            session: Some(Arc::new(MockCronSession {
+                handoff: false,
+                busy: true,
+            })),
+            ..CronBindings::default()
+        };
+        let idle = CronBindings {
+            session: Some(Arc::new(MockCronSession {
+                handoff: false,
+                busy: false,
+            })),
+            ..CronBindings::default()
+        };
+        assert!(session_should_skip(&job, &handoff, "thread").await);
+        assert!(session_should_skip(&job, &busy, "thread").await);
+        assert!(!session_should_skip(&job, &idle, "thread").await);
+        job.skip_if_handoff = false;
+        job.skip_if_busy = false;
+        assert!(!session_should_skip(&job, &handoff, "thread").await);
+    }
+
+    #[test]
+    fn resolved_channel_falls_back_to_channel_when_alias_missing() {
+        let mut job = test_cron_job();
+        job.workspace_alias = Some("missing".into());
+        job.channel = "fallback-channel".into();
+        let bindings = CronBindings {
+            resolve_channel: Some(Arc::new(|_, _| None)),
+            ..CronBindings::default()
+        };
+        assert_eq!(
+            resolved_channel(&job, &bindings).as_deref(),
+            Some("fallback-channel")
+        );
+    }
+
+    #[test]
+    fn resolved_prompt_falls_back_to_message_when_action_missing() {
+        let mut job = test_cron_job();
+        job.action_id = Some("missing".into());
+        job.message = "fallback-prompt".into();
+        let bindings = CronBindings {
+            resolve_action_prompt: Some(Arc::new(|_, _| None)),
+            ..CronBindings::default()
+        };
+        assert_eq!(
+            resolved_prompt(&job, &bindings).as_deref(),
+            Some("fallback-prompt")
+        );
     }
 }

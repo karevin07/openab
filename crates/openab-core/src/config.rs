@@ -737,6 +737,32 @@ fn validate_discord_project_actions(actions: &[DiscordProjectActionConfig]) -> a
     Ok(())
 }
 
+/// Resolve a Project Home action. A workspace-local id wins over `*`.
+pub fn resolve_project_action<'a>(
+    actions: &'a [DiscordProjectActionConfig],
+    workspace_alias: &str,
+    action_id: &str,
+) -> Option<&'a DiscordProjectActionConfig> {
+    let alias = workspace_alias.trim_start_matches('@');
+    actions
+        .iter()
+        .find(|action| action.workspace_alias == alias && action.id == action_id)
+        .or_else(|| {
+            actions
+                .iter()
+                .find(|action| action.workspace_alias == "*" && action.id == action_id)
+        })
+}
+
+/// Resolve a Project Home action prompt. A workspace-local id wins over `*`.
+pub fn resolve_project_action_prompt(
+    actions: &[DiscordProjectActionConfig],
+    workspace_alias: &str,
+    action_id: &str,
+) -> Option<String> {
+    resolve_project_action(actions, workspace_alias, action_id).map(|action| action.prompt.clone())
+}
+
 fn validate_discord_project_commands(
     commands: &[DiscordProjectCommandConfig],
 ) -> anyhow::Result<()> {
@@ -2093,19 +2119,49 @@ pub struct PoolConfig {
     pub default_config_options: HashMap<String, String>,
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum CronThreadPolicy {
+    /// Current default: create a new thread on each firing unless `thread_id` is set.
+    #[default]
+    NewEachRun,
+    /// Reuse one thread/session across firings. Requires `id` so the scheduler can
+    /// persist the Discord thread ID without writing back to config.toml.
+    Sticky,
+}
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct CronJobConfig {
-    /// Stable ID for usercron jobs that need scheduler writeback.
+    /// Stable ID for usercron jobs that need scheduler writeback, and for sticky
+    /// thread persistence of baseline jobs.
     pub id: Option<String>,
     /// Whether this cronjob is active (default: true)
     #[serde(default = "default_true")]
     pub enabled: bool,
     /// Cron expression (5-field POSIX format)
     pub schedule: String,
-    /// Target channel ID
+    /// Target channel ID. Optional when `workspace_alias` is set.
+    #[serde(default)]
     pub channel: String,
-    /// Message to send to the agent
+    /// Workspace alias without a leading `@`. Resolved to a project/parent
+    /// channel from runtime workspace bindings at fire time.
+    pub workspace_alias: Option<String>,
+    /// Message to send to the agent. Optional when `action_id` is set.
+    #[serde(default)]
     pub message: String,
+    /// Trusted `[[discord.project_actions]]` id; its prompt is used instead of
+    /// `message`. A workspace-local action wins over `workspace_alias = "*"`.
+    pub action_id: Option<String>,
+    /// How Discord/Slack threads are created. Default preserves historical
+    /// "new thread every firing" behaviour.
+    #[serde(default)]
+    pub thread_policy: CronThreadPolicy,
+    /// Skip this tick when the target session is held by an external Cursor UI.
+    #[serde(default)]
+    pub skip_if_handoff: bool,
+    /// Skip this tick when the target session currently has an in-flight prompt.
+    #[serde(default)]
+    pub skip_if_busy: bool,
     /// Target platform (default: "discord")
     #[serde(default = "default_cron_platform")]
     pub platform: String,
@@ -2128,6 +2184,37 @@ pub struct CronJobConfig {
     pub disable_on_success_timeout_secs: u64,
     /// Usercron-only: working directory for `disable_on_success`.
     pub disable_on_success_working_dir: Option<String>,
+}
+
+impl CronJobConfig {
+    pub fn normalized_workspace_alias(&self) -> Option<&str> {
+        self.workspace_alias.as_deref().and_then(|alias| {
+            let trimmed = alias.trim().trim_start_matches('@');
+            (!trimmed.is_empty()).then_some(trimmed)
+        })
+    }
+
+    pub fn normalized_action_id(&self) -> Option<&str> {
+        self.action_id.as_deref().and_then(|id| {
+            let trimmed = id.trim();
+            (!trimmed.is_empty()).then_some(trimmed)
+        })
+    }
+
+    pub fn sticky_key(&self) -> Option<&str> {
+        self.id.as_deref().and_then(|id| {
+            let trimmed = id.trim();
+            (!trimmed.is_empty()).then_some(trimmed)
+        })
+    }
+
+    pub fn has_channel_target(&self) -> bool {
+        !self.channel.trim().is_empty() || self.normalized_workspace_alias().is_some()
+    }
+
+    pub fn has_prompt_source(&self) -> bool {
+        !self.message.trim().is_empty() || self.normalized_action_id().is_some()
+    }
 }
 
 fn default_cron_platform() -> String {
@@ -3005,6 +3092,40 @@ prompt = "Run cargo test without changing files."
         assert_eq!(actions[0].workspace_alias, "openab");
         assert_eq!(actions[0].id, "test");
         assert_eq!(actions[0].prompt, "Run cargo test without changing files.");
+    }
+
+    #[test]
+    fn resolve_project_action_prompt_prefers_workspace_local_over_global() {
+        let actions = vec![
+            DiscordProjectActionConfig {
+                workspace_alias: "*".into(),
+                id: "daily_summary".into(),
+                label: "Daily summary".into(),
+                description: String::new(),
+                title: String::new(),
+                prompt: "global".into(),
+            },
+            DiscordProjectActionConfig {
+                workspace_alias: "openab".into(),
+                id: "daily_summary".into(),
+                label: "Daily summary".into(),
+                description: String::new(),
+                title: String::new(),
+                prompt: "local".into(),
+            },
+        ];
+        assert_eq!(
+            resolve_project_action_prompt(&actions, "openab", "daily_summary").as_deref(),
+            Some("local")
+        );
+        assert_eq!(
+            resolve_project_action_prompt(&actions, "novel-vault", "daily_summary").as_deref(),
+            Some("global")
+        );
+        assert_eq!(
+            resolve_project_action_prompt(&actions, "@openab", "missing").as_deref(),
+            None
+        );
     }
 
     #[test]

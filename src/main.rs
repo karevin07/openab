@@ -1651,6 +1651,16 @@ async fn main() -> anyhow::Result<()> {
     } else {
         None
     };
+    let openab_data_dir = std::env::var("HOME")
+        .map(PathBuf::from)
+        .unwrap_or_default()
+        .join(".openab");
+    let cron_toggles = Arc::new(cron::CronToggleStore::load(
+        openab_data_dir.join("cron-toggles.json"),
+    ));
+    let cron_sticky_path = openab_data_dir.join("cron-threads.json");
+    let (cron_run_now_tx, cron_run_now_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+
     let has_cron_work = !cfg.cron.jobs.is_empty() || usercron_path.is_some();
     let cron_handle = if has_cron_work {
         let shutdown_rx = shutdown_rx.clone();
@@ -1679,6 +1689,29 @@ async fn main() -> anyhow::Result<()> {
         }
         let cron_platforms: Vec<String> =
             configured_platforms.iter().map(|s| s.to_string()).collect();
+        let project_actions = {
+            #[cfg(feature = "discord")]
+            {
+                cfg.discord
+                    .as_ref()
+                    .map(|discord| discord.project_actions.clone())
+                    .unwrap_or_default()
+            }
+            #[cfg(not(feature = "discord"))]
+            Vec::new()
+        };
+        let binding_router = cron_router.clone();
+        let cron_bindings = cron::CronBindings {
+            resolve_channel: Some(Arc::new(move |platform, alias| {
+                binding_router.channel_id_for_workspace_alias(platform, alias)
+            })),
+            resolve_action_prompt: Some(Arc::new(move |alias, action_id| {
+                config::resolve_project_action_prompt(&project_actions, alias, action_id)
+            })),
+            session: Some(pool.clone() as Arc<dyn cron::CronSessionView>),
+            sticky_store_path: Some(cron_sticky_path.clone()),
+            toggles: Some(cron_toggles.clone()),
+        };
         info!(baseline = cronjobs.len(), usercron = ?usercron_path, "starting cron scheduler");
         Some(tokio::spawn(async move {
             cron::run_scheduler(
@@ -1687,11 +1720,14 @@ async fn main() -> anyhow::Result<()> {
                 cron_platforms,
                 cron_router,
                 cron_adapters,
+                cron_bindings,
                 shutdown_rx,
+                Some(cron_run_now_rx),
             )
             .await;
         }))
     } else {
+        drop(cron_run_now_rx);
         None
     };
 
@@ -1878,6 +1914,10 @@ async fn main() -> anyhow::Result<()> {
             project_actions: discord_cfg.project_actions,
             project_commands: discord_cfg.project_commands,
             project_command_runs: tokio::sync::Mutex::new(std::collections::HashSet::new()),
+            cron_jobs: cfg.cron.jobs.clone(),
+            cron_toggles: cron_toggles.clone(),
+            cron_run_now: has_cron_work.then_some(cron_run_now_tx),
+            cron_sticky_path: Some(cron_sticky_path.clone()),
             admin_control,
             git_push_broker,
         };
@@ -1920,6 +1960,7 @@ async fn main() -> anyhow::Result<()> {
             Ok(_) => {}
         }
     } else {
+        drop(cron_run_now_tx);
         info!("running without discord, press ctrl+c to stop");
         shutdown_signal().await;
         info!("shutdown signal received");
@@ -1929,6 +1970,7 @@ async fn main() -> anyhow::Result<()> {
     // branch of the `if let Some(discord_cfg)` above handles shutdown instead.)
     #[cfg(not(feature = "discord"))]
     {
+        drop(cron_run_now_tx);
         info!("running without discord, press ctrl+c to stop");
         shutdown_signal().await;
         info!("shutdown signal received");

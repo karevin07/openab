@@ -456,6 +456,15 @@ impl SessionPool {
         }
     }
 
+    /// True when this thread's ACP connection currently holds its mutex (prompt in flight).
+    pub async fn prompt_in_flight(&self, thread_id: &str) -> bool {
+        let state = self.state.read().await;
+        match state.active.get(thread_id) {
+            Some(conn) => conn.try_lock().is_err(),
+            None => false,
+        }
+    }
+
     /// Reject a chat that already belongs to a Discord thread before creating UI for it.
     pub async fn ensure_external_session_available(&self, session_id: &str) -> Result<()> {
         if !self.external_session_is_available(session_id).await {
