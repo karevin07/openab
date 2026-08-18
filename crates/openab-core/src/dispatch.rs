@@ -341,6 +341,17 @@ struct PersistedQueueFile {
     lanes: Vec<PersistedLane>,
 }
 
+/// Borrowed mirror of [`PersistedQueueFile`] used only for writing. Serialising
+/// from references keeps a snapshot from deep-copying every lane — and every
+/// base64 image block inside it — on each queue mutation. Field names and order
+/// must stay identical to `PersistedQueueFile` so the on-disk shape is unchanged.
+#[derive(Serialize)]
+struct PersistedQueueFileRef<'a> {
+    version: u32,
+    next_message_id: u64,
+    lanes: Vec<&'a PersistedLane>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct PersistedLane {
     key: String,
@@ -394,6 +405,15 @@ struct QueueStore {
     path: PathBuf,
     lanes: Mutex<HashMap<String, PersistedLane>>,
     next_message_id: AtomicU64,
+    /// Monotonic snapshot counter, assigned while `lanes` is held. Serialising
+    /// under that lock but writing outside it means two mutations can reach
+    /// `write_snapshot` out of order; the sequence lets the older one notice it
+    /// has been superseded instead of rolling the file back.
+    snapshot_seq: AtomicU64,
+    /// Guards the file write and records the newest sequence already on disk.
+    /// Deliberately separate from `lanes` so an fsync never blocks `submit` or
+    /// the queue-management APIs.
+    writer: Mutex<u64>,
 }
 
 impl QueueStore {
@@ -459,6 +479,8 @@ impl QueueStore {
             path,
             lanes: Mutex::new(lanes),
             next_message_id: AtomicU64::new(next_message_id),
+            snapshot_seq: AtomicU64::new(0),
+            writer: Mutex::new(0),
         }
     }
 
@@ -613,25 +635,61 @@ impl QueueStore {
         });
     }
 
+    /// Apply `mutate` to the in-memory lanes, then persist the resulting
+    /// snapshot. Serialisation runs under the `lanes` lock because it borrows
+    /// the map; the write and its two fsyncs deliberately do not, so a slow
+    /// disk cannot stall `submit` or the queue-management APIs.
+    ///
+    /// Durability is unchanged: when this returns, a snapshot at least as new
+    /// as this mutation is on disk — either the one written here, or a later
+    /// one that superseded it.
     fn mutate(&self, mutate: impl FnOnce(&mut HashMap<String, PersistedLane>)) {
-        let mut lanes = self.lanes.lock().unwrap();
-        mutate(&mut lanes);
-        if let Err(error) = self.persist_locked(&lanes) {
-            warn!(%error, path = %self.path.display(), "failed to persist dispatch queue");
-        }
+        let (seq, data) = {
+            let mut lanes = self.lanes.lock().unwrap();
+            mutate(&mut lanes);
+            // Assigned under the lock, so sequence order matches the order in
+            // which mutations were applied.
+            let seq = self
+                .snapshot_seq
+                .fetch_add(1, Ordering::Relaxed)
+                .saturating_add(1);
+            match self.serialize_locked(&lanes) {
+                Ok(data) => (seq, data),
+                Err(error) => {
+                    warn!(%error, path = %self.path.display(), "failed to serialize dispatch queue");
+                    return;
+                }
+            }
+        };
+        self.write_snapshot(seq, &data);
     }
 
-    fn persist_locked(&self, lanes: &HashMap<String, PersistedLane>) -> anyhow::Result<()> {
-        let mut entries = lanes.values().cloned().collect::<Vec<_>>();
+    fn serialize_locked(&self, lanes: &HashMap<String, PersistedLane>) -> anyhow::Result<Vec<u8>> {
+        let mut entries = lanes.values().collect::<Vec<_>>();
         entries.sort_by(|a, b| a.key.cmp(&b.key));
-        let file = PersistedQueueFile {
+        let file = PersistedQueueFileRef {
             version: QUEUE_STORE_VERSION,
             next_message_id: self.next_message_id(),
             lanes: entries,
         };
-        let data = serde_json::to_vec_pretty(&file)?;
-        atomic_write(&self.path, &data)?;
-        Ok(())
+        Ok(serde_json::to_vec_pretty(&file)?)
+    }
+
+    /// Write one serialised snapshot, skipping it when a newer snapshot already
+    /// reached disk. Sequence order equals lock-acquisition order, so a higher
+    /// sequence always contains every earlier mutation — dropping the stale
+    /// write loses nothing and stops it from rolling the file back.
+    fn write_snapshot(&self, seq: u64, data: &[u8]) {
+        let mut last_written = self.writer.lock().unwrap();
+        if *last_written >= seq {
+            return;
+        }
+        match atomic_write(&self.path, data) {
+            Ok(()) => *last_written = seq,
+            Err(error) => {
+                warn!(%error, path = %self.path.display(), "failed to persist dispatch queue");
+            }
+        }
     }
 }
 
@@ -1125,35 +1183,14 @@ impl Dispatcher {
                 let (queued, recovered) = message.into_queued();
                 queue.insert_with_recovery(queued.id, queued.message, false, recovered);
             }
-            let activity = Arc::new(QueueActivity::default());
             let thread_channel: ChannelRef = lane.thread_channel.clone().into();
+            // Capacity must cover what was restored: a lane larger than the
+            // configured cap could not wake its own consumer.
             let cap = self.max_buffered_messages.max(queue.len()).max(1);
-            let (tx, rx) = tokio::sync::mpsc::channel(cap);
             let generation = self.next_generation.fetch_add(1, Ordering::Relaxed);
             store.mark_requeued(&stored_lane);
-            let consumer = tokio::spawn(consumer_loop(
-                lane.key.clone(),
-                thread_channel.clone(),
-                rx,
-                Arc::clone(&queue),
-                Arc::clone(&activity),
-                Arc::clone(&self.target),
-                Arc::clone(&adapter),
-                cap,
-                self.max_batch_tokens,
-                self.idle_timeout,
-                self.queue_store.clone(),
-            ));
-            let handle = ThreadHandle {
-                tx,
-                queue,
-                activity,
-                consumer,
-                generation,
-                channel_id: thread_channel.channel_id.clone(),
-                thread_channel,
-                adapter_kind: adapter.platform().to_string(),
-            };
+            let handle =
+                self.spawn_lane(&lane.key, &thread_channel, &adapter, generation, queue, cap);
             let mut map = self.per_thread.lock().unwrap();
             if let std::collections::hash_map::Entry::Vacant(entry) = map.entry(lane.key) {
                 entry.insert(handle);
@@ -1217,6 +1254,54 @@ impl Dispatcher {
         }
     }
 
+    /// Create a fresh lane — pending queue, activity gate, mpsc wakeup channel
+    /// and consumer task — and return its handle.
+    ///
+    /// `submit` (first attempt and retry) and `restore_persisted` all need
+    /// exactly this wiring. Keeping it in one place means the eleven-argument
+    /// `consumer_loop` call exists once, so a new consumer parameter cannot be
+    /// threaded through one path and silently forgotten in another.
+    ///
+    /// `queue` is a parameter because `restore_persisted` hands over a queue
+    /// already populated from disk while `submit` starts empty. This spawns the
+    /// consumer task, so only call it when a lane is genuinely missing (e.g.
+    /// from inside `or_insert_with`).
+    fn spawn_lane(
+        &self,
+        thread_key: &str,
+        thread_channel: &ChannelRef,
+        adapter: &Arc<dyn ChatAdapter>,
+        generation: u64,
+        queue: Arc<PendingQueue>,
+        cap: usize,
+    ) -> ThreadHandle {
+        let (tx, rx) = tokio::sync::mpsc::channel(cap);
+        let activity = Arc::new(QueueActivity::default());
+        let consumer = tokio::spawn(consumer_loop(
+            thread_key.to_string(),
+            thread_channel.clone(),
+            rx,
+            Arc::clone(&queue),
+            Arc::clone(&activity),
+            Arc::clone(&self.target),
+            Arc::clone(adapter),
+            cap,
+            self.max_batch_tokens,
+            self.idle_timeout,
+            self.queue_store.clone(),
+        ));
+        ThreadHandle {
+            tx,
+            queue,
+            activity,
+            consumer,
+            generation,
+            channel_id: thread_channel.channel_id.clone(),
+            thread_channel: thread_channel.clone(),
+            adapter_kind: adapter.platform().to_string(),
+        }
+    }
+
     /// Submit one arrival event for the given thread.
     ///
     /// - If the thread has no active consumer, one is spawned lazily.
@@ -1236,9 +1321,6 @@ impl Dispatcher {
         msg: BufferedMessage,
     ) -> Result<(), DispatchError> {
         let cap = self.max_buffered_messages;
-        let target = Arc::clone(&self.target);
-        let max_tokens = self.max_batch_tokens;
-        let idle_timeout = self.idle_timeout;
 
         // Pre-fetch a generation in case we end up inserting a fresh handle.
         // Wasted if the entry already exists; generations need only be monotonic.
@@ -1260,32 +1342,14 @@ impl Dispatcher {
             }
 
             let entry = map.entry(thread_key.clone()).or_insert_with(|| {
-                let (tx, rx) = tokio::sync::mpsc::channel(cap);
-                let queue = Arc::new(PendingQueue::default());
-                let activity = Arc::new(QueueActivity::default());
-                let consumer = tokio::spawn(consumer_loop(
-                    thread_key.clone(),
-                    thread_channel.clone(),
-                    rx,
-                    Arc::clone(&queue),
-                    Arc::clone(&activity),
-                    Arc::clone(&target),
-                    Arc::clone(&adapter),
+                self.spawn_lane(
+                    &thread_key,
+                    &thread_channel,
+                    &adapter,
+                    next_g,
+                    Arc::new(PendingQueue::default()),
                     cap,
-                    max_tokens,
-                    idle_timeout,
-                    self.queue_store.clone(),
-                ));
-                ThreadHandle {
-                    tx,
-                    queue,
-                    activity,
-                    consumer,
-                    generation: next_g,
-                    channel_id: thread_channel.channel_id.clone(),
-                    thread_channel: thread_channel.clone(),
-                    adapter_kind: adapter.platform().to_string(),
-                }
+                )
             });
             (entry.tx.clone(), Arc::clone(&entry.queue), entry.generation)
         };
@@ -1325,32 +1389,14 @@ impl Dispatcher {
                 // SAFETY: no .await while this guard is held — guard drops at end of block.
                 let mut map = self.per_thread.lock().unwrap();
                 let entry = map.entry(thread_key.clone()).or_insert_with(|| {
-                    let (tx, rx) = tokio::sync::mpsc::channel(cap);
-                    let queue = Arc::new(PendingQueue::default());
-                    let activity = Arc::new(QueueActivity::default());
-                    let consumer = tokio::spawn(consumer_loop(
-                        thread_key.clone(),
-                        thread_channel.clone(),
-                        rx,
-                        Arc::clone(&queue),
-                        Arc::clone(&activity),
-                        Arc::clone(&target),
-                        Arc::clone(&adapter),
+                    self.spawn_lane(
+                        &thread_key,
+                        &thread_channel,
+                        &adapter,
+                        retry_g,
+                        Arc::new(PendingQueue::default()),
                         cap,
-                        max_tokens,
-                        idle_timeout,
-                        self.queue_store.clone(),
-                    ));
-                    ThreadHandle {
-                        tx,
-                        queue,
-                        activity,
-                        consumer,
-                        generation: retry_g,
-                        channel_id: thread_channel.channel_id.clone(),
-                        thread_channel: thread_channel.clone(),
-                        adapter_kind: adapter.platform().to_string(),
-                    }
+                    )
                 });
                 (
                     entry.tx.clone(),
@@ -2760,6 +2806,37 @@ mod tests {
         ));
         assert_eq!(reloaded.next_message_id(), 13);
         assert!(!dir.path().join("queue.json.tmp").exists());
+    }
+
+    #[test]
+    fn write_snapshot_skips_a_superseded_sequence() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("queue.json");
+        let store = QueueStore::load(path.clone());
+        let channel = make_channel("T1");
+        let queue = PendingQueue::default();
+        queue.insert(1, make_msg("queued", 10), false);
+
+        // Writes sequence 1 and records it as the newest state on disk.
+        store.update_pending("mock:T1", "mock", &channel, queue.snapshot());
+        let persisted = std::fs::read_to_string(&path).unwrap();
+        assert!(persisted.contains("queued"));
+
+        // Serialisation now happens outside the lanes lock, so an older
+        // snapshot can reach `write_snapshot` after a newer one already
+        // landed. It must be dropped rather than roll the file back.
+        let empty = serde_json::to_vec_pretty(&PersistedQueueFile {
+            version: QUEUE_STORE_VERSION,
+            next_message_id: 1,
+            lanes: Vec::new(),
+        })
+        .unwrap();
+        store.write_snapshot(1, &empty);
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), persisted);
+
+        // A genuinely newer sequence still writes.
+        store.write_snapshot(2, &empty);
+        assert!(!std::fs::read_to_string(&path).unwrap().contains("queued"));
     }
 
     #[tokio::test]
