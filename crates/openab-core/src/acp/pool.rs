@@ -309,10 +309,30 @@ impl SessionPool {
         hung_threshold_secs: u64,
         default_config_options: HashMap<String, String>,
     ) -> Self {
-        let openab_dir = std::env::var("HOME")
+        let home = std::env::var("HOME")
             .map(PathBuf::from)
-            .unwrap_or_else(|_| PathBuf::from("/tmp"))
-            .join(".openab");
+            .unwrap_or_else(|_| PathBuf::from("/tmp"));
+        Self::new_in(
+            &home,
+            config,
+            max_sessions,
+            hung_threshold_secs,
+            default_config_options,
+        )
+    }
+
+    /// Same as [`SessionPool::new`] with the state directory given explicitly.
+    ///
+    /// `new` derives it from `HOME`, which makes a pool impossible to construct
+    /// in a test without two tests fighting over the same `thread_map.json`.
+    pub(crate) fn new_in(
+        home: &Path,
+        config: AgentConfig,
+        max_sessions: usize,
+        hung_threshold_secs: u64,
+        default_config_options: HashMap<String, String>,
+    ) -> Self {
+        let openab_dir = home.join(".openab");
         let _ = std::fs::create_dir_all(&openab_dir);
         let mapping_path = openab_dir.join("thread_map.json");
         let meta_path = openab_dir.join("session_meta.json");
@@ -1252,8 +1272,10 @@ mod tests {
     use super::{
         attach_external_session_state, better_candidate, classify_hung, classify_idle,
         get_or_insert_gate, has_session_state, purge_session_entries, remove_if_same_handle,
-        session_state, PoolState, SessionState,
+        session_state, PoolState, SessionPool, SessionState,
     };
+    use crate::config::AgentConfig;
+    use std::time::Duration;
     use crate::acp::connection::SessionActivity;
     use std::collections::HashMap;
     use std::sync::Arc;
@@ -1486,6 +1508,65 @@ mod tests {
 
         assert!(Arc::ptr_eq(&first, &second));
         assert_eq!(map.len(), 1);
+    }
+
+    /// `get_or_create` holds a per-thread gate from its first line until it has
+    /// inserted the finished connection — across `spawn`, `initialize` and
+    /// `session/load`. That is seconds of real time, and exactly the window in
+    /// which someone reaches for `/reset` because the session feels stuck.
+    ///
+    /// `detach_session` and `attach_external_session` take that gate.
+    /// `reset_session` does not. It can therefore land in the middle of a
+    /// creation that read `saved_session_id` *before* the reset and will
+    /// re-insert it on its way out: the reset reports success, and the thread
+    /// comes back holding the history it was meant to lose.
+    ///
+    /// The test pins the asymmetry rather than the interleaving, which cannot be
+    /// driven here without a live agent subprocess. Both calls run under
+    /// identical conditions, so the difference between them is the code's.
+    #[tokio::test]
+    async fn reset_session_is_not_serialised_against_session_creation() {
+        let dir = tempfile::tempdir().unwrap();
+        let pool = SessionPool::new_in(dir.path(), AgentConfig::default(), 4, 600, HashMap::new());
+        const KEY: &str = "discord:T1";
+
+        {
+            let mut state = pool.state.write().await;
+            state
+                .persisted
+                .insert(KEY.to_string(), "sess_old".to_string());
+            state
+                .suspended
+                .insert(KEY.to_string(), "sess_old".to_string());
+        }
+
+        // Stands in for an in-flight `get_or_create`, which owns this gate for
+        // the whole of its slow section.
+        let gate = {
+            let mut state = pool.state.write().await;
+            get_or_insert_gate(&mut state.creating, KEY)
+        };
+        let creating = gate.lock().await;
+
+        // Ungated: runs to completion while a creation is in flight.
+        tokio::time::timeout(Duration::from_secs(2), pool.reset_session(KEY))
+            .await
+            .expect(
+                "reset_session waited for the creating gate — the gap is closed, update this test",
+            )
+            .expect("reset_session should clear an existing session");
+        assert_eq!(pool.session_snapshot(KEY).await.state, SessionState::None);
+
+        // Gated, under exactly the same conditions — so the difference above
+        // belongs to the code and not to this test's setup.
+        let detached =
+            tokio::time::timeout(Duration::from_millis(300), pool.detach_session(KEY)).await;
+        assert!(
+            detached.is_err(),
+            "detach_session returned without waiting for the gate; the contrast this test relies on is invalid"
+        );
+
+        drop(creating);
     }
 
     #[test]
