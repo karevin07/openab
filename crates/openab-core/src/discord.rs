@@ -492,7 +492,7 @@ fn task_control_rows(task: &TaskRecord) -> Vec<CreateActionRow> {
     };
     let commands = || {
         CreateButton::new("oab_task:commands")
-            .label("⌨ Commands")
+            .label("⌨ Repository commands")
             .style(ButtonStyle::Secondary)
     };
 
@@ -690,7 +690,7 @@ fn project_welcome_components(tasks: &[TaskRecord]) -> Vec<CreateActionRow> {
             .label("📤 Attach local chat")
             .style(ButtonStyle::Success),
         CreateButton::new("oab_project:actions")
-            .label("⚡ Task templates")
+            .label("⚡ New task templates")
             .style(ButtonStyle::Secondary),
         CreateButton::new("oab_project:sessions")
             .label("🧠 Sessions")
@@ -898,7 +898,13 @@ fn project_actions_message(
             "Repository",
             inline_code(&format!("@{}", binding.workspace_alias)),
             true,
-        );
+        )
+        .field(
+            "只是想查狀態？",
+            "git status、diff、make help 這類確定性輸出，用 ⌨ Repository commands 更快 —— 直接執行、不經過模型、不佔用對話輪次。",
+            false,
+        )
+        ;
     if actions.is_empty() {
         return CreateInteractionResponseMessage::new()
             .embed(embed.field(
@@ -958,6 +964,11 @@ fn task_actions_message(
             true,
         )
         .field("Current session", format!("<#{}>", task.thread_id), true)
+        .field(
+            "只是想查狀態？",
+            "git status、diff、make help 這類確定性輸出，用 ⌨ Repository commands 更快 —— 直接執行、不經過模型、不佔用對話輪次。",
+            false,
+        )
         .footer(CreateEmbedFooter::new(
             if matches!(task.state, TaskState::Queued | TaskState::Running) {
                 "Queued in this Cursor session · no new thread"
@@ -1006,7 +1017,7 @@ fn task_commands_message(
     let mut embed = CreateEmbed::new()
         .title(format!("⌨ Repository tools · {}", task.title))
         .description(
-            "直接在目前 repository 執行管理者允許的固定指令。不會建立 thread，也不會把輸出加入 Cursor 對話 context。",
+            "直接執行管理者允許的固定指令，不經過模型，輸出即為實際結果。不會建立 thread、不會中斷進行中的工作，也不會把輸出加入 Cursor 對話 context。",
         )
         .colour(0x2ECC71)
         .field(
@@ -1077,7 +1088,7 @@ fn project_commands_message(
             binding.workspace_alias
         ))
         .description(
-            "選擇管理者預先允許的固定指令。一般指令直接在 repository 執行；Git push 由隔離的 credential broker 處理。不建立 Cursor session，也不接受任意 shell 輸入。",
+            "選擇管理者預先允許的固定指令。直接執行、不經過模型，輸出即為實際結果。一般指令在 repository 內執行；Git push 由隔離的 credential broker 處理。不建立 Cursor session，也不接受任意 shell 輸入。",
         )
         .colour(0x2ECC71)
         .field(
@@ -1242,7 +1253,7 @@ fn project_welcome_message(binding: &ProjectBinding, tasks: &[TaskRecord]) -> Cr
     let embed = project_info_embed(binding)
         .field(
             "1 · Start a task",
-            "Tap **New task** for a custom request or **Task templates** to start a new thread from a preset. Repository commands do not create a session.",
+            "Tap **New task** for a custom request or **New task templates** to start a new thread from a preset. **Repository commands** run without a model and never create a session.",
             false,
         )
         .field(
@@ -1265,7 +1276,7 @@ fn project_welcome_edit(binding: &ProjectBinding, tasks: &[TaskRecord]) -> EditM
     let embed = project_info_embed(binding)
         .field(
             "1 · Start a task",
-            "Tap **New task** for a custom request or **Task templates** to start a new thread from a preset. Repository commands do not create a session.",
+            "Tap **New task** for a custom request or **New task templates** to start a new thread from a preset. **Repository commands** run without a model and never create a session.",
             false,
         )
         .field(
@@ -1406,7 +1417,7 @@ fn help_action_center(
         if offers_repository_commands(task.state) {
             task_buttons.push(
                 CreateButton::new("oab_task:commands")
-                    .label("⌨ Commands")
+                    .label("⌨ Repository commands")
                     .style(ButtonStyle::Secondary),
             );
         }
@@ -1467,7 +1478,7 @@ fn help_topic_message(
     let (title, description) = match topic {
         "discord" => (
             "📱 在 Discord 開始開發",
-            "1. 在 Project Home 點 **New task**，或用 **Task templates** 從範本建立新 thread。\n2. 進入既有 task 後，用狀態卡的 **Continue** 或 **Quick actions** 接續同一個 Cursor session。\n3. **Commands** 只操作 repository，不建立 session，也不加入 Cursor context。\n4. 要查看 repository 內的 PNG，直接請 Agent 將相對路徑圖片傳回 Discord。",
+            "1. 在 Project Home 點 **New task**，或用 **New task templates** 從範本建立新 thread。\n2. 進入既有 task 後，用狀態卡的 **Continue** 或 **Quick actions** 接續同一個 Cursor session；Agent 執行中送出的會排入佇列。\n3. **Repository commands** 直接執行固定指令，不經過模型、不建立 session、不加入 Cursor context，任何時候都能用。\n4. 要查看 repository 內的 PNG，直接請 Agent 將相對路徑圖片傳回 Discord。",
         ),
         "cursor" => (
             "🖥️ 回到電腦接續",
@@ -1498,7 +1509,7 @@ fn help_topic_message(
                     );
                     buttons.push(
                         CreateButton::new("oab_project:actions")
-                            .label("⚡ Task templates")
+                            .label("⚡ New task templates")
                             .style(ButtonStyle::Secondary),
                     );
                     buttons.push(
@@ -1582,7 +1593,7 @@ fn help_project_message(
         );
         buttons.push(
             CreateButton::new("oab_project:actions")
-                .label("⚡ Task templates")
+                .label("⚡ New task templates")
                 .style(ButtonStyle::Secondary),
         );
         buttons.push(
@@ -4231,6 +4242,21 @@ impl Handler {
             .send_message(&ctx.http, task_status_message(task))
             .await
             .map_err(|error| format!("Could not post Task Status: {error}"))?;
+        // The card is edited in place, so it stays where it was first posted and
+        // sinks out of reach as the thread grows — which is exactly where its
+        // controls live. Pinning keeps it one tap away without re-posting the
+        // card on every turn, at the cost of one "pinned a message" system line
+        // when the thread starts.
+        //
+        // Best-effort: a thread where the bot lacks Manage Messages still works,
+        // it just needs a scroll or `/help`.
+        if let Err(error) = message.pin(&ctx.http).await {
+            tracing::warn!(
+                %error,
+                thread_id = task.thread_id,
+                "could not pin Task Status card; controls stay reachable via /help"
+            );
+        }
         match self
             .task_registry
             .set_status_message(task.thread_id, message.id.get())
@@ -8916,7 +8942,6 @@ mod tests {
         }
     }
 
-    #[test]
     /// The rule both surfaces read. A repository command runs a fixed argv in
     /// its own process, so only a closed task withholds it; a session request
     /// needs Discord to actually hold the session.
@@ -9200,7 +9225,10 @@ mod tests {
         assert!(project.contains("oab_project:actions"));
         assert!(project.contains("oab_project:commands"));
         assert!(project.contains("oab_project:schedules"));
-        assert!(project.contains("Task templates"));
+        assert!(project.contains("New task templates"));
+        // ⌨ does the same thing on every surface, so its label is identical
+        // everywhere; only ⚡ differs, because its effect genuinely does.
+        assert!(project.contains("Repository commands"));
         assert!(project.contains("Schedules"));
 
         let admin = serde_json::to_string(&admin_navigation_buttons()).unwrap();
