@@ -2175,6 +2175,64 @@ impl Handler {
 
         (involved, other_bot_present)
     }
+
+    /// Buffer one message for ambient observation.
+    ///
+    /// Both ambient routes — the early one for bot messages that bypasses
+    /// Discord-level bot gating, and the later one for humans and bot
+    /// @mentions — need exactly this payload, so it is built once here.
+    ///
+    /// Returns `true` when something was actually buffered. A message with no
+    /// text and no attachments has nothing to observe; either way the caller
+    /// stops afterwards, since an ambient-routed message is never dispatched.
+    async fn submit_ambient(
+        &self,
+        ambient: &crate::ambient::AmbientDispatcher,
+        adapter: &Arc<dyn ChatAdapter>,
+        msg: &Message,
+        bot_id: UserId,
+        channel_id: u64,
+    ) -> bool {
+        let prompt = resolve_mentions(&msg.content, bot_id, &self.allowed_role_ids);
+        if prompt.is_empty() && msg.attachments.is_empty() {
+            return false;
+        }
+
+        let display_name = msg
+            .member
+            .as_ref()
+            .and_then(|m| m.nick.as_ref())
+            .or(msg.author.global_name.as_ref())
+            .unwrap_or(&msg.author.name);
+
+        let channel_ref = ChannelRef {
+            platform: "discord".into(),
+            channel_id: channel_id.to_string(),
+            thread_id: None,
+            parent_id: None,
+            origin_event_id: None,
+        };
+
+        let ambient_msg = crate::ambient::AmbientMessage {
+            sender_name: display_name.to_owned(),
+            sender_id: msg.author.id.to_string(),
+            prompt,
+            extra_blocks: Vec::new(), // Skip attachments for ambient v1
+            arrived_at: std::time::Instant::now(),
+        };
+
+        let target = Arc::clone(&self.router) as Arc<dyn DispatchTarget>;
+        ambient
+            .submit(
+                &channel_id.to_string(),
+                channel_ref,
+                adapter.clone(),
+                target,
+                ambient_msg,
+            )
+            .await;
+        true
+    }
 }
 
 #[serenity::async_trait]
@@ -2418,46 +2476,11 @@ impl EventHandler for Handler {
             if let Some(ambient) = self.ambient.as_ref() {
                 if !ambient.allow_bot_messages() {
                     debug!(channel_id = %msg.channel_id, bot_id = %msg.author.id, "ambient early-route: bot msg rejected (allow_bot_messages=false)");
-                } else {
-                    let prompt = resolve_mentions(&msg.content, bot_id, &self.allowed_role_ids);
-                    if prompt.is_empty() && msg.attachments.is_empty() {
-                        return;
-                    }
-
-                    let display_name = msg
-                        .member
-                        .as_ref()
-                        .and_then(|m| m.nick.as_ref())
-                        .or(msg.author.global_name.as_ref())
-                        .unwrap_or(&msg.author.name);
-
-                    let channel_ref = ChannelRef {
-                        platform: "discord".into(),
-                        channel_id: channel_id.to_string(),
-                        thread_id: None,
-                        parent_id: None,
-                        origin_event_id: None,
-                    };
-
-                    let ambient_msg = crate::ambient::AmbientMessage {
-                        sender_name: display_name.to_owned(),
-                        sender_id: msg.author.id.to_string(),
-                        prompt,
-                        extra_blocks: Vec::new(),
-                        arrived_at: std::time::Instant::now(),
-                    };
-
-                    let target = Arc::clone(&self.router) as Arc<dyn DispatchTarget>;
+                } else if self
+                    .submit_ambient(ambient, &adapter, &msg, bot_id, channel_id)
+                    .await
+                {
                     debug!(channel_id = %msg.channel_id, bot_id = %msg.author.id, "ambient early-route: bot msg buffered");
-                    ambient
-                        .submit(
-                            &channel_id.to_string(),
-                            channel_ref,
-                            adapter.clone(),
-                            target,
-                            ambient_msg,
-                        )
-                        .await;
                 }
             }
             return;
@@ -2582,44 +2605,7 @@ impl EventHandler for Handler {
                     if msg.author.bot && !ambient.allow_bot_messages() {
                         return;
                     }
-
-                    let prompt = resolve_mentions(&msg.content, bot_id, &self.allowed_role_ids);
-                    if prompt.is_empty() && msg.attachments.is_empty() {
-                        return;
-                    }
-
-                    let display_name = msg
-                        .member
-                        .as_ref()
-                        .and_then(|m| m.nick.as_ref())
-                        .or(msg.author.global_name.as_ref())
-                        .unwrap_or(&msg.author.name);
-
-                    let channel_ref = ChannelRef {
-                        platform: "discord".into(),
-                        channel_id: channel_id.to_string(),
-                        thread_id: None,
-                        parent_id: None,
-                        origin_event_id: None,
-                    };
-
-                    let ambient_msg = crate::ambient::AmbientMessage {
-                        sender_name: display_name.to_owned(),
-                        sender_id: msg.author.id.to_string(),
-                        prompt,
-                        extra_blocks: Vec::new(), // Skip attachments for ambient v1
-                        arrived_at: std::time::Instant::now(),
-                    };
-
-                    let target = Arc::clone(&self.router) as Arc<dyn DispatchTarget>;
-                    ambient
-                        .submit(
-                            &channel_id.to_string(),
-                            channel_ref,
-                            adapter.clone(),
-                            target,
-                            ambient_msg,
-                        )
+                    self.submit_ambient(ambient, &adapter, &msg, bot_id, channel_id)
                         .await;
                     return;
                 }
