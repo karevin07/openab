@@ -1,4 +1,4 @@
-use crate::acp::connection::{AcpConnection, AcpRequestError, SessionActivity};
+use crate::acp::connection::{AcpConnection, SessionActivity};
 use crate::acp::protocol::ConfigOption;
 use crate::config::AgentConfig;
 use anyhow::{anyhow, Result};
