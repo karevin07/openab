@@ -44,6 +44,10 @@ pub mod discord_admin;
 #[cfg(feature = "discord")]
 pub mod discord_admin_ui;
 #[cfg(feature = "discord")]
+pub mod discord_queue_ui;
+#[cfg(feature = "discord")]
+pub mod discord_session_ui;
+#[cfg(feature = "discord")]
 pub mod workspace_attachment;
 #[cfg(feature = "discord")]
 pub mod ambient;
