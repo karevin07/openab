@@ -2481,9 +2481,8 @@ impl EventHandler for Handler {
             // trusted_bot_ids. Messages from trusted bots without @mention still
             // follow normal gating. Empty trusted_bot_ids (default) disables this
             // entirely — no behavioral change for existing deployments.
-            let trusted_mention = is_mentioned
-                && !self.trusted_bot_ids.is_empty()
-                && self.trusted_bot_ids.contains(&msg.author.id.get());
+            let trusted_mention =
+                is_trusted_bot_mention(is_mentioned, &self.trusted_bot_ids, msg.author.id.get());
 
             if !trusted_mention {
                 match self.allow_bot_messages {
@@ -2635,46 +2634,43 @@ impl EventHandler for Handler {
         //   in the thread, require @mention to avoid all bots responding.
         // DMs are treated as implicit @mention (mirrors Slack behavior).
         if !is_mentioned && !is_dm && !implicit_project_prompt {
-            match self.allow_user_messages {
-                AllowUsers::Mentions => return,
-                AllowUsers::Involved => {
-                    if !in_thread {
-                        return;
-                    }
-                    let (involved, _) = if bot_owns_thread {
-                        (true, false) // other_bot_present not needed for Involved mode
-                    } else {
-                        self.bot_participated_in_thread(&ctx.http, msg.channel_id, bot_id)
-                            .await
-                    };
-                    if !involved {
-                        tracing::debug!(channel_id = %msg.channel_id, "bot not involved in thread, ignoring");
-                        return;
-                    }
+            // Resolving involvement can cost an HTTP fetch, so only pay for it
+            // where the answer can change the outcome: `Mentions` never consults
+            // it, outside a thread there is nothing to be involved in, and owning
+            // the thread already implies involvement. `MultibotMentions` still
+            // fetches in the owned case — not for involvement, but because it is
+            // the only way to learn whether another bot is present.
+            let (involved, other_bot_present) = match self.allow_user_messages {
+                AllowUsers::Mentions => (false, false),
+                _ if !in_thread => (false, false),
+                AllowUsers::Involved if bot_owns_thread => (true, false),
+                AllowUsers::MultibotMentions if bot_owns_thread => {
+                    let (_, other_bot) = self
+                        .bot_participated_in_thread(&ctx.http, msg.channel_id, bot_id)
+                        .await;
+                    (true, other_bot)
                 }
-                AllowUsers::MultibotMentions => {
-                    if !in_thread {
-                        return;
-                    }
-                    let (involved, other_bot) = if bot_owns_thread {
-                        // Still need to check for other bots
-                        let (_, other) = self
-                            .bot_participated_in_thread(&ctx.http, msg.channel_id, bot_id)
-                            .await;
-                        (true, other)
-                    } else {
-                        self.bot_participated_in_thread(&ctx.http, msg.channel_id, bot_id)
-                            .await
-                    };
-                    if !involved {
-                        tracing::debug!(channel_id = %msg.channel_id, "bot not involved in thread, ignoring");
-                        return;
-                    }
-                    if other_bot {
-                        tracing::debug!(channel_id = %msg.channel_id, "multi-bot thread, requiring @mention");
-                        return;
-                    }
+                _ => {
+                    self.bot_participated_in_thread(&ctx.http, msg.channel_id, bot_id)
+                        .await
                 }
+            };
+            if !should_process_user_message(
+                self.allow_user_messages,
+                is_mentioned,
+                in_thread,
+                involved,
+                other_bot_present,
+            ) {
+                tracing::debug!(
+                    channel_id = %msg.channel_id,
+                    mode = ?self.allow_user_messages,
+                    in_thread,
+                    involved,
+                    other_bot_present,
+                    "user message gated out"
+                );
+                return;
             }
         }
 
@@ -2882,7 +2878,7 @@ impl EventHandler for Handler {
             "processing"
         );
 
-        let thread_channel = if in_thread || is_dm {
+        let thread_channel = if should_skip_thread_creation(in_thread, is_dm) {
             // DMs use the DM channel directly (no threads in DMs).
             ChannelRef {
                 platform: "discord".into(),
@@ -8377,7 +8373,6 @@ pub(crate) fn is_denied_user(
 /// Returns `true` if a bot message should bypass the `allow_bot_messages` mode check.
 /// A trusted bot that @mentions this bot is treated the same as a human @mention —
 /// it can pull the bot into a thread regardless of the `allow_bot_messages` setting.
-#[cfg(test)]
 fn is_trusted_bot_mention(
     is_mentioned: bool,
     trusted_bot_ids: &HashSet<u64>,
@@ -8386,31 +8381,21 @@ fn is_trusted_bot_mention(
     is_mentioned && !trusted_bot_ids.is_empty() && trusted_bot_ids.contains(&author_id)
 }
 
-/// Pure decision function: should a DM be processed?
-/// Returns `true` if the DM should be processed (bot responds).
-/// Mirrors the DM gating logic in EventHandler::message:
-/// - `allow_dm` must be true
-/// - `allowed_users` still applies (checked separately via `is_denied_user`)
-/// - DMs bypass `allowed_channels` and `@mention` requirements
-#[cfg(test)]
-fn should_process_dm(allow_dm: bool) -> bool {
-    allow_dm
-}
-
 /// Pure decision function: should thread creation be skipped?
 /// Returns `true` when the message should reuse the current channel
 /// directly (existing thread or DM), `false` when a new thread should
 /// be created. Pins the invariant that DMs never call
 /// `get_or_create_thread()` — Discord DM channels cannot create threads.
-#[cfg(test)]
 fn should_skip_thread_creation(in_thread: bool, is_dm: bool) -> bool {
     in_thread || is_dm
 }
 
-/// Pure decision function: should this message be processed or ignored?
-/// Returns `true` if the message should be processed (bot responds).
-/// Extracted from the EventHandler::message gating logic for testability.
-#[cfg(test)]
+/// Should this message be processed or ignored?
+///
+/// This *is* the user gate `EventHandler::message` applies — the caller resolves
+/// `involved` / `other_bot_present` (which may need an HTTP fetch) and this
+/// decides. It used to be a `#[cfg(test)]` copy of an inlined `match`, so the
+/// tests pinned a second implementation that could drift from the one that ran.
 fn should_process_user_message(
     mode: AllowUsers,
     is_mentioned: bool,
@@ -10516,30 +10501,13 @@ mod tests {
     // DMs are gated by `allow_dm` config. When allowed, DMs bypass
     // `allowed_channels` and treat the message as implicit @mention.
 
-    /// GIVEN: allow_dm = false
-    /// WHEN:  user sends a DM
-    /// THEN:  DM is rejected
-    #[test]
-    fn dm_rejected_when_allow_dm_false() {
-        assert!(!should_process_dm(false));
-    }
-
-    /// GIVEN: allow_dm = true
-    /// WHEN:  user sends a DM
-    /// THEN:  DM is accepted
-    #[test]
-    fn dm_accepted_when_allow_dm_true() {
-        assert!(should_process_dm(true));
-    }
-
     /// GIVEN: allow_dm = true, user NOT in allowed_users
     /// WHEN:  user sends a DM
     /// THEN:  user is denied (allowed_users still enforced in DMs)
     #[test]
     fn dm_denied_user_still_enforced() {
         let allowed = HashSet::from([100]);
-        // DM passes allow_dm gate, but user gate still applies
-        assert!(should_process_dm(true));
+        // A DM bypasses the channel allowlist, but the user gate still applies.
         assert!(is_denied_user(false, false, &allowed, 999));
     }
 
@@ -10549,7 +10517,6 @@ mod tests {
     #[test]
     fn dm_allowed_user_passes() {
         let allowed = HashSet::from([100]);
-        assert!(should_process_dm(true));
         assert!(!is_denied_user(false, false, &allowed, 100));
     }
 
