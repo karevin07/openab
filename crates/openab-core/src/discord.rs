@@ -13,7 +13,8 @@ use crate::cron::{
 };
 use crate::discord_admin::{
     AdminInventory, AdminStatus, CategoryPlan, ChannelPlan, CleanupCandidates, CreatedCategory,
-    CreatedTextChannel, DeletedResource, DeletionPlan, DiscordAdminClient,
+    CreatedTextChannel, DeletedResource, DeletionPlan, DiscordAdminClient, MutationOutcome,
+    MutationPlan,
 };
 use crate::dispatch::{ActiveMessage, DispatchTarget, PendingMessage};
 use crate::directives::resolve_workspace;
@@ -72,6 +73,20 @@ const SELECT_OPTION_TEXT_MAX: usize = 100;
 
 /// Keep workspace catalogs comfortably below Discord's 2000-character limit.
 const WORKSPACE_LIST_LIMIT: usize = 25;
+
+fn first_string_select(kind: &ComponentInteractionDataKind) -> Option<&str> {
+    match kind {
+        ComponentInteractionDataKind::StringSelect { values } => values.first().map(String::as_str),
+        _ => None,
+    }
+}
+
+fn first_role_select(kind: &ComponentInteractionDataKind) -> Option<u64> {
+    match kind {
+        ComponentInteractionDataKind::RoleSelect { values } => values.first().map(|role| role.get()),
+        _ => None,
+    }
+}
 
 /// Truncate to at most `max` characters (not bytes — Discord counts
 /// characters, and slicing on a byte boundary would panic on multi-byte
@@ -1685,6 +1700,20 @@ fn admin_navigation_buttons() -> Vec<CreateActionRow> {
                 .style(ButtonStyle::Secondary),
         ]),
         CreateActionRow::Buttons(vec![
+            CreateButton::new("oab_admin:rename")
+                .label("✏ Rename")
+                .style(ButtonStyle::Secondary),
+            CreateButton::new("oab_admin:move")
+                .label("↕ Move")
+                .style(ButtonStyle::Secondary),
+            CreateButton::new("oab_admin:permissions")
+                .label("🔐 Permissions")
+                .style(ButtonStyle::Secondary),
+            CreateButton::new("oab_admin:structure")
+                .label("📐 Structure")
+                .style(ButtonStyle::Secondary),
+        ]),
+        CreateActionRow::Buttons(vec![
             CreateButton::new("oab_help:back")
                 .label("← Help")
                 .style(ButtonStyle::Secondary),
@@ -1740,7 +1769,7 @@ fn admin_status_card(status: &AdminStatus) -> InteractionCard {
                 false,
             )
             .footer(CreateEmbedFooter::new(
-                "Phase A-C: inspect, provision channels, and safely clean empty resources",
+                "Phase A-D: inspect, provision, rename/move, permissions, structure, cleanup",
             )),
         components: admin_navigation_buttons(),
     }
@@ -2151,6 +2180,373 @@ fn admin_deleted_card(deleted: &DeletedResource) -> InteractionCard {
             ))
             .colour(0x2ECC71)
             .field("Resource ID", inline_code(&deleted.id), false),
+        components: admin_navigation_buttons(),
+    }
+}
+
+const ADMIN_PERMISSION_TEMPLATES: &[(&str, &str)] = &[
+    ("inherit", "Inherit category permissions"),
+    ("public", "Everyone can read and write"),
+    ("announcement", "Everyone reads; owner posts"),
+    ("private-project", "Selected role plus owner"),
+    ("admin-only", "Owner and Admin Bot only"),
+];
+
+const ADMIN_STRUCTURE_BLUEPRINTS: &[(&str, &str)] = &[
+    ("openab", "OpenAB projects and operations"),
+    ("development", "Compact development workspace"),
+    ("community", "Announcements and feedback"),
+];
+
+fn admin_text_channel_options(
+    inventory: &AdminInventory,
+) -> Vec<(String, String, String)> {
+    let mut options = Vec::new();
+    for category in &inventory.categories {
+        for channel in &category.channels {
+            if channel.kind != "text" {
+                continue;
+            }
+            options.push((
+                channel.id.clone(),
+                format!("#{}", channel.name),
+                category.name.clone(),
+            ));
+        }
+    }
+    for channel in &inventory.uncategorized {
+        if channel.kind == "text" {
+            options.push((
+                channel.id.clone(),
+                format!("#{}", channel.name),
+                "Uncategorized".into(),
+            ));
+        }
+    }
+    options
+}
+
+fn admin_permission_channel_options(
+    inventory: &AdminInventory,
+) -> Vec<(String, String, String)> {
+    let mut options = Vec::new();
+    for category in &inventory.categories {
+        for channel in &category.channels {
+            if channel.kind != "text" && channel.kind != "forum" {
+                continue;
+            }
+            options.push((
+                channel.id.clone(),
+                format!("#{}", channel.name),
+                format!("{} · {}", category.name, channel.kind),
+            ));
+        }
+    }
+    options
+}
+
+fn admin_rename_target_options(
+    inventory: &AdminInventory,
+) -> Vec<(String, String, String)> {
+    let mut options = Vec::new();
+    for category in &inventory.categories {
+        options.push((
+            format!("category:{}", category.id),
+            format!("🗂️ {}", category.name),
+            "category".into(),
+        ));
+        for channel in &category.channels {
+            if channel.kind != "text" && channel.kind != "forum" {
+                continue;
+            }
+            options.push((
+                format!("{}:{}", if channel.kind == "forum" { "forum" } else { "text_channel" }, channel.id),
+                format!("#{}", channel.name),
+                format!("{} · {}", category.name, channel.kind),
+            ));
+        }
+    }
+    options
+}
+
+fn admin_select_row(
+    custom_id: impl Into<String>,
+    placeholder: &str,
+    options: Vec<(String, String, String)>,
+) -> Option<CreateActionRow> {
+    if options.is_empty() {
+        return None;
+    }
+    let menu_options = options
+        .into_iter()
+        .take(SELECT_MENU_PAGE_SIZE)
+        .map(|(value, label, description)| {
+            CreateSelectMenuOption::new(
+                truncate_for_discord(&suppress_mentions(&label), SELECT_OPTION_TEXT_MAX),
+                value,
+            )
+            .description(truncate_for_discord(
+                &suppress_mentions(&description),
+                SELECT_OPTION_TEXT_MAX,
+            ))
+        })
+        .collect();
+    Some(CreateActionRow::SelectMenu(
+        CreateSelectMenu::new(custom_id, CreateSelectMenuKind::String { options: menu_options })
+            .placeholder(placeholder.to_string()),
+    ))
+}
+
+fn admin_rename_card(inventory: &AdminInventory) -> InteractionCard {
+    let options = admin_rename_target_options(inventory);
+    let mut embed = CreateEmbed::new()
+        .title("✏ Rename")
+        .description("Choose a category, text channel, or Forum. A form asks for the new name; nothing changes before confirmation.")
+        .colour(0x5865F2);
+    let mut components = Vec::new();
+    if let Some(row) = admin_select_row("oab_admin_rename_target", "Select something to rename", options) {
+        components.push(row);
+    } else {
+        embed = embed.field("Nothing to rename", "No categories or text/Forum channels were found.", false);
+    }
+    components.extend(admin_navigation_buttons());
+    InteractionCard {
+        content: String::new(),
+        embed,
+        components,
+    }
+}
+
+fn admin_rename_modal(target_type: &str, target_id: u64) -> CreateModal {
+    CreateModal::new(
+        format!("oab_admin_rename:{target_type}:{target_id}"),
+        "Preview rename",
+    )
+    .components(vec![CreateActionRow::InputText(
+        CreateInputText::new(InputTextStyle::Short, "New name", "name")
+            .min_length(1)
+            .max_length(100),
+    )])
+}
+
+fn admin_move_channel_card(inventory: &AdminInventory) -> InteractionCard {
+    let options = admin_text_channel_options(inventory);
+    let mut embed = CreateEmbed::new()
+        .title("↕ Move channel")
+        .description("Choose a text channel, then the destination category. Forum channels stay where they are.")
+        .colour(0x5865F2);
+    let mut components = Vec::new();
+    if let Some(row) = admin_select_row("oab_admin_move_channel", "Select a text channel", options) {
+        components.push(row);
+    } else {
+        embed = embed.field("No text channels", "Create a text channel first.", false);
+    }
+    components.extend(admin_navigation_buttons());
+    InteractionCard {
+        content: String::new(),
+        embed,
+        components,
+    }
+}
+
+fn admin_move_category_card(inventory: &AdminInventory, channel_id: u64) -> InteractionCard {
+    let options = inventory
+        .categories
+        .iter()
+        .map(|category| {
+            (
+                category.id.clone(),
+                format!("🗂️ {}", category.name),
+                format!("{} channel(s)", category.channels.len()),
+            )
+        })
+        .collect();
+    let mut embed = CreateEmbed::new()
+        .title("↕ Choose destination category")
+        .description("The channel inherits the destination category's permissions unless it has custom overwrites.")
+        .colour(0x5865F2);
+    let mut components = Vec::new();
+    if let Some(row) = admin_select_row(
+        format!("oab_admin_move_category:{channel_id}"),
+        "Select destination category",
+        options,
+    ) {
+        components.push(row);
+    } else {
+        embed = embed.field("No categories", "Create a category first.", false);
+    }
+    components.extend(admin_navigation_buttons());
+    InteractionCard {
+        content: String::new(),
+        embed,
+        components,
+    }
+}
+
+fn admin_permission_channel_card(inventory: &AdminInventory) -> InteractionCard {
+    let options = admin_permission_channel_options(inventory);
+    let mut embed = CreateEmbed::new()
+        .title("🔐 Permission template")
+        .description("Choose a text or Forum channel, then a template. `private-project` also asks for an access role. This replaces current overwrites.")
+        .colour(0x5865F2);
+    let mut components = Vec::new();
+    if let Some(row) = admin_select_row("oab_admin_perm_channel", "Select a channel", options) {
+        components.push(row);
+    } else {
+        embed = embed.field("No channels", "Create a text or Forum channel first.", false);
+    }
+    components.extend(admin_navigation_buttons());
+    InteractionCard {
+        content: String::new(),
+        embed,
+        components,
+    }
+}
+
+fn admin_permission_template_card(channel_id: u64) -> InteractionCard {
+    let options = ADMIN_PERMISSION_TEMPLATES
+        .iter()
+        .map(|(value, description)| ((*value).to_string(), (*value).to_string(), (*description).to_string()))
+        .collect();
+    InteractionCard {
+        content: String::new(),
+        embed: CreateEmbed::new()
+            .title("🔐 Choose permission template")
+            .description("Existing channel overwrites will be replaced after you confirm.")
+            .colour(0x5865F2),
+        components: {
+            let mut components = Vec::new();
+            if let Some(row) = admin_select_row(
+                format!("oab_admin_perm_template:{channel_id}"),
+                "Select a template",
+                options,
+            ) {
+                components.push(row);
+            }
+            components.extend(admin_navigation_buttons());
+            components
+        },
+    }
+}
+
+fn admin_permission_role_card(channel_id: u64, template: &str) -> InteractionCard {
+    let mut components = vec![CreateActionRow::SelectMenu(
+        CreateSelectMenu::new(
+            format!("oab_admin_perm_role:{channel_id}:{template}"),
+            CreateSelectMenuKind::Role { default_roles: None },
+        )
+        .placeholder("Select access role"),
+    )];
+    components.extend(admin_navigation_buttons());
+    InteractionCard {
+        content: String::new(),
+        embed: CreateEmbed::new()
+            .title("🔐 Select access role")
+            .description("`private-project` needs a non-@everyone role that can see this channel.")
+            .colour(0x5865F2),
+        components,
+    }
+}
+
+fn admin_structure_blueprint_card() -> InteractionCard {
+    let options = ADMIN_STRUCTURE_BLUEPRINTS
+        .iter()
+        .map(|(value, description)| {
+            ((*value).to_string(), (*value).to_string(), (*description).to_string())
+        })
+        .collect();
+    let mut components = Vec::new();
+    if let Some(row) = admin_select_row("oab_admin_struct_blueprint", "Select a structure", options)
+    {
+        components.push(row);
+    }
+    components.extend(admin_navigation_buttons());
+    InteractionCard {
+        content: String::new(),
+        embed: CreateEmbed::new()
+            .title("📐 Apply structure")
+            .description("Creates missing categories and channels from a built-in blueprint. Existing same-name items are skipped, never overwritten.")
+            .colour(0x5865F2),
+        components,
+    }
+}
+
+fn admin_structure_template_card(blueprint: &str) -> InteractionCard {
+    let options = ADMIN_PERMISSION_TEMPLATES
+        .iter()
+        .map(|(value, description)| {
+            ((*value).to_string(), (*value).to_string(), (*description).to_string())
+        })
+        .collect();
+    let mut components = Vec::new();
+    if let Some(row) = admin_select_row(
+        format!("oab_admin_struct_template:{blueprint}"),
+        "Select permissions for new channels",
+        options,
+    ) {
+        components.push(row);
+    }
+    components.extend(admin_navigation_buttons());
+    InteractionCard {
+        content: String::new(),
+        embed: CreateEmbed::new()
+            .title("📐 Structure permissions")
+            .description(format!("Blueprint `{}`. New channels receive this template; existing channels keep their current overwrites.", blueprint))
+            .colour(0x5865F2),
+        components,
+    }
+}
+
+fn admin_structure_role_card(blueprint: &str, template: &str) -> InteractionCard {
+    let mut components = vec![CreateActionRow::SelectMenu(
+        CreateSelectMenu::new(
+            format!("oab_admin_struct_role:{blueprint}:{template}"),
+            CreateSelectMenuKind::Role { default_roles: None },
+        )
+        .placeholder("Select access role"),
+    )];
+    components.extend(admin_navigation_buttons());
+    InteractionCard {
+        content: String::new(),
+        embed: CreateEmbed::new()
+            .title("📐 Select access role")
+            .description("`private-project` needs a non-@everyone role for newly created channels.")
+            .colour(0x5865F2),
+        components,
+    }
+}
+
+fn admin_mutation_preview_card(plan: &MutationPlan, confirm_prefix: &str) -> InteractionCard {
+    InteractionCard {
+        content: String::new(),
+        embed: CreateEmbed::new()
+            .title("⚠️ Confirm server change")
+            .description(truncate_for_discord(&plan.summary, 3500))
+            .colour(0xF1C40F)
+            .field("Operation", inline_code(&plan.operation), false)
+            .footer(CreateEmbedFooter::new(format!(
+                "This preview expires in {} seconds",
+                plan.expires_in_seconds
+            ))),
+        components: vec![CreateActionRow::Buttons(vec![
+            CreateButton::new(format!("oab_admin:{confirm_prefix}:{}", plan.id))
+                .label("Confirm")
+                .style(ButtonStyle::Success),
+            CreateButton::new("oab_admin:cancel")
+                .label("Cancel")
+                .style(ButtonStyle::Secondary),
+        ])],
+    }
+}
+
+fn admin_mutation_done_card(result: &MutationOutcome) -> InteractionCard {
+    InteractionCard {
+        content: String::new(),
+        embed: CreateEmbed::new()
+            .title("✅ Server change applied")
+            .description(truncate_for_discord(&result.summary, 3500))
+            .colour(0x2ECC71)
+            .field("Operation", inline_code(&result.operation), false),
         components: admin_navigation_buttons(),
     }
 }
@@ -4675,8 +5071,7 @@ impl EventHandler for Handler {
             }
             Interaction::Component(comp)
                 if comp.data.custom_id.starts_with("oab_admin:")
-                    || comp.data.custom_id == "oab_admin_cleanup"
-                    || comp.data.custom_id == "oab_admin_channel_category" =>
+                    || comp.data.custom_id.starts_with("oab_admin_") =>
             {
                 self.handle_admin_component(&ctx, &comp).await;
             }
@@ -4717,6 +5112,11 @@ impl EventHandler for Handler {
             }
             Interaction::Modal(modal) if modal.data.custom_id == "oab_admin_category_create" => {
                 self.handle_admin_category_modal(&ctx, &modal).await;
+            }
+            Interaction::Modal(modal)
+                if modal.data.custom_id.starts_with("oab_admin_rename:") =>
+            {
+                self.handle_admin_rename_modal(&ctx, &modal).await;
             }
             Interaction::Modal(modal)
                 if modal
@@ -5241,6 +5641,265 @@ impl Handler {
             }
             return;
         }
+        if comp.data.custom_id == "oab_admin_rename_target" {
+            let Some((target_type, target_id)) = first_string_select(&comp.data.kind)
+                .and_then(|value| value.split_once(':'))
+                .and_then(|(target_type, target_id)| {
+                    target_id
+                        .parse::<u64>()
+                        .ok()
+                        .map(|target_id| (target_type, target_id))
+                })
+            else {
+                let response = CreateInteractionResponse::Message(
+                    CreateInteractionResponseMessage::new()
+                        .content("⚠️ This rename selection is invalid. Refresh the card.")
+                        .ephemeral(true),
+                );
+                let _ = comp.create_response(&ctx.http, response).await;
+                return;
+            };
+            if let Err(error) = comp
+                .create_response(
+                    &ctx.http,
+                    CreateInteractionResponse::Modal(admin_rename_modal(target_type, target_id)),
+                )
+                .await
+            {
+                tracing::error!(%error, "failed to open admin rename modal");
+            }
+            return;
+        }
+        if comp.data.custom_id == "oab_admin_move_channel" {
+            let Some(channel_id) = first_string_select(&comp.data.kind)
+                .and_then(|value| value.parse::<u64>().ok())
+            else {
+                let response = CreateInteractionResponse::Message(
+                    CreateInteractionResponseMessage::new()
+                        .content("⚠️ This channel selection is invalid. Refresh the card.")
+                        .ephemeral(true),
+                );
+                let _ = comp.create_response(&ctx.http, response).await;
+                return;
+            };
+            if let Err(error) = comp.defer(&ctx.http).await {
+                tracing::error!(%error, "failed to defer move channel selection");
+                return;
+            }
+            let card = match client.inventory(comp.user.id.get(), guild_id).await {
+                Ok(inventory) => admin_move_category_card(&inventory, channel_id),
+                Err(error) => admin_error_card(&error),
+            };
+            let _ = comp.edit_response(&ctx.http, card.into_edit()).await;
+            return;
+        }
+        if let Some(channel_id) = comp
+            .data
+            .custom_id
+            .strip_prefix("oab_admin_move_category:")
+            .and_then(|value| value.parse::<u64>().ok())
+        {
+            let Some(category_id) = first_string_select(&comp.data.kind)
+                .and_then(|value| value.parse::<u64>().ok())
+            else {
+                let response = CreateInteractionResponse::Message(
+                    CreateInteractionResponseMessage::new()
+                        .content("⚠️ This category selection is invalid. Refresh the card.")
+                        .ephemeral(true),
+                );
+                let _ = comp.create_response(&ctx.http, response).await;
+                return;
+            };
+            if let Err(error) = comp.defer(&ctx.http).await {
+                tracing::error!(%error, "failed to defer move preview");
+                return;
+            }
+            let card = match client
+                .preview_move(comp.user.id.get(), guild_id, channel_id, category_id)
+                .await
+            {
+                Ok(preview) => admin_mutation_preview_card(&preview.plan, "confirm_move"),
+                Err(error) => admin_error_card(&error),
+            };
+            let _ = comp.edit_response(&ctx.http, card.into_edit()).await;
+            return;
+        }
+        if comp.data.custom_id == "oab_admin_perm_channel" {
+            let Some(channel_id) = first_string_select(&comp.data.kind)
+                .and_then(|value| value.parse::<u64>().ok())
+            else {
+                let response = CreateInteractionResponse::Message(
+                    CreateInteractionResponseMessage::new()
+                        .content("⚠️ This channel selection is invalid. Refresh the card.")
+                        .ephemeral(true),
+                );
+                let _ = comp.create_response(&ctx.http, response).await;
+                return;
+            };
+            let response = CreateInteractionResponse::UpdateMessage(
+                admin_permission_template_card(channel_id).into_message(),
+            );
+            let _ = comp.create_response(&ctx.http, response).await;
+            return;
+        }
+        if let Some(channel_id) = comp
+            .data
+            .custom_id
+            .strip_prefix("oab_admin_perm_template:")
+            .and_then(|value| value.parse::<u64>().ok())
+        {
+            let Some(template) = first_string_select(&comp.data.kind).map(str::to_owned) else {
+                let response = CreateInteractionResponse::Message(
+                    CreateInteractionResponseMessage::new()
+                        .content("⚠️ This template selection is invalid. Refresh the card.")
+                        .ephemeral(true),
+                );
+                let _ = comp.create_response(&ctx.http, response).await;
+                return;
+            };
+            if template == "private-project" {
+                let response = CreateInteractionResponse::UpdateMessage(
+                    admin_permission_role_card(channel_id, &template).into_message(),
+                );
+                let _ = comp.create_response(&ctx.http, response).await;
+                return;
+            }
+            if let Err(error) = comp.defer(&ctx.http).await {
+                tracing::error!(%error, "failed to defer permission preview");
+                return;
+            }
+            let card = match client
+                .preview_permission(comp.user.id.get(), guild_id, channel_id, &template, None)
+                .await
+            {
+                Ok(preview) => admin_mutation_preview_card(&preview.plan, "confirm_perm"),
+                Err(error) => admin_error_card(&error),
+            };
+            let _ = comp.edit_response(&ctx.http, card.into_edit()).await;
+            return;
+        }
+        if let Some(rest) = comp.data.custom_id.strip_prefix("oab_admin_perm_role:") {
+            let mut parts = rest.splitn(2, ':');
+            let channel_id = parts.next().and_then(|value| value.parse::<u64>().ok());
+            let template = parts.next().map(str::to_owned);
+            let role_id = first_role_select(&comp.data.kind);
+            let (Some(channel_id), Some(template), Some(role_id)) = (channel_id, template, role_id)
+            else {
+                let response = CreateInteractionResponse::Message(
+                    CreateInteractionResponseMessage::new()
+                        .content("⚠️ This role selection is invalid. Refresh the card.")
+                        .ephemeral(true),
+                );
+                let _ = comp.create_response(&ctx.http, response).await;
+                return;
+            };
+            if let Err(error) = comp.defer(&ctx.http).await {
+                tracing::error!(%error, "failed to defer permission role preview");
+                return;
+            }
+            let card = match client
+                .preview_permission(
+                    comp.user.id.get(),
+                    guild_id,
+                    channel_id,
+                    &template,
+                    Some(role_id),
+                )
+                .await
+            {
+                Ok(preview) => admin_mutation_preview_card(&preview.plan, "confirm_perm"),
+                Err(error) => admin_error_card(&error),
+            };
+            let _ = comp.edit_response(&ctx.http, card.into_edit()).await;
+            return;
+        }
+        if comp.data.custom_id == "oab_admin_struct_blueprint" {
+            let Some(blueprint) = first_string_select(&comp.data.kind).map(str::to_owned) else {
+                let response = CreateInteractionResponse::Message(
+                    CreateInteractionResponseMessage::new()
+                        .content("⚠️ This structure selection is invalid. Refresh the card.")
+                        .ephemeral(true),
+                );
+                let _ = comp.create_response(&ctx.http, response).await;
+                return;
+            };
+            let response = CreateInteractionResponse::UpdateMessage(
+                admin_structure_template_card(&blueprint).into_message(),
+            );
+            let _ = comp.create_response(&ctx.http, response).await;
+            return;
+        }
+        if let Some(blueprint) = comp
+            .data
+            .custom_id
+            .strip_prefix("oab_admin_struct_template:")
+            .map(str::to_owned)
+        {
+            let Some(template) = first_string_select(&comp.data.kind).map(str::to_owned) else {
+                let response = CreateInteractionResponse::Message(
+                    CreateInteractionResponseMessage::new()
+                        .content("⚠️ This template selection is invalid. Refresh the card.")
+                        .ephemeral(true),
+                );
+                let _ = comp.create_response(&ctx.http, response).await;
+                return;
+            };
+            if template == "private-project" {
+                let response = CreateInteractionResponse::UpdateMessage(
+                    admin_structure_role_card(&blueprint, &template).into_message(),
+                );
+                let _ = comp.create_response(&ctx.http, response).await;
+                return;
+            }
+            if let Err(error) = comp.defer(&ctx.http).await {
+                tracing::error!(%error, "failed to defer structure preview");
+                return;
+            }
+            let card = match client
+                .preview_structure(comp.user.id.get(), guild_id, &blueprint, &template, None)
+                .await
+            {
+                Ok(preview) => admin_mutation_preview_card(&preview.plan, "confirm_struct"),
+                Err(error) => admin_error_card(&error),
+            };
+            let _ = comp.edit_response(&ctx.http, card.into_edit()).await;
+            return;
+        }
+        if let Some(rest) = comp.data.custom_id.strip_prefix("oab_admin_struct_role:") {
+            let mut parts = rest.splitn(2, ':');
+            let blueprint = parts.next().map(str::to_owned);
+            let template = parts.next().map(str::to_owned);
+            let role_id = first_role_select(&comp.data.kind);
+            let (Some(blueprint), Some(template), Some(role_id)) = (blueprint, template, role_id)
+            else {
+                let response = CreateInteractionResponse::Message(
+                    CreateInteractionResponseMessage::new()
+                        .content("⚠️ This role selection is invalid. Refresh the card.")
+                        .ephemeral(true),
+                );
+                let _ = comp.create_response(&ctx.http, response).await;
+                return;
+            };
+            if let Err(error) = comp.defer(&ctx.http).await {
+                tracing::error!(%error, "failed to defer structure role preview");
+                return;
+            }
+            let card = match client
+                .preview_structure(
+                    comp.user.id.get(),
+                    guild_id,
+                    &blueprint,
+                    &template,
+                    Some(role_id),
+                )
+                .await
+            {
+                Ok(preview) => admin_mutation_preview_card(&preview.plan, "confirm_struct"),
+                Err(error) => admin_error_card(&error),
+            };
+            let _ = comp.edit_response(&ctx.http, card.into_edit()).await;
+            return;
+        }
         let action = comp.data.custom_id.strip_prefix("oab_admin:").unwrap_or("");
         if action == "create" {
             if let Err(error) = comp
@@ -5290,6 +5949,43 @@ impl Handler {
                 .cleanup(comp.user.id.get(), guild_id)
                 .await
                 .map(|cleanup| admin_cleanup_card(&cleanup))
+        } else if action == "rename" {
+            client
+                .inventory(comp.user.id.get(), guild_id)
+                .await
+                .map(|inventory| admin_rename_card(&inventory))
+        } else if action == "move" {
+            client
+                .inventory(comp.user.id.get(), guild_id)
+                .await
+                .map(|inventory| admin_move_channel_card(&inventory))
+        } else if action == "permissions" {
+            client
+                .inventory(comp.user.id.get(), guild_id)
+                .await
+                .map(|inventory| admin_permission_channel_card(&inventory))
+        } else if action == "structure" {
+            Ok(admin_structure_blueprint_card())
+        } else if let Some(plan_id) = action.strip_prefix("confirm_rename:") {
+            client
+                .apply_rename(comp.user.id.get(), guild_id, plan_id)
+                .await
+                .map(|result| admin_mutation_done_card(&result.result))
+        } else if let Some(plan_id) = action.strip_prefix("confirm_move:") {
+            client
+                .apply_move(comp.user.id.get(), guild_id, plan_id)
+                .await
+                .map(|result| admin_mutation_done_card(&result.result))
+        } else if let Some(plan_id) = action.strip_prefix("confirm_perm:") {
+            client
+                .apply_permission(comp.user.id.get(), guild_id, plan_id)
+                .await
+                .map(|result| admin_mutation_done_card(&result.result))
+        } else if let Some(plan_id) = action.strip_prefix("confirm_struct:") {
+            client
+                .apply_structure(comp.user.id.get(), guild_id, plan_id)
+                .await
+                .map(|result| admin_mutation_done_card(&result.result))
         } else if let Some(plan_id) = action.strip_prefix("confirm_delete:") {
             client
                 .apply_deletion(comp.user.id.get(), guild_id, plan_id)
@@ -5488,6 +6184,93 @@ impl Handler {
         };
         if let Err(error) = modal.edit_response(&ctx.http, card.into_edit()).await {
             tracing::error!(%error, "failed to show admin channel preview");
+        }
+    }
+
+    async fn handle_admin_rename_modal(
+        &self,
+        ctx: &Context,
+        modal: &serenity::model::application::ModalInteraction,
+    ) {
+        if modal.user.bot
+            || is_denied_user(
+                false,
+                self.allow_all_users,
+                &self.allowed_users,
+                modal.user.id.get(),
+            )
+        {
+            let response = CreateInteractionResponse::Message(
+                CreateInteractionResponseMessage::new()
+                    .content("🚫 你沒有使用這個 Bot 的權限。")
+                    .ephemeral(true),
+            );
+            let _ = modal.create_response(&ctx.http, response).await;
+            return;
+        }
+        let Some(client) = &self.admin_control else {
+            let response = CreateInteractionResponse::Message(
+                CreateInteractionResponseMessage::new()
+                    .content("⚠️ Server management is not configured.")
+                    .ephemeral(true),
+            );
+            let _ = modal.create_response(&ctx.http, response).await;
+            return;
+        };
+        let Some(guild_id) = modal.guild_id.map(|value| value.get()) else {
+            let response = CreateInteractionResponse::Message(
+                CreateInteractionResponseMessage::new()
+                    .content("⚠️ Server management is only available inside the configured server.")
+                    .ephemeral(true),
+            );
+            let _ = modal.create_response(&ctx.http, response).await;
+            return;
+        };
+        let Some((target_type, target_id)) = modal
+            .data
+            .custom_id
+            .strip_prefix("oab_admin_rename:")
+            .and_then(|value| value.split_once(':'))
+            .and_then(|(target_type, target_id)| {
+                target_id
+                    .parse::<u64>()
+                    .ok()
+                    .map(|target_id| (target_type.to_string(), target_id))
+            })
+        else {
+            let response = CreateInteractionResponse::Message(
+                CreateInteractionResponseMessage::new()
+                    .content("⚠️ This rename selection is invalid. Start Rename again.")
+                    .ephemeral(true),
+            );
+            let _ = modal.create_response(&ctx.http, response).await;
+            return;
+        };
+        let name = modal_input_value(modal, "name")
+            .map(str::trim)
+            .unwrap_or_default();
+        if let Err(error) = modal.defer_ephemeral(&ctx.http).await {
+            tracing::error!(%error, "failed to defer admin rename preview");
+            return;
+        }
+        let card = match client
+            .preview_rename(
+                modal.user.id.get(),
+                guild_id,
+                &target_type,
+                target_id,
+                name,
+            )
+            .await
+        {
+            Ok(preview) => admin_mutation_preview_card(&preview.plan, "confirm_rename"),
+            Err(error) => {
+                tracing::warn!(%error, "Discord Admin rename preview failed");
+                admin_error_card(&error)
+            }
+        };
+        if let Err(error) = modal.edit_response(&ctx.http, card.into_edit()).await {
+            tracing::error!(%error, "failed to show admin rename preview");
         }
     }
 
@@ -11522,6 +12305,10 @@ mod tests {
         let admin = serde_json::to_string(&admin_navigation_buttons()).unwrap();
         assert!(admin.contains("oab_admin:cleanup"));
         assert!(admin.contains("oab_admin:channel_setup"));
+        assert!(admin.contains("oab_admin:rename"));
+        assert!(admin.contains("oab_admin:move"));
+        assert!(admin.contains("oab_admin:permissions"));
+        assert!(admin.contains("oab_admin:structure"));
     }
 
     #[test]

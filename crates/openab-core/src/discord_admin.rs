@@ -173,6 +173,32 @@ pub struct DeletedResource {
     pub target_type: String,
 }
 
+#[derive(Debug, Clone, Deserialize)]
+pub struct MutationPlan {
+    pub id: String,
+    pub operation: String,
+    pub summary: String,
+    pub expires_in_seconds: u64,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct MutationPreview {
+    pub plan: MutationPlan,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct MutationOutcome {
+    pub id: String,
+    pub name: String,
+    pub operation: String,
+    pub summary: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct MutationResult {
+    pub result: MutationOutcome,
+}
+
 #[derive(Debug, Deserialize)]
 struct ApiErrorEnvelope {
     error: ApiError,
@@ -220,6 +246,41 @@ struct ChannelPreviewRequest<'a> {
     category_id: u64,
     name: &'a str,
     topic: Option<&'a str>,
+}
+
+#[derive(Serialize)]
+struct RenamePreviewRequest<'a> {
+    actor_user_id: u64,
+    guild_id: u64,
+    target_type: &'a str,
+    target_id: u64,
+    name: &'a str,
+}
+
+#[derive(Serialize)]
+struct MovePreviewRequest {
+    actor_user_id: u64,
+    guild_id: u64,
+    channel_id: u64,
+    category_id: u64,
+}
+
+#[derive(Serialize)]
+struct PermissionPreviewRequest<'a> {
+    actor_user_id: u64,
+    guild_id: u64,
+    channel_id: u64,
+    template: &'a str,
+    role_id: Option<u64>,
+}
+
+#[derive(Serialize)]
+struct StructurePreviewRequest<'a> {
+    actor_user_id: u64,
+    guild_id: u64,
+    blueprint: &'a str,
+    template: &'a str,
+    role_id: Option<u64>,
 }
 
 impl DiscordAdminClient {
@@ -425,6 +486,156 @@ impl DiscordAdminClient {
     ) -> Result<DeletionResult> {
         self.post(
             "/v1/deletions/apply",
+            &ApplyRequest {
+                actor_user_id,
+                guild_id,
+                plan_id,
+            },
+        )
+        .await
+    }
+
+    pub async fn preview_rename(
+        &self,
+        actor_user_id: u64,
+        guild_id: u64,
+        target_type: &str,
+        target_id: u64,
+        name: &str,
+    ) -> Result<MutationPreview> {
+        self.post(
+            "/v1/renames/preview",
+            &RenamePreviewRequest {
+                actor_user_id,
+                guild_id,
+                target_type,
+                target_id,
+                name,
+            },
+        )
+        .await
+    }
+
+    pub async fn apply_rename(
+        &self,
+        actor_user_id: u64,
+        guild_id: u64,
+        plan_id: &str,
+    ) -> Result<MutationResult> {
+        self.post(
+            "/v1/renames/apply",
+            &ApplyRequest {
+                actor_user_id,
+                guild_id,
+                plan_id,
+            },
+        )
+        .await
+    }
+
+    pub async fn preview_move(
+        &self,
+        actor_user_id: u64,
+        guild_id: u64,
+        channel_id: u64,
+        category_id: u64,
+    ) -> Result<MutationPreview> {
+        self.post(
+            "/v1/moves/preview",
+            &MovePreviewRequest {
+                actor_user_id,
+                guild_id,
+                channel_id,
+                category_id,
+            },
+        )
+        .await
+    }
+
+    pub async fn apply_move(
+        &self,
+        actor_user_id: u64,
+        guild_id: u64,
+        plan_id: &str,
+    ) -> Result<MutationResult> {
+        self.post(
+            "/v1/moves/apply",
+            &ApplyRequest {
+                actor_user_id,
+                guild_id,
+                plan_id,
+            },
+        )
+        .await
+    }
+
+    pub async fn preview_permission(
+        &self,
+        actor_user_id: u64,
+        guild_id: u64,
+        channel_id: u64,
+        template: &str,
+        role_id: Option<u64>,
+    ) -> Result<MutationPreview> {
+        self.post(
+            "/v1/permissions/preview",
+            &PermissionPreviewRequest {
+                actor_user_id,
+                guild_id,
+                channel_id,
+                template,
+                role_id,
+            },
+        )
+        .await
+    }
+
+    pub async fn apply_permission(
+        &self,
+        actor_user_id: u64,
+        guild_id: u64,
+        plan_id: &str,
+    ) -> Result<MutationResult> {
+        self.post(
+            "/v1/permissions/apply",
+            &ApplyRequest {
+                actor_user_id,
+                guild_id,
+                plan_id,
+            },
+        )
+        .await
+    }
+
+    pub async fn preview_structure(
+        &self,
+        actor_user_id: u64,
+        guild_id: u64,
+        blueprint: &str,
+        template: &str,
+        role_id: Option<u64>,
+    ) -> Result<MutationPreview> {
+        self.post(
+            "/v1/structures/preview",
+            &StructurePreviewRequest {
+                actor_user_id,
+                guild_id,
+                blueprint,
+                template,
+                role_id,
+            },
+        )
+        .await
+    }
+
+    pub async fn apply_structure(
+        &self,
+        actor_user_id: u64,
+        guild_id: u64,
+        plan_id: &str,
+    ) -> Result<MutationResult> {
+        self.post(
+            "/v1/structures/apply",
             &ApplyRequest {
                 actor_user_id,
                 guild_id,
