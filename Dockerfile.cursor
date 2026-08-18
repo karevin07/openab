@@ -32,7 +32,7 @@ FROM debian:trixie-slim
 # https://cursor.com/cli or https://docs.cursor.com/cli for version/URL updates.
 ARG CURSOR_VERSION=2026.06.19-20-24-33-653a7fb
 RUN apt-get update && apt-get install -y --no-install-recommends \
-      ca-certificates curl git make procps python3-minimal tini unzip \
+      ca-certificates curl git make openssh-client procps python3 tini unzip \
     && ARCH=$(dpkg --print-architecture) \
     && if [ "$ARCH" = "arm64" ]; then ARCH=arm64; else ARCH=x64; fi \
     && curl -fSL "https://downloads.cursor.com/lab/${CURSOR_VERSION}/linux/${ARCH}/agent-cli-package.tar.gz" \
