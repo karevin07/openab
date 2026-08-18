@@ -396,6 +396,30 @@ fn task_state_presentation(state: TaskState) -> (&'static str, &'static str, u32
     }
 }
 
+/// Can a new request be sent into this thread's session right now?
+///
+/// `Queued` and `Running` accept one: the dispatcher queues it exactly as it
+/// queues a message typed by hand, and the Queue Manager can then edit, reorder
+/// or drop it. Refusing here while accepting free-form text would make the
+/// admin-vetted shortcut the *more* restricted path, which is backwards.
+///
+/// `Cursor` and `Closed` do not: Discord is not holding the session.
+fn accepts_session_request(state: TaskState) -> bool {
+    matches!(
+        state,
+        TaskState::Queued | TaskState::Running | TaskState::Ready | TaskState::Failed
+    )
+}
+
+/// Repository commands run a fixed argv in the bound repository with a cleared
+/// environment; they never touch the Cursor session. The only thing they need
+/// is a thread that is still bound to a project, so every live state offers
+/// them — including `Running`, which is exactly when someone wants to look at
+/// `git status` without interrupting the agent.
+fn offers_repository_commands(state: TaskState) -> bool {
+    state != TaskState::Closed
+}
+
 fn task_status_embed(task: &TaskRecord) -> CreateEmbed {
     let (icon, state, colour) = task_state_presentation(task.state);
     let mut embed = CreateEmbed::new()
@@ -461,31 +485,48 @@ fn task_control_rows(task: &TaskRecord) -> Vec<CreateActionRow> {
         ))
         .label("← Project")
     };
+    let quick_actions = || {
+        CreateButton::new("oab_task:actions")
+            .label("⚡ Quick actions")
+            .style(ButtonStyle::Success)
+    };
+    let commands = || {
+        CreateButton::new("oab_task:commands")
+            .label("⌨ Commands")
+            .style(ButtonStyle::Secondary)
+    };
+
+    // Row 1 is "give the session more work / inspect the repository" and is
+    // offered in every state that can honour it. Row 2 is lifecycle control.
+    // Discord allows five buttons per row, which is why they are split.
+    let mut shortcuts = Vec::new();
     if task.state == TaskState::Ready {
-        return vec![
-            CreateActionRow::Buttons(vec![
-                CreateButton::new("oab_task:continue")
-                    .label("💬 Continue")
-                    .style(ButtonStyle::Primary),
-                CreateButton::new("oab_task:actions")
-                    .label("⚡ Quick actions")
-                    .style(ButtonStyle::Success),
-                CreateButton::new("oab_task:commands")
-                    .label("⌨ Commands")
-                    .style(ButtonStyle::Secondary),
-            ]),
-            CreateActionRow::Buttons(vec![
-                CreateButton::new("oab_session:detach")
-                    .label("🖥️ Continue on computer")
-                    .style(ButtonStyle::Secondary),
-                CreateButton::new("oab_session:close")
-                    .label("✕ Close…")
-                    .style(ButtonStyle::Danger),
-                help(),
-            ]),
-        ];
+        shortcuts.push(
+            CreateButton::new("oab_task:continue")
+                .label("💬 Continue")
+                .style(ButtonStyle::Primary),
+        );
     }
-    let buttons = match task.state {
+    if task.state == TaskState::Failed && task.last_prompt.is_some() {
+        shortcuts.push(
+            CreateButton::new("oab_task:retry")
+                .label("↻ Retry")
+                .style(ButtonStyle::Primary),
+        );
+        shortcuts.push(
+            CreateButton::new("oab_task:edit")
+                .label("✏️ Edit and retry")
+                .style(ButtonStyle::Secondary),
+        );
+    }
+    if accepts_session_request(task.state) {
+        shortcuts.push(quick_actions());
+    }
+    if offers_repository_commands(task.state) {
+        shortcuts.push(commands());
+    }
+
+    let lifecycle = match task.state {
         TaskState::Queued => vec![
             queue_manager_button(task),
             CreateButton::new("oab_session:refresh")
@@ -503,7 +544,15 @@ fn task_control_rows(task: &TaskRecord) -> Vec<CreateActionRow> {
                 .style(ButtonStyle::Secondary),
             help(),
         ],
-        TaskState::Ready => unreachable!("ready controls returned above"),
+        TaskState::Ready => vec![
+            CreateButton::new("oab_session:detach")
+                .label("🖥️ Continue on computer")
+                .style(ButtonStyle::Secondary),
+            CreateButton::new("oab_session:close")
+                .label("✕ Close…")
+                .style(ButtonStyle::Danger),
+            help(),
+        ],
         TaskState::Cursor => vec![
             CreateButton::new("oab_session:refresh")
                 .label("↻ Check status")
@@ -511,39 +560,27 @@ fn task_control_rows(task: &TaskRecord) -> Vec<CreateActionRow> {
             project(),
             help(),
         ],
-        TaskState::Failed => {
-            let mut buttons = Vec::new();
-            if task.last_prompt.is_some() {
-                buttons.push(
-                    CreateButton::new("oab_task:retry")
-                        .label("↻ Retry")
-                        .style(ButtonStyle::Primary),
-                );
-                buttons.push(
-                    CreateButton::new("oab_task:edit")
-                        .label("✏️ Edit and retry")
-                        .style(ButtonStyle::Secondary),
-                );
-            }
-            buttons.extend([
-                CreateButton::new("oab_task:error")
-                    .label("🔍 Error details")
-                    .style(ButtonStyle::Secondary),
-                CreateButton::new("oab_session:detach")
-                    .label("🖥️ Use Cursor")
-                    .style(ButtonStyle::Secondary),
-                CreateButton::new("oab_session:close")
-                    .label("✕ Close…")
-                    .style(ButtonStyle::Danger),
-            ]);
-            buttons
-        }
+        TaskState::Failed => vec![
+            CreateButton::new("oab_task:error")
+                .label("🔍 Error details")
+                .style(ButtonStyle::Secondary),
+            CreateButton::new("oab_session:detach")
+                .label("🖥️ Use Cursor")
+                .style(ButtonStyle::Secondary),
+            CreateButton::new("oab_session:close")
+                .label("✕ Close…")
+                .style(ButtonStyle::Danger),
+            project(),
+            help(),
+        ],
         TaskState::Closed => vec![project(), help()],
     };
-    let mut rows = vec![CreateActionRow::Buttons(buttons)];
-    if task.state == TaskState::Failed && task.last_prompt.is_some() {
-        rows.push(CreateActionRow::Buttons(vec![project(), help()]));
+
+    let mut rows = Vec::new();
+    if !shortcuts.is_empty() {
+        rows.push(CreateActionRow::Buttons(shortcuts));
     }
+    rows.push(CreateActionRow::Buttons(lifecycle));
     rows
 }
 
@@ -909,9 +946,11 @@ fn task_actions_message(
 ) -> CreateInteractionResponseMessage {
     let mut embed = CreateEmbed::new()
         .title(format!("⚡ Continue · {}", task.title))
-        .description(
-            "選擇常用工作後會開啟可編輯的 Continue 視窗；確認後送進目前 thread 的 Cursor session，不會建立新 thread。",
-        )
+        .description(if matches!(task.state, TaskState::Queued | TaskState::Running) {
+            "選擇常用工作後會開啟可編輯的視窗；確認後排入目前 thread 的佇列，等 Agent 跑完就會執行 —— 和直接打字送出完全一樣，不會中斷進行中的工作，也不會建立新 thread。"
+        } else {
+            "選擇常用工作後會開啟可編輯的 Continue 視窗；確認後送進目前 thread 的 Cursor session，不會建立新 thread。"
+        })
         .colour(0xF1C40F)
         .field(
             "Repository",
@@ -920,7 +959,11 @@ fn task_actions_message(
         )
         .field("Current session", format!("<#{}>", task.thread_id), true)
         .footer(CreateEmbedFooter::new(
-            "Runs in this Cursor session · no new thread",
+            if matches!(task.state, TaskState::Queued | TaskState::Running) {
+                "Queued in this Cursor session · no new thread"
+            } else {
+                "Runs in this Cursor session · no new thread"
+            },
         ));
     if actions.is_empty() {
         return CreateInteractionResponseMessage::new()
@@ -1322,12 +1365,16 @@ fn help_action_center(
     let mut components = Vec::new();
         if let Some(task) = task {
         let (_, state, _) = task_state_presentation(task.state);
-        let guidance = if task.state == TaskState::Ready {
-            "可直接從下方繼續目前 Cursor session，或執行 repository command。"
-        } else if matches!(task.state, TaskState::Queued | TaskState::Running) {
-            "可管理尚未送進 Cursor 的需求；新的工作仍會依序執行。"
-        } else {
-            "目前無法啟動捷徑；請回到 Task Status 查看下一步。"
+        let guidance = match task.state {
+            TaskState::Ready => "可直接繼續目前 Cursor session，或執行 repository 指令。",
+            TaskState::Queued | TaskState::Running => {
+                "Agent 執行中：常用工作會排入佇列依序執行；repository 指令不經過 session，會立刻執行。"
+            }
+            TaskState::Failed => "可重試、改寫後重試，或先用 repository 指令查看目前狀態。",
+            TaskState::Cursor => {
+                "Cursor terminal 正持有這個 session；repository 指令仍可使用，其餘請先在電腦端結束。"
+            }
+            TaskState::Closed => "這個 task 已關閉；請回到 Project Home 開始新的工作。",
         };
         embed = embed.field(
             "Current task",
@@ -1339,20 +1386,35 @@ fn help_action_center(
             ),
             false,
         );
+        // Same availability rule as the Task Status Card, so the two surfaces
+        // never disagree about what is possible right now.
+        let mut task_buttons = Vec::new();
         if task.state == TaskState::Ready {
-            components.push(CreateActionRow::Buttons(vec![
+            task_buttons.push(
                 CreateButton::new("oab_task:continue")
                     .label("💬 Continue")
                     .style(ButtonStyle::Primary),
+            );
+        }
+        if accepts_session_request(task.state) {
+            task_buttons.push(
                 CreateButton::new("oab_task:actions")
                     .label("⚡ Quick actions")
                     .style(ButtonStyle::Success),
+            );
+        }
+        if offers_repository_commands(task.state) {
+            task_buttons.push(
                 CreateButton::new("oab_task:commands")
                     .label("⌨ Commands")
                     .style(ButtonStyle::Secondary),
-            ]));
-        } else if matches!(task.state, TaskState::Queued | TaskState::Running) {
-            components.push(CreateActionRow::Buttons(vec![queue_manager_button(task)]));
+            );
+        }
+        if matches!(task.state, TaskState::Queued | TaskState::Running) {
+            task_buttons.push(queue_manager_button(task));
+        }
+        if !task_buttons.is_empty() {
+            components.push(CreateActionRow::Buttons(task_buttons));
         }
     }
     components.push(CreateActionRow::Buttons(vec![
@@ -5390,11 +5452,18 @@ impl Handler {
         }
     }
 
+    /// Post a request into the task thread and hand it to the dispatcher.
+    ///
+    /// The guard is "can this session still take a request", not "is the state
+    /// exactly what the card showed": moving between Queued, Running and Ready
+    /// while the modal was open changes only whether the request runs now or
+    /// waits in the queue, which is the same thing that happens to a message
+    /// typed by hand. Buttons that genuinely require one state (Retry needs
+    /// Failed) are gated where they are rendered and handled.
     async fn submit_task_prompt(
         &self,
         ctx: &Context,
         task: &TaskRecord,
-        expected_state: TaskState,
         user: &serenity::model::user::User,
         prompt: String,
     ) -> Result<(), String> {
@@ -5402,8 +5471,11 @@ impl Handler {
             .task_registry
             .task_for_thread(task.thread_id)
             .ok_or_else(|| "Task metadata is no longer available.".to_string())?;
-        if current.state != expected_state {
-            return Err("Task state changed. Refresh the card and try again.".to_string());
+        if !accepts_session_request(current.state) {
+            return Err(
+                "This session is no longer accepting requests. Refresh the card and try again."
+                    .to_string(),
+            );
         }
         self.task_registry
             .record_prompt(task.thread_id, &prompt)
@@ -5508,7 +5580,14 @@ impl Handler {
         };
         let action = comp.data.custom_id.strip_prefix("oab_task:").unwrap_or("");
         if action == "actions" || action == "commands" {
-            if task.state != TaskState::Ready {
+            // Mirrors the buttons: a repository command needs nothing from the
+            // session, a quick action needs a session that can take a request.
+            let allowed = if action == "commands" {
+                offers_repository_commands(task.state)
+            } else {
+                accepts_session_request(task.state)
+            };
+            if !allowed {
                 let response = CreateInteractionResponse::Message(
                     CreateInteractionResponseMessage::new()
                         .content("⚠️ Task state changed. Refresh the card and try again.")
@@ -5617,7 +5696,7 @@ impl Handler {
             return;
         }
         let result = self
-            .submit_task_prompt(ctx, &task, TaskState::Failed, &comp.user, prompt)
+            .submit_task_prompt(ctx, &task, &comp.user, prompt)
             .await;
         let content = result.map_or_else(
             |error| format!("⚠️ Could not retry: {error}"),
@@ -5649,16 +5728,9 @@ impl Handler {
             let _ = modal.create_response(&ctx.http, response).await;
             return;
         }
-        let action = modal
-            .data
-            .custom_id
-            .strip_prefix("oab_task_prompt:")
-            .unwrap_or("");
-        let expected_state = if action == "edit" {
-            TaskState::Failed
-        } else {
-            TaskState::Ready
-        };
+        // All three prompt modals (continue, edit and retry, quick action) now
+        // submit through the same path, so the custom_id suffix no longer
+        // selects behaviour and is not read here.
         let Some(task) = self.task_registry.task_for_thread(modal.channel_id.get()) else {
             let response = CreateInteractionResponse::Message(
                 CreateInteractionResponseMessage::new()
@@ -5685,7 +5757,7 @@ impl Handler {
             return;
         }
         let result = self
-            .submit_task_prompt(ctx, &task, expected_state, &modal.user, prompt.to_string())
+            .submit_task_prompt(ctx, &task, &modal.user, prompt.to_string())
             .await;
         let content = result.map_or_else(
             |error| format!("⚠️ Could not submit request: {error}"),
@@ -6063,7 +6135,7 @@ impl Handler {
         };
         let current_task = self.task_registry.task_for_thread(comp.channel_id.get());
         if let Some(task) = current_task {
-            if task.state != TaskState::Ready {
+            if !accepts_session_request(task.state) {
                 let response = CreateInteractionResponse::Message(
                     CreateInteractionResponseMessage::new()
                         .content("⚠️ Task state changed. Refresh the card and try again.")
@@ -8845,6 +8917,35 @@ mod tests {
     }
 
     #[test]
+    /// The rule both surfaces read. A repository command runs a fixed argv in
+    /// its own process, so only a closed task withholds it; a session request
+    /// needs Discord to actually hold the session.
+    #[test]
+    fn session_request_and_command_availability_by_state() {
+        for state in [
+            TaskState::Queued,
+            TaskState::Running,
+            TaskState::Ready,
+            TaskState::Failed,
+        ] {
+            assert!(accepts_session_request(state), "{state:?} should accept");
+        }
+        assert!(!accepts_session_request(TaskState::Cursor));
+        assert!(!accepts_session_request(TaskState::Closed));
+
+        for state in [
+            TaskState::Queued,
+            TaskState::Running,
+            TaskState::Ready,
+            TaskState::Cursor,
+            TaskState::Failed,
+        ] {
+            assert!(offers_repository_commands(state), "{state:?} should offer");
+        }
+        assert!(!offers_repository_commands(TaskState::Closed));
+    }
+
+    #[test]
     fn task_controls_are_contextual_instead_of_disabled() {
         let ready =
             serde_json::to_string(&task_control_rows(&ui_task(TaskState::Ready, None))).unwrap();
@@ -8859,7 +8960,25 @@ mod tests {
         assert!(running.contains("oab_session:cancel"));
         assert!(running.contains("oab_queue:open"));
         assert!(!running.contains("oab_session:detach"));
-        assert!(!running.contains("oab_task:actions"));
+        // Mid-run is exactly when someone wants to look at the repository. A
+        // command never touches the session, and a quick action queues like a
+        // message typed by hand — refusing either would make the vetted
+        // shortcut more restricted than free-form text.
+        assert!(running.contains("oab_task:actions"));
+        assert!(running.contains("oab_task:commands"));
+
+        let queued =
+            serde_json::to_string(&task_control_rows(&ui_task(TaskState::Queued, None))).unwrap();
+        assert!(queued.contains("oab_task:actions"));
+        assert!(queued.contains("oab_task:commands"));
+        assert!(queued.contains("oab_queue:open"));
+
+        // An external Cursor terminal holds the session: no new requests, but a
+        // repository command runs in its own process and is still fine.
+        let handoff =
+            serde_json::to_string(&task_control_rows(&ui_task(TaskState::Cursor, None))).unwrap();
+        assert!(!handoff.contains("oab_task:actions"));
+        assert!(handoff.contains("oab_task:commands"));
 
         let failed = serde_json::to_string(&task_control_rows(&ui_task(
             TaskState::Failed,
@@ -8869,6 +8988,32 @@ mod tests {
         assert!(failed.contains("oab_task:retry"));
         assert!(failed.contains("oab_task:edit"));
         assert!(failed.contains("oab_task:error"));
+        assert!(failed.contains("oab_task:actions"));
+        assert!(failed.contains("oab_task:commands"));
+
+        let closed =
+            serde_json::to_string(&task_control_rows(&ui_task(TaskState::Closed, None))).unwrap();
+        assert!(!closed.contains("oab_task:actions"));
+        assert!(!closed.contains("oab_task:commands"));
+
+        // Rows are composed conditionally now, so pin Discord's five-per-row
+        // cap: exceeding it is rejected at send time, not at compile time.
+        for state in [
+            TaskState::Queued,
+            TaskState::Running,
+            TaskState::Ready,
+            TaskState::Cursor,
+            TaskState::Failed,
+            TaskState::Closed,
+        ] {
+            let rows = serde_json::to_value(task_control_rows(&ui_task(state, Some("retry me"))))
+                .unwrap();
+            for row in rows.as_array().unwrap() {
+                let count = row["components"].as_array().unwrap().len();
+                assert!(count <= 5, "{state:?} row has {count} buttons");
+                assert!(count > 0, "{state:?} has an empty row");
+            }
+        }
     }
 
     #[test]
@@ -9044,9 +9189,11 @@ mod tests {
         let running_help =
             serde_json::to_string(&help_action_center(None, &[], false, Some(&running_task)))
                 .unwrap();
-        assert!(running_help.contains("可管理尚未送進 Cursor 的需求"));
+        assert!(running_help.contains("排入佇列"));
         assert!(running_help.contains("oab_queue:open"));
-        assert!(!running_help.contains("oab_task:actions"));
+        // Help must agree with the Task Status Card about what is possible.
+        assert!(running_help.contains("oab_task:actions"));
+        assert!(running_help.contains("oab_task:commands"));
 
         let project = serde_json::to_string(&project_welcome_components(&[])).unwrap();
         assert!(project.contains("oab_project:sessions"));
