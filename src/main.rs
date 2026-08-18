@@ -126,12 +126,14 @@ enum Commands {
     /// operational actions for MCP components. Long-running serving is
     /// config-driven (`[mcp]` in config.toml + `openab run`); these
     /// subcommands cover interactive logins and standalone/dev serving.
+    #[cfg(feature = "mcp")]
     Mcp {
         #[command(subcommand)]
         addon: McpAddon,
     },
 }
 
+#[cfg(feature = "mcp")]
 #[derive(clap::Subcommand)]
 enum McpAddon {
     /// Native Gmail adapter (Capability Plugin, ADR §6.1/§6.5): the six-tool
@@ -144,6 +146,7 @@ enum McpAddon {
     },
 }
 
+#[cfg(feature = "mcp")]
 #[derive(clap::Subcommand)]
 enum GmailNativeAction {
     /// Serve the adapter over loopback Streamable HTTP (non-loopback
@@ -378,6 +381,7 @@ async fn main() -> anyhow::Result<()> {
             }
             return Ok(());
         }
+        #[cfg(feature = "mcp")]
         Commands::Mcp { addon } => {
             let McpAddon::GmailNative { action } = addon;
             match action {
@@ -427,16 +431,28 @@ async fn main() -> anyhow::Result<()> {
         // need the capability surface (coding-CLI-only users, dev loops, CI
         // runners, agent hosts with no chat platform) run the same
         // `openab run` with a two-line config instead of a chat token.
-        if let Some(mcp_cfg) = cfg.mcp.clone() {
-            tracing::info!(
-                listen = %mcp_cfg.listen,
-                "no chat adapter configured — running in facade-only mode ([mcp] present)"
+        #[cfg(feature = "mcp")]
+        {
+            if let Some(mcp_cfg) = cfg.mcp.clone() {
+                tracing::info!(
+                    listen = %mcp_cfg.listen,
+                    "no chat adapter configured — running in facade-only mode ([mcp] present)"
+                );
+                // Foreground, not spawned: the facade IS the workload. A bind
+                // failure or server exit terminates the process (fail fast).
+                return openab_mcp::mcp::facade::serve_http(&mcp_cfg.listen)
+                    .await
+                    .map_err(|e| anyhow::anyhow!("OAB MCP facade exited: {e:#}"));
+            }
+        }
+        // Without the `mcp` feature there is no facade to run. Say so instead of
+        // falling through to the generic message below, which would send an
+        // operator hunting for a chat token they never meant to provide.
+        #[cfg(not(feature = "mcp"))]
+        if cfg.mcp.is_some() {
+            anyhow::bail!(
+                "[mcp] is configured but this build has no MCP support — rebuild with the `mcp` feature"
             );
-            // Foreground, not spawned: the facade IS the workload. A bind
-            // failure or server exit terminates the process (fail fast).
-            return openab_mcp::mcp::facade::serve_http(&mcp_cfg.listen)
-                .await
-                .map_err(|e| anyhow::anyhow!("OAB MCP facade exited: {e:#}"));
         }
         anyhow::bail!(
             "no adapter configured — add [discord], [slack], [telegram], [wecom], [googlechat], or [gateway] to config (or [mcp] for facade-only mode), or set platform env vars (TELEGRAM_BOT_TOKEN, etc.)"
@@ -524,7 +540,16 @@ async fn main() -> anyhow::Result<()> {
     // Browser capabilities (Facade mode, default): registered as a
     // session-aware in-process source — one listener, per-session identity
     // via broker-minted tokens; no per-session proxy servers.
+    #[cfg(feature = "mcp")]
     let facade_sessions = openab_mcp::mcp::sources::SessionTokens::new();
+    // A `[mcp]` section in a build without the feature is a silent no-op
+    // otherwise: the operator would see no listener and no explanation.
+    #[cfg(not(feature = "mcp"))]
+    if cfg.mcp.is_some() {
+        tracing::warn!(
+            "[mcp] is present but this build has no MCP support — the facade listener is not started"
+        );
+    }
     // Only read under the acp feature (pool facade wiring below).
     #[cfg(feature = "acp")]
     let facade_serving = cfg.mcp.is_some();
@@ -536,6 +561,7 @@ async fn main() -> anyhow::Result<()> {
     // that is a core feature and naming it here is an unknown-cfg error.
     #[cfg(feature = "acp")]
     openab_core::acp_mcp::report_facade_status(cfg.mcp.is_some(), &cfg.agent.working_dir);
+    #[cfg(feature = "mcp")]
     if let Some(mcp_cfg) = cfg.mcp.clone() {
         let listen = mcp_cfg.listen.clone();
         let tokens = facade_sessions.clone();
