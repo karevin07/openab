@@ -61,5 +61,16 @@ teams = ["dep:openab-gateway", "dep:axum", "openab-gateway/teams"]
 acp = ["dep:openab-gateway", "dep:axum", "openab-gateway/acp", "openab-core/acp-mcp", "mcp"]
 lineworks = ["dep:openab-gateway", "dep:axum", "openab-gateway/lineworks"]
 
+# Applies workspace-wide (profiles are only honoured in the workspace root).
+# Cross-crate inlining and a single codegen unit trade build time for a smaller,
+# faster binary — worth it for an image that ships this on every deploy.
+#
+# `panic` is deliberately left at the default unwind: this is a long-running bot
+# where a panic in one Tokio task kills that task, and `abort` would take the
+# whole process — and every other in-flight turn — down with it.
+[profile.release]
+lto = true
+codegen-units = 1
+
 [dev-dependencies]
 tempfile = "3.27.0"
