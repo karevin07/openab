@@ -1,4 +1,4 @@
-use crate::acp::connection::{AcpConnection, SessionActivity};
+use crate::acp::connection::{AcpConnection, AcpRequestError, SessionActivity};
 use crate::acp::protocol::ConfigOption;
 use crate::config::AgentConfig;
 use anyhow::{anyhow, Result};
@@ -8,11 +8,6 @@ use std::sync::Arc;
 use tokio::sync::{Mutex, RwLock};
 use tokio::time::Instant;
 use tracing::{info, warn};
-
-/// Error substrings produced by `AcpConnection::send_request` that indicate a
-/// transient failure worth preserving the session ID for retry, as opposed to
-/// a permanent agent-side rejection.
-const TRANSIENT_LOAD_ERRORS: &[&str] = &["timeout waiting for", "channel closed"];
 
 /// Combined state protected by a single lock to prevent deadlocks.
 /// Lock ordering: never await a per-connection mutex while holding `state`.
@@ -687,17 +682,13 @@ impl SessionPool {
                         resumed = true;
                     }
                     Err(e) => {
-                        let err_str = e.to_string();
-                        let is_transient =
-                            TRANSIENT_LOAD_ERRORS.iter().any(|s| err_str.contains(s));
-                        if is_transient {
+                        // `AcpRequestError` classifies this; the pool no longer
+                        // reads the message text to decide whether the session
+                        // is still worth resuming.
+                        if e.is_transient() {
                             warn!(thread_id = %crate::redact::redact_session_ids(thread_id), session_id = %crate::redact::redact_session_ids(sid), error = %e,
                                 "session/load failed transiently, preserving session ID for retry");
-                            load_failed = Some(if err_str.contains("timeout waiting for") {
-                                "timeout"
-                            } else {
-                                "connection lost"
-                            });
+                            load_failed = Some(e.user_reason());
                         } else {
                             warn!(thread_id = %crate::redact::redact_session_ids(thread_id), session_id = %crate::redact::redact_session_ids(sid), error = %e,
                                 "session/load failed, creating new session");

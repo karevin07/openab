@@ -179,6 +179,87 @@ impl SessionActivity {
     }
 }
 
+/// Why an ACP request failed.
+///
+/// The distinction that matters to callers is whether the session ID is still
+/// worth keeping for a retry. `SessionPool` used to recover that by substring
+/// matching on the formatted error (`TRANSIENT_LOAD_ERRORS`), which made the
+/// exact wording of the messages below a load-bearing contract between two
+/// files with nothing to enforce it: rephrasing "timeout waiting for" would
+/// silently downgrade a recoverable timeout into a permanent failure, and the
+/// pool would discard a resumable session and start a context-free one.
+///
+/// `Display` reproduces the previous strings verbatim, so logs and
+/// user-visible messages are unchanged.
+#[derive(Debug)]
+pub enum AcpRequestError {
+    /// No response arrived within the per-method deadline. The agent may still
+    /// be alive and working, so the session stays worth resuming.
+    Timeout { method: String },
+    /// The response channel closed before a reply arrived — the reader loop
+    /// stopped without answering this request.
+    ChannelClosed { method: String },
+    /// The agent answered with a JSON-RPC error. This is a decision by the
+    /// agent, not a connection failure, so retrying the same session will
+    /// generally reproduce it.
+    Rejected {
+        method: String,
+        error: crate::acp::protocol::JsonRpcError,
+    },
+    /// The request could not be serialised or written to the agent's stdin.
+    Transport {
+        method: String,
+        source: anyhow::Error,
+    },
+}
+
+impl AcpRequestError {
+    /// True when the failure says nothing about whether the session is still
+    /// loadable, so a caller should preserve the session ID and retry rather
+    /// than fall back to a fresh session.
+    pub fn is_transient(&self) -> bool {
+        matches!(self, Self::Timeout { .. } | Self::ChannelClosed { .. })
+    }
+
+    /// Short reason for user-facing copy.
+    pub fn user_reason(&self) -> &'static str {
+        match self {
+            Self::Timeout { .. } => "timeout",
+            Self::ChannelClosed { .. } | Self::Transport { .. } => "connection lost",
+            Self::Rejected { .. } => "rejected",
+        }
+    }
+
+    pub fn method(&self) -> &str {
+        match self {
+            Self::Timeout { method }
+            | Self::ChannelClosed { method }
+            | Self::Rejected { method, .. }
+            | Self::Transport { method, .. } => method,
+        }
+    }
+}
+
+impl std::fmt::Display for AcpRequestError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Timeout { method } => write!(f, "timeout waiting for {method} response"),
+            Self::ChannelClosed { method } => write!(f, "channel closed waiting for {method}"),
+            Self::Rejected { error, .. } => write!(f, "{error}"),
+            Self::Transport { source, .. } => write!(f, "{source}"),
+        }
+    }
+}
+
+impl std::error::Error for AcpRequestError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Transport { source, .. } => Some(source.as_ref()),
+            _ => None,
+        }
+    }
+}
+
 pub struct AcpConnection {
     _proc: Child,
     /// PID of the direct child, used as the process group ID for cleanup.
@@ -534,24 +615,43 @@ impl AcpConnection {
         Ok(())
     }
 
-    async fn send_request(&self, method: &str, params: Option<Value>) -> Result<JsonRpcMessage> {
+    async fn send_request(
+        &self,
+        method: &str,
+        params: Option<Value>,
+    ) -> std::result::Result<JsonRpcMessage, AcpRequestError> {
         let id = self.next_id();
         let req = JsonRpcRequest::new(id, method, params);
-        let data = serde_json::to_string(&req)?;
+        let data = serde_json::to_string(&req).map_err(|error| AcpRequestError::Transport {
+            method: method.to_string(),
+            source: error.into(),
+        })?;
 
         let (tx, rx) = oneshot::channel();
         self.pending.lock().await.insert(id, tx);
 
-        self.send_raw(&data).await?;
+        self.send_raw(&data)
+            .await
+            .map_err(|source| AcpRequestError::Transport {
+                method: method.to_string(),
+                source,
+            })?;
 
         let timeout_secs = if method == "session/new" { 120 } else { 30 };
         let resp = tokio::time::timeout(std::time::Duration::from_secs(timeout_secs), rx)
             .await
-            .map_err(|_| anyhow!("timeout waiting for {method} response"))?
-            .map_err(|_| anyhow!("channel closed waiting for {method}"))?;
+            .map_err(|_| AcpRequestError::Timeout {
+                method: method.to_string(),
+            })?
+            .map_err(|_| AcpRequestError::ChannelClosed {
+                method: method.to_string(),
+            })?;
 
-        if let Some(err) = &resp.error {
-            return Err(anyhow!("{err}"));
+        if let Some(error) = resp.error.clone() {
+            return Err(AcpRequestError::Rejected {
+                method: method.to_string(),
+                error,
+            });
         }
         Ok(resp)
     }
@@ -803,17 +903,22 @@ impl AcpConnection {
 
     /// Resume a previous session by ID. Returns Ok(()) if the agent accepted
     /// the load, or an error if it failed (caller should fall back to session/new).
-    pub async fn session_load(&mut self, session_id: &str, cwd: &str) -> Result<()> {
+    /// Returns the typed error so the caller can tell a recoverable failure
+    /// (retry this session) from an agent rejection (fall back to
+    /// `session/new`) without inspecting the message text.
+    pub async fn session_load(
+        &mut self,
+        session_id: &str,
+        cwd: &str,
+    ) -> std::result::Result<(), AcpRequestError> {
+        // `send_request` already converts a JSON-RPC error response into
+        // `AcpRequestError::Rejected`, so any response reaching here succeeded.
         let resp = self
             .send_request(
                 "session/load",
                 Some(json!({"sessionId": session_id, "cwd": cwd, "mcpServers": []})),
             )
             .await?;
-        // Accept any non-error response as success
-        if resp.error.is_some() {
-            return Err(anyhow!("session/load rejected"));
-        }
         info!(session_id, "session loaded");
         self.acp_session_id = Some(session_id.to_string());
         if let Some(result) = resp.result.as_ref() {
@@ -862,8 +967,76 @@ impl Drop for AcpConnection {
 
 #[cfg(test)]
 mod tests {
-    use super::{build_agent_env, build_permission_response, expand_agent_args, pick_best_option};
+    use super::{
+        build_agent_env, build_permission_response, expand_agent_args, pick_best_option,
+        AcpRequestError,
+    };
+    use crate::acp::protocol::JsonRpcError;
     use serde_json::json;
+
+    fn rpc_error(code: i64, message: &str) -> JsonRpcError {
+        JsonRpcError {
+            code,
+            message: message.to_string(),
+            data: None,
+        }
+    }
+
+    /// Pins the contract `SessionPool` depends on. It used to be expressed as
+    /// substring matches on these Display strings, so a rewording could flip a
+    /// recoverable failure into a permanent one and silently drop a resumable
+    /// session; the variants carry the classification now, and the strings are
+    /// asserted here so the user-visible wording still cannot drift unnoticed.
+    #[test]
+    fn acp_request_error_classifies_recoverable_failures() {
+        let timeout = AcpRequestError::Timeout {
+            method: "session/load".into(),
+        };
+        assert!(timeout.is_transient());
+        assert_eq!(timeout.user_reason(), "timeout");
+        assert_eq!(
+            timeout.to_string(),
+            "timeout waiting for session/load response"
+        );
+
+        let closed = AcpRequestError::ChannelClosed {
+            method: "session/load".into(),
+        };
+        assert!(closed.is_transient());
+        assert_eq!(closed.user_reason(), "connection lost");
+        assert_eq!(
+            closed.to_string(),
+            "channel closed waiting for session/load"
+        );
+
+        // An agent rejection is a decision, not a connection failure: the pool
+        // must fall back to session/new instead of retrying the same session.
+        let rejected = AcpRequestError::Rejected {
+            method: "session/load".into(),
+            error: rpc_error(-32000, "unknown session"),
+        };
+        assert!(!rejected.is_transient());
+        assert_eq!(
+            rejected.to_string(),
+            "JSON-RPC error -32000: unknown session"
+        );
+
+        // Substring matching classified this as transient purely because the
+        // agent's own message contained the marker text. The variant decides now.
+        let misleading = AcpRequestError::Rejected {
+            method: "session/load".into(),
+            error: rpc_error(-32000, "timeout waiting for tool approval"),
+        };
+        assert!(!misleading.is_transient());
+
+        let transport = AcpRequestError::Transport {
+            method: "session/load".into(),
+            source: anyhow::anyhow!("stdin write timeout"),
+        };
+        assert!(!transport.is_transient());
+        assert_eq!(transport.to_string(), "stdin write timeout");
+        assert_eq!(transport.method(), "session/load");
+    }
 
     #[test]
     fn picks_allow_always_over_other_options() {
