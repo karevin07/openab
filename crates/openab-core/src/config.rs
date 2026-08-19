@@ -659,6 +659,18 @@ pub struct DiscordProjectCommandConfig {
     /// Require an explicit Discord confirmation before execution.
     #[serde(default)]
     pub requires_confirmation: bool,
+    /// Environment variables copied from OpenAB's own process into this
+    /// command's otherwise-cleared environment.
+    ///
+    /// The bridge scripts need the bot token to reach Discord. Handing it over
+    /// here rather than mounting the `.env` beside them keeps it out of the
+    /// agent's reach: the agent runs as the same uid as OpenAB, so any file it
+    /// can find it can read, and `env_clear` on the *agent* is worth nothing if
+    /// the same secret is sitting in a world-readable mount.
+    ///
+    /// Names only; values are never read from the Discord payload.
+    #[serde(default)]
+    pub env_passthrough: Vec<String>,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
