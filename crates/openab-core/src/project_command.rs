@@ -92,6 +92,15 @@ pub async fn run_project_command(
             process.env(key, value);
         }
     }
+    // Named by the operator in `env_passthrough`, copied from OpenAB's own
+    // environment. A name the operator asked for but that is unset here is
+    // skipped silently: the command reports its own missing-credential error,
+    // which says more than a failure to start would.
+    for key in &command.env_passthrough {
+        if let Some(value) = std::env::var_os(key) {
+            process.env(key, value);
+        }
+    }
 
     // Give every command its own process group so timeout termination also
     // reaches children spawned by make, npm, and similar task runners.
@@ -169,6 +178,7 @@ mod tests {
             args: args.iter().map(|value| (*value).into()).collect(),
             timeout_seconds: 5,
             requires_confirmation: false,
+            env_passthrough: Vec::new(),
         }
     }
 
@@ -193,6 +203,40 @@ mod tests {
         assert_eq!(output.stdout, "literal;not-shell-expanded");
         assert!(output.stderr.is_empty());
         assert!(!output.timed_out);
+    }
+
+    /// The bridge scripts need the bot token, and the whole point of handing it
+    /// over here is that the `.env` beside them can stop being mounted — the
+    /// agent runs as the same uid and would otherwise just read the file.
+    #[tokio::test]
+    async fn passes_through_only_the_named_variables() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join(".git")).unwrap();
+        std::env::set_var("OPENAB_TEST_WANTED", "wanted-value");
+        std::env::set_var("OPENAB_TEST_UNWANTED", "secret");
+
+        let mut config = command("printenv", &[]);
+        config.env_passthrough = vec!["OPENAB_TEST_WANTED".into()];
+        let output = run_project_command(&config, dir.path()).await.unwrap();
+
+        std::env::remove_var("OPENAB_TEST_WANTED");
+        std::env::remove_var("OPENAB_TEST_UNWANTED");
+        assert!(output.stdout.contains("OPENAB_TEST_WANTED=wanted-value"));
+        // Everything else stays cleared: passthrough is an allowlist, not a door.
+        assert!(!output.stdout.contains("OPENAB_TEST_UNWANTED"));
+    }
+
+    /// An operator can name a variable that is not set here — a deployment
+    /// without the admin bot, say. Starting anyway lets the command report its
+    /// own missing-credential message instead of failing to spawn.
+    #[tokio::test]
+    async fn a_missing_named_variable_does_not_stop_the_command() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join(".git")).unwrap();
+        let mut config = command("printenv", &[]);
+        config.env_passthrough = vec!["OPENAB_TEST_DEFINITELY_UNSET".into()];
+        let output = run_project_command(&config, dir.path()).await.unwrap();
+        assert!(!output.stdout.contains("OPENAB_TEST_DEFINITELY_UNSET"));
     }
 
     #[tokio::test]

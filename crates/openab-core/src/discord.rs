@@ -8866,6 +8866,7 @@ mod tests {
             args: vec!["status".into(), "--short".into()],
             timeout_seconds: 30,
             requires_confirmation: true,
+            env_passthrough: Vec::new(),
         }
     }
 
