@@ -44,6 +44,18 @@ struct PoolState {
     /// Per-session working directory overrides (from control directives).
     /// thread_key → canonical workspace path.
     session_workdirs: HashMap<String, String>,
+    /// Reset counter per thread, bumped by [`SessionPool::reset_session`].
+    ///
+    /// `get_or_create` reads it before its slow section and again under the
+    /// final write lock. A reset that lands in between has already cleared the
+    /// maps and told the user so; without this the creation would write a
+    /// session straight back and — when it was resuming rather than creating —
+    /// restore the very history the reset discarded.
+    ///
+    /// Deliberately not a lock: making `reset_session` wait for the creating
+    /// gate would park it behind a `session/new` that can take two minutes,
+    /// and a stuck session is exactly when someone reaches for `/reset`.
+    reset_generations: HashMap<String, u64>,
 }
 
 pub struct SessionPool {
@@ -213,7 +225,8 @@ fn purge_session_entries(state: &mut PoolState, key: &str) {
     // Do NOT remove the creating gate: it is concurrency control, not session
     // state. Removing it while a holder still owns the old gate Arc would let
     // a concurrent get_or_create mint a fresh gate and run two creations for
-    // the same key.
+    // the same key. The reset generation is the same kind of thing — dropping
+    // it would reset the counter an in-flight creation is comparing against.
     state.session_workdirs.remove(key);
 }
 
@@ -352,6 +365,7 @@ impl SessionPool {
                 suspended,
                 creating: HashMap::new(),
                 session_workdirs,
+                reset_generations: HashMap::new(),
             }),
             config,
             max_sessions,
@@ -545,11 +559,12 @@ impl SessionPool {
             ));
         }
 
-        let (existing, saved_session_id) = {
+        let (existing, saved_session_id, reset_generation) = {
             let state = self.state.read().await;
             (
                 state.active.get(thread_id).cloned(),
                 state.suspended.get(thread_id).cloned(),
+                state.reset_generations.get(thread_id).copied().unwrap_or(0),
             )
         };
 
@@ -756,6 +771,21 @@ impl SessionPool {
         let new_conn = Arc::new(Mutex::new(new_conn));
 
         let mut state = self.state.write().await;
+
+        // A reset landed while this connection was being built. It has already
+        // cleared the maps and reported success; writing now would silently undo
+        // it. Return instead and let `new_conn` drop — its `Drop` kills the agent
+        // process group, and the next message starts the clean session the user
+        // asked for.
+        if state.reset_generations.get(thread_id).copied().unwrap_or(0) != reset_generation {
+            info!(
+                thread_id = %crate::redact::redact_session_ids(thread_id),
+                "session was reset while it was being created; discarding the new connection"
+            );
+            return Err(anyhow!(
+                "session was reset while it was being created; send the request again"
+            ));
+        }
 
         // Another task may have created a healthy connection while we were
         // initializing this one.
@@ -1051,6 +1081,13 @@ impl SessionPool {
 
         let mut state = self.state.write().await;
         let had_state = has_session_state(&state, thread_id);
+        // Bumped before anything is cleared, so a creation that re-acquires the
+        // write lock after this point sees a changed generation and stands down.
+        let generation = state
+            .reset_generations
+            .entry(thread_id.to_string())
+            .or_insert(0);
+        *generation = generation.saturating_add(1);
         state.active.remove(thread_id);
         // Everything else a reset clears is exactly what hung eviction clears, including the rule
         // that the creating gate survives. Call the one implementation rather than keeping a second
@@ -1321,6 +1358,7 @@ mod tests {
             persisted: HashMap::new(),
             creating: HashMap::new(),
             session_workdirs: HashMap::new(),
+            reset_generations: HashMap::new(),
         }
     }
 
@@ -1516,14 +1554,18 @@ mod tests {
     /// which someone reaches for `/reset` because the session feels stuck.
     ///
     /// `detach_session` and `attach_external_session` take that gate.
-    /// `reset_session` does not. It can therefore land in the middle of a
-    /// creation that read `saved_session_id` *before* the reset and will
-    /// re-insert it on its way out: the reset reports success, and the thread
-    /// comes back holding the history it was meant to lose.
+    /// `reset_session` deliberately does not, and this pins that: parking a
+    /// reset behind a `session/new` that can take two minutes would break the
+    /// one case it exists for, a session that is already stuck.
     ///
-    /// The test pins the asymmetry rather than the interleaving, which cannot be
-    /// driven here without a live agent subprocess. Both calls run under
-    /// identical conditions, so the difference between them is the code's.
+    /// Staying ungated means the creation has to notice on its own, which is
+    /// what `reset_generations` is for — see the test below. Before that
+    /// counter existed, a reset landing mid-creation was silently undone, and
+    /// when the creation was resuming rather than creating, the thread came
+    /// back holding the very history the reset was meant to discard.
+    ///
+    /// Both calls run under identical conditions here, so the difference
+    /// between them is the code's and not this test's setup.
     #[tokio::test]
     async fn reset_session_is_not_serialised_against_session_creation() {
         let dir = tempfile::tempdir().unwrap();
@@ -1567,6 +1609,52 @@ mod tests {
         );
 
         drop(creating);
+    }
+
+    /// The other half of the same problem. `reset_session` stays ungated, so a
+    /// creation already in flight has to detect the reset itself: it captures
+    /// this counter before its slow section and compares again under the final
+    /// write lock, standing down if it moved.
+    #[tokio::test]
+    async fn reset_bumps_the_generation_an_in_flight_creation_compares_against() {
+        let dir = tempfile::tempdir().unwrap();
+        let pool = SessionPool::new_in(dir.path(), AgentConfig::default(), 4, 600, HashMap::new());
+        const KEY: &str = "discord:T1";
+
+        // An untouched thread has no entry, which a creation reads as 0.
+        assert_eq!(
+            pool.state.read().await.reset_generations.get(KEY).copied(),
+            None
+        );
+
+        for expected in 1..=2u64 {
+            {
+                let mut state = pool.state.write().await;
+                state
+                    .persisted
+                    .insert(KEY.to_string(), "sess_old".to_string());
+                state
+                    .suspended
+                    .insert(KEY.to_string(), "sess_old".to_string());
+            }
+            pool.reset_session(KEY).await.expect("reset should succeed");
+            assert_eq!(
+                pool.state.read().await.reset_generations.get(KEY).copied(),
+                Some(expected),
+                "every reset must move the counter, or the second one goes unnoticed"
+            );
+        }
+
+        // Per thread: a reset here cannot cancel a creation running elsewhere.
+        assert_eq!(
+            pool.state
+                .read()
+                .await
+                .reset_generations
+                .get("discord:T2")
+                .copied(),
+            None
+        );
     }
 
     #[test]
@@ -1710,6 +1798,7 @@ mod tests {
             ]),
             creating: HashMap::from([("hung".to_string(), Arc::new(Mutex::new(())))]),
             session_workdirs: HashMap::from([("hung".to_string(), "/tmp/ws".to_string())]),
+            reset_generations: HashMap::from([("hung".to_string(), 7)]),
         };
 
         purge_session_entries(&mut state, "hung");
@@ -1722,8 +1811,12 @@ mod tests {
         assert!(!state.persisted.contains_key("hung"));
         assert!(!state.session_workdirs.contains_key("hung"));
         // The creating gate is concurrency control, not session state: it must
-        // survive so an in-flight get_or_create holder stays serialized.
+        // survive so an in-flight get_or_create holder stays serialized. The
+        // reset generation is the same: dropping it would reset the counter an
+        // in-flight creation is comparing itself against, and that creation
+        // would then happily undo this eviction.
         assert!(state.creating.contains_key("hung"));
+        assert_eq!(state.reset_generations.get("hung"), Some(&7));
         assert_eq!(state.pgids.get("other"), Some(&5678));
         // Other keys survive untouched.
         assert_eq!(
