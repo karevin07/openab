@@ -1776,6 +1776,12 @@ async fn main() -> anyhow::Result<()> {
             .map(str::parse::<u64>)
             .transpose()
             .map_err(|error| anyhow::anyhow!("invalid discord.project_category_id: {error}"))?;
+        let all_sessions_channel_id = discord_cfg
+            .all_sessions_channel_id
+            .as_deref()
+            .map(str::parse::<u64>)
+            .transpose()
+            .map_err(|error| anyhow::anyhow!("invalid discord.all_sessions_channel_id: {error}"))?;
         if discord_cfg.project_channels_enabled && project_category_id.is_none() {
             anyhow::bail!(
                 "discord.project_category_id is required when project_channels_enabled=true"
@@ -1809,6 +1815,7 @@ async fn main() -> anyhow::Result<()> {
             allow_dm = discord_cfg.allow_dm,
             project_channels_enabled = discord_cfg.project_channels_enabled,
             project_category_id,
+            all_sessions_channel_id,
             project_actions = discord_cfg.project_actions.len(),
             project_commands = discord_cfg.project_commands.len(),
             admin_control_enabled = admin_control.is_some(),
@@ -1935,6 +1942,7 @@ async fn main() -> anyhow::Result<()> {
             scheduled_ids: tokio::sync::Mutex::new(std::collections::HashSet::new()),
             project_channels_enabled: discord_cfg.project_channels_enabled,
             project_category_id,
+            all_sessions_channel_id,
             project_registry,
             task_registry,
             project_actions: discord_cfg.project_actions,

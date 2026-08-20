@@ -530,6 +530,9 @@ pub struct DiscordConfig {
     /// Discord category ID under which `/project create` places channels.
     /// Required when `project_channels_enabled` is true.
     pub project_category_id: Option<String>,
+    /// Optional Discord channel that exposes the cross-project Session Center.
+    /// The button and its interactions are unavailable everywhere else.
+    pub all_sessions_channel_id: Option<String>,
     /// Trusted, repository-specific prompt shortcuts shown from Discord
     /// Project Home. Selecting one opens the normal new-task modal with the
     /// configured title and prompt pre-filled; OpenAB never executes these as
@@ -2997,6 +3000,7 @@ bot_token = "token"
         .unwrap();
         assert!(!defaults.project_channels_enabled);
         assert!(defaults.project_category_id.is_none());
+        assert!(defaults.all_sessions_channel_id.is_none());
         assert!(defaults.admin_control.is_none());
 
         let cfg = parse_config_str(
@@ -3005,6 +3009,7 @@ bot_token = "token"
 bot_token = "token"
 project_channels_enabled = true
 project_category_id = "123456789"
+all_sessions_channel_id = "987654321"
 "#,
             "test",
         )
@@ -3013,6 +3018,10 @@ project_category_id = "123456789"
         let discord = cfg.discord.unwrap();
         assert!(discord.project_channels_enabled);
         assert_eq!(discord.project_category_id.as_deref(), Some("123456789"));
+        assert_eq!(
+            discord.all_sessions_channel_id.as_deref(),
+            Some("987654321")
+        );
     }
 
     #[test]

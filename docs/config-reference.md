@@ -75,6 +75,7 @@ Discord adapter. Requires a Discord bot token.
 | `bot_token` | string | *required* | Discord bot token. Use `${DISCORD_BOT_TOKEN}` for env var. |
 | `project_channels_enabled` | bool | `false` | Enable administrator-only `/project` commands for private workspace channels. Existing persisted bindings remain routable when disabled. |
 | `project_category_id` | string \| omit | none | Discord category ID used by `/project create`. Required when project channels are enabled. |
+| `all_sessions_channel_id` | string \| omit | none | The only channel where `/help` exposes the cross-project **All sessions** card. Interactions are rejected from every other channel. |
 | `project_actions` | table[] | `[]` | Trusted per-workspace Agent prompt shortcuts shown from Project Home. See below. |
 | `project_commands` | table[] | `[]` | Trusted per-workspace executable shortcuts shown from Project Home. See below. |
 | `allow_all_channels` | bool \| omit | auto-detect | `true` = all channels; `false` = only `allowed_channels`. Omitted = inferred from list (non-empty → false, empty → true). |

@@ -231,6 +231,21 @@ impl TaskRegistry {
         tasks
     }
 
+    /// Return the most recently updated tasks across every registered project.
+    /// Callers must still apply their own guild and project-access filters.
+    pub fn recent_all(&self, limit: usize) -> Vec<TaskRecord> {
+        let mut tasks = self
+            .tasks
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .values()
+            .cloned()
+            .collect::<Vec<_>>();
+        tasks.sort_by_key(|task| std::cmp::Reverse(task.updated_at));
+        tasks.truncate(limit);
+        tasks
+    }
+
     /// Remove one task from the Discord UI registry.
     ///
     /// Session state must be closed separately before calling this method. Keeping
@@ -420,6 +435,13 @@ mod tests {
         let recent = registry.recent_for_project(10, 10);
         assert_eq!(recent.len(), 2);
         assert_eq!(recent[0].thread_id, 20);
+
+        let all = registry.recent_all(10);
+        assert_eq!(all.len(), 3);
+        assert!(all.iter().any(|item| item.project_channel_id == 11));
+        assert!(all
+            .windows(2)
+            .all(|items| items[0].updated_at >= items[1].updated_at));
     }
 
     #[test]
