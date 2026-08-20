@@ -25,6 +25,7 @@ use serenity::builder::{
 use serenity::model::application::{ButtonStyle, ComponentInteractionDataKind};
 use serenity::model::id::{ChannelId, MessageId};
 use serenity::prelude::*;
+use std::collections::HashSet;
 
 #[derive(Debug, Clone)]
 pub(crate) struct ManagedSessionEntry {
@@ -297,7 +298,221 @@ pub(crate) fn session_manager_edit(
     session_manager_card(binding, entries, selected_thread_id, note).into_edit()
 }
 
+fn all_sessions_card(
+    entries: &[ManagedSessionEntry],
+    selected_thread_id: Option<u64>,
+    note: Option<String>,
+) -> InteractionCard {
+    let selected = selected_thread_id.and_then(|thread_id| {
+        entries
+            .iter()
+            .find(|entry| entry.task.thread_id == thread_id)
+    });
+    let active = entries
+        .iter()
+        .filter(|entry| entry.snapshot.state == SessionState::Active)
+        .count();
+    let resumable = entries
+        .iter()
+        .filter(|entry| entry.snapshot.state != SessionState::None)
+        .count();
+    let on_computer = entries
+        .iter()
+        .filter(|entry| entry.snapshot.externally_detached)
+        .count();
+
+    let mut embed = CreateEmbed::new()
+        .title("🌐 All Cursor Sessions")
+        .description(
+            "跨 repository 查看最近的 sessions。選擇一筆可跳到 task thread 或 Project Home；只有設定的 OpenAB 控制頻道能開啟此卡片。",
+        )
+        .colour(0x5865F2)
+        .field(
+            "總覽",
+            format!(
+                "**{}** sessions · **{active}** active · **{resumable}** resumable · **{on_computer}** on computer",
+                entries.len()
+            ),
+            false,
+        );
+
+    if let Some(entry) = selected {
+        let (icon, state, colour) = managed_session_presentation(entry);
+        let workspace = if entry.task.workspace_alias.is_empty() {
+            format!("project {}", entry.task.project_channel_id)
+        } else {
+            format!("@{}", entry.task.workspace_alias)
+        };
+        embed = embed
+            .title(format!("{icon} {}", entry.task.title))
+            .colour(colour)
+            .field("Session", format!("**{state}**"), true)
+            .field("Workspace", inline_code(&workspace), true)
+            .field("Task thread", format!("<#{}>", entry.task.thread_id), false)
+            .field(
+                "Last updated",
+                format!("<t:{}:R>", entry.task.updated_at.timestamp()),
+                true,
+            );
+    } else if entries.is_empty() {
+        embed = embed.field(
+            "Sessions",
+            "_目前沒有你可以存取的 registered sessions。_",
+            false,
+        );
+    } else {
+        let list = entries
+            .iter()
+            .take(10)
+            .map(|entry| {
+                let (icon, state, _) = managed_session_presentation(entry);
+                let workspace = if entry.task.workspace_alias.is_empty() {
+                    format!("project {}", entry.task.project_channel_id)
+                } else {
+                    format!("@{}", entry.task.workspace_alias)
+                };
+                format!(
+                    "{icon} **{workspace}** · <#{}> · {state} · <t:{}:R>",
+                    entry.task.thread_id,
+                    entry.task.updated_at.timestamp()
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        embed = embed.field("Recent sessions", list, false);
+    }
+    embed = embed.footer(CreateEmbedFooter::new(
+        "最多顯示你可存取的最近 25 筆 · 選擇後前往原 project 管理",
+    ));
+
+    let mut rows = Vec::new();
+    if !entries.is_empty() {
+        let options = entries
+            .iter()
+            .take(SELECT_MENU_PAGE_SIZE)
+            .map(|entry| {
+                let (icon, state, _) = managed_session_presentation(entry);
+                let workspace = if entry.task.workspace_alias.is_empty() {
+                    "unknown".to_string()
+                } else {
+                    format!("@{}", entry.task.workspace_alias)
+                };
+                let mut option = CreateSelectMenuOption::new(
+                    truncate_for_discord(
+                        &format!("{workspace} · {}", entry.task.title),
+                        SELECT_OPTION_TEXT_MAX,
+                    ),
+                    entry.task.thread_id.to_string(),
+                )
+                .description(truncate_for_discord(
+                    &format!(
+                        "{icon} {state} · {} UTC",
+                        entry.task.updated_at.format("%m-%d %H:%M")
+                    ),
+                    SELECT_OPTION_TEXT_MAX,
+                ));
+                if selected_thread_id == Some(entry.task.thread_id) {
+                    option = option.default_selection(true);
+                }
+                option
+            })
+            .collect();
+        rows.push(CreateActionRow::SelectMenu(
+            CreateSelectMenu::new(
+                "oab_all_sessions:select",
+                CreateSelectMenuKind::String { options },
+            )
+            .placeholder("選擇 repository session"),
+        ));
+    }
+
+    let mut buttons = Vec::new();
+    if let Some(entry) = selected {
+        buttons.push(
+            CreateButton::new_link(format!(
+                "https://discord.com/channels/{}/{}",
+                entry.task.guild_id, entry.task.thread_id
+            ))
+            .label("Open thread"),
+        );
+        buttons.push(
+            CreateButton::new_link(format!(
+                "https://discord.com/channels/{}/{}",
+                entry.task.guild_id, entry.task.project_channel_id
+            ))
+            .label("Project Home"),
+        );
+    }
+    buttons.push(
+        CreateButton::new("oab_all_sessions:refresh")
+            .label("↻ Refresh")
+            .style(ButtonStyle::Secondary),
+    );
+    buttons.push(
+        CreateButton::new("oab_help:back")
+            .label("← Help")
+            .style(ButtonStyle::Secondary),
+    );
+    rows.push(CreateActionRow::Buttons(buttons));
+
+    InteractionCard {
+        content: note
+            .map(|value| truncate_for_discord(&value, 1900))
+            .unwrap_or_default(),
+        embed,
+        components: rows,
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn all_sessions_message(
+    entries: &[ManagedSessionEntry],
+    selected_thread_id: Option<u64>,
+    note: Option<String>,
+) -> CreateInteractionResponseMessage {
+    all_sessions_card(entries, selected_thread_id, note).into_message()
+}
+
+pub(crate) fn all_sessions_edit(
+    entries: &[ManagedSessionEntry],
+    selected_thread_id: Option<u64>,
+    note: Option<String>,
+) -> EditInteractionResponse {
+    all_sessions_card(entries, selected_thread_id, note).into_edit()
+}
+
 impl Handler {
+    pub(crate) async fn managed_sessions_for_projects(
+        &self,
+        projects: &[ProjectBinding],
+    ) -> Vec<ManagedSessionEntry> {
+        let visible_project_ids = projects
+            .iter()
+            .map(|binding| binding.channel_id)
+            .collect::<HashSet<_>>();
+        let tasks = self
+            .task_registry
+            .recent_all(usize::MAX)
+            .into_iter()
+            .filter(|task| visible_project_ids.contains(&task.project_channel_id))
+            .take(SELECT_MENU_PAGE_SIZE);
+        let mut entries = Vec::new();
+        for mut task in tasks {
+            let snapshot = self
+                .router
+                .pool()
+                .session_snapshot(&format!("discord:{}", task.thread_id))
+                .await;
+            if let Some(state) = reconciled_handoff_task_state(task.state, &snapshot) {
+                if let Ok(updated) = self.task_registry.set_state(task.thread_id, state) {
+                    task = updated;
+                }
+            }
+            entries.push(ManagedSessionEntry { task, snapshot });
+        }
+        entries
+    }
+
     pub(crate) async fn managed_sessions_for_project(
         &self,
         project_channel_id: u64,
@@ -320,6 +535,90 @@ impl Handler {
             entries.push(ManagedSessionEntry { task, snapshot });
         }
         entries
+    }
+
+    pub(crate) async fn handle_all_sessions_component(
+        &self,
+        ctx: &Context,
+        comp: &serenity::model::application::ComponentInteraction,
+    ) {
+        if comp.user.bot
+            || is_denied_user(
+                false,
+                self.allow_all_users,
+                &self.allowed_users,
+                comp.user.id.get(),
+            )
+        {
+            let response = CreateInteractionResponse::Message(
+                CreateInteractionResponseMessage::new()
+                    .content("🚫 你沒有查看 Cursor sessions 的權限。")
+                    .ephemeral(true),
+            );
+            let _ = comp.create_response(&ctx.http, response).await;
+            return;
+        }
+        if self.all_sessions_channel_id != Some(comp.channel_id.get()) {
+            let response = CreateInteractionResponse::Message(
+                CreateInteractionResponseMessage::new()
+                    .content("🚫 All sessions 只能在指定的 OpenAB 控制頻道使用。")
+                    .ephemeral(true),
+            );
+            let _ = comp.create_response(&ctx.http, response).await;
+            return;
+        }
+
+        let action = comp
+            .data
+            .custom_id
+            .strip_prefix("oab_all_sessions:")
+            .unwrap_or("");
+        let selected_thread_id = if action == "select" {
+            match &comp.data.kind {
+                ComponentInteractionDataKind::StringSelect { values } => {
+                    values.first().and_then(|value| value.parse::<u64>().ok())
+                }
+                _ => None,
+            }
+        } else {
+            None
+        };
+
+        if let Err(error) = comp.defer(&ctx.http).await {
+            tracing::error!(%error, action, "failed to defer All Sessions interaction");
+            return;
+        }
+        let role_ids = comp
+            .member
+            .as_ref()
+            .map(|member| member.roles.iter().map(|role_id| role_id.get()).collect())
+            .unwrap_or_default();
+        let permissions = comp.member.as_ref().and_then(|member| member.permissions);
+        let projects = self.visible_projects(
+            comp.guild_id.map(|guild_id| guild_id.get()),
+            comp.user.id.get(),
+            &role_ids,
+            permissions,
+        );
+        let entries = self.managed_sessions_for_projects(&projects).await;
+        let selected = selected_thread_id.filter(|thread_id| {
+            entries
+                .iter()
+                .any(|entry| entry.task.thread_id == *thread_id)
+        });
+        let note = if selected_thread_id.is_some() && selected.is_none() {
+            Some("⚠️ 這筆 session 已不存在或你已沒有存取權限，清單已更新。".to_string())
+        } else if !matches!(action, "select" | "refresh") {
+            Some("⚠️ This All Sessions action is no longer available.".to_string())
+        } else {
+            None
+        };
+        if let Err(error) = comp
+            .edit_response(&ctx.http, all_sessions_edit(&entries, selected, note))
+            .await
+        {
+            tracing::error!(%error, action, "failed to update All Sessions");
+        }
     }
 
     pub(crate) async fn handle_session_manager_component(

@@ -16,7 +16,9 @@ use crate::cron::{
 use crate::discord_admin::DiscordAdminClient;
 // Help and the session-control card both render the Session Manager; the card
 // itself and the handoff-state rule live with the rest of that flow.
-use crate::discord_session_ui::{reconciled_handoff_task_state, session_manager_edit};
+use crate::discord_session_ui::{
+    all_sessions_edit, reconciled_handoff_task_state, session_manager_edit,
+};
 use crate::dispatch::DispatchTarget;
 use crate::directives::resolve_workspace;
 use crate::format;
@@ -1347,6 +1349,7 @@ fn help_action_center(
     image_url: Option<&str>,
     projects: &[ProjectBinding],
     admin_control_enabled: bool,
+    all_sessions_enabled: bool,
     task: Option<&TaskRecord>,
 ) -> CreateInteractionResponseMessage {
     let mut embed = CreateEmbed::new()
@@ -1445,12 +1448,23 @@ fn help_action_center(
             .label("🛠️ Troubleshoot")
             .style(ButtonStyle::Secondary),
     ]));
+    let mut utility_buttons = Vec::new();
+    if all_sessions_enabled {
+        utility_buttons.push(
+            CreateButton::new("oab_help:all_sessions")
+                .label("🌐 All sessions")
+                .style(ButtonStyle::Secondary),
+        );
+    }
     if admin_control_enabled {
-        components.push(CreateActionRow::Buttons(vec![CreateButton::new(
-            "oab_admin:open",
-        )
-        .label("🛡️ Server management")
-        .style(ButtonStyle::Secondary)]));
+        utility_buttons.push(
+            CreateButton::new("oab_admin:open")
+                .label("🛡️ Server management")
+                .style(ButtonStyle::Secondary),
+        );
+    }
+    if !utility_buttons.is_empty() {
+        components.push(CreateActionRow::Buttons(utility_buttons));
     }
     if let Some(row) = project_selector_row(projects) {
         components.push(row);
@@ -2118,6 +2132,8 @@ pub struct Handler {
     pub project_channels_enabled: bool,
     /// Category under which new private project channels are created.
     pub project_category_id: Option<u64>,
+    /// The only channel allowed to expose and operate the cross-project Session Center.
+    pub all_sessions_channel_id: Option<u64>,
     /// Runtime Discord channel-to-workspace bindings persisted across restarts.
     pub project_registry: ProjectRegistry,
     /// Persistent task metadata used by Project Home and task status cards.
@@ -3683,6 +3699,11 @@ impl EventHandler for Handler {
             Interaction::Component(comp) if comp.data.custom_id.starts_with("oab_sessions:") => {
                 self.handle_session_manager_component(&ctx, &comp).await;
             }
+            Interaction::Component(comp)
+                if comp.data.custom_id.starts_with("oab_all_sessions:") =>
+            {
+                self.handle_all_sessions_component(&ctx, &comp).await;
+            }
             Interaction::Component(comp) if comp.data.custom_id == "oab_project_actions" => {
                 self.handle_project_action_select(&ctx, &comp).await;
             }
@@ -3846,7 +3867,7 @@ impl Handler {
             })
     }
 
-    fn visible_projects(
+    pub(crate) fn visible_projects(
         &self,
         guild_id: Option<u64>,
         user_id: u64,
@@ -3899,6 +3920,7 @@ impl Handler {
                 avatar_url.as_deref(),
                 &projects,
                 self.admin_control.is_some(),
+                self.all_sessions_channel_id == Some(cmd.channel_id.get()),
                 task.as_ref(),
             )
             .ephemeral(true),
@@ -3954,6 +3976,7 @@ impl Handler {
                     avatar_url.as_deref(),
                     &projects,
                     self.admin_control.is_some(),
+                    self.all_sessions_channel_id == Some(comp.channel_id.get()),
                     task.as_ref(),
                 ))
             } else {
@@ -3962,6 +3985,7 @@ impl Handler {
                         avatar_url.as_deref(),
                         &projects,
                         self.admin_control.is_some(),
+                        self.all_sessions_channel_id == Some(comp.channel_id.get()),
                         task.as_ref(),
                     )
                     .ephemeral(true),
@@ -3969,6 +3993,30 @@ impl Handler {
             };
             if let Err(error) = comp.create_response(&ctx.http, response).await {
                 tracing::error!(%error, "failed to open help action center");
+            }
+            return;
+        }
+
+        if topic == "all_sessions" {
+            if self.all_sessions_channel_id != Some(comp.channel_id.get()) {
+                let response = CreateInteractionResponse::Message(
+                    CreateInteractionResponseMessage::new()
+                        .content("🚫 All sessions 只能在指定的 OpenAB 控制頻道使用。")
+                        .ephemeral(true),
+                );
+                let _ = comp.create_response(&ctx.http, response).await;
+                return;
+            }
+            if let Err(error) = comp.defer(&ctx.http).await {
+                tracing::error!(%error, "failed to defer All Sessions from help");
+                return;
+            }
+            let entries = self.managed_sessions_for_projects(&projects).await;
+            if let Err(error) = comp
+                .edit_response(&ctx.http, all_sessions_edit(&entries, None, None))
+                .await
+            {
+                tracing::error!(%error, "failed to open All Sessions from help");
             }
             return;
         }
@@ -4088,6 +4136,7 @@ impl Handler {
                     avatar_url.as_deref(),
                     &projects,
                     self.admin_control.is_some(),
+                    self.all_sessions_channel_id == Some(comp.channel_id.get()),
                     self.task_registry
                         .task_for_thread(comp.channel_id.get())
                         .as_ref(),
@@ -8602,7 +8651,8 @@ mod tests {
     use crate::dispatch::{ActiveMessage, PendingMessage};
     use crate::discord_admin::{AdminInventory, CleanupCandidates};
     use crate::discord_session_ui::{
-        reconciled_handoff_task_state, session_manager_message, ManagedSessionEntry,
+        all_sessions_message, reconciled_handoff_task_state, session_manager_message,
+        ManagedSessionEntry,
     };
     use crate::discord_queue_ui::{
         queue_clear_confirmation_card, queue_edit_modal, queue_item_allowed,
@@ -9198,13 +9248,19 @@ mod tests {
 
     #[test]
     fn help_and_project_home_expose_session_manager() {
-        let help = serde_json::to_string(&help_action_center(None, &[], true, None)).unwrap();
+        let help =
+            serde_json::to_string(&help_action_center(None, &[], true, true, None)).unwrap();
         assert!(help.contains("oab_help:sessions"));
+        assert!(help.contains("oab_help:all_sessions"));
         assert!(help.contains("oab_admin:open"));
+
+        let regular_channel_help =
+            serde_json::to_string(&help_action_center(None, &[], false, false, None)).unwrap();
+        assert!(!regular_channel_help.contains("oab_help:all_sessions"));
 
         let ready_task = ui_task(TaskState::Ready, None);
         let task_help =
-            serde_json::to_string(&help_action_center(None, &[], false, Some(&ready_task)))
+            serde_json::to_string(&help_action_center(None, &[], false, false, Some(&ready_task)))
                 .unwrap();
         assert!(task_help.contains("Current task"));
         assert!(task_help.contains("oab_task:continue"));
@@ -9213,7 +9269,7 @@ mod tests {
 
         let running_task = ui_task(TaskState::Running, None);
         let running_help =
-            serde_json::to_string(&help_action_center(None, &[], false, Some(&running_task)))
+            serde_json::to_string(&help_action_center(None, &[], false, false, Some(&running_task)))
                 .unwrap();
         assert!(running_help.contains("排入佇列"));
         assert!(running_help.contains("oab_queue:open"));
@@ -9439,7 +9495,7 @@ mod tests {
             })
             .collect::<Vec<_>>();
         let value =
-            serde_json::to_value(help_action_center(None, &projects, false, None)).unwrap();
+            serde_json::to_value(help_action_center(None, &projects, false, false, None)).unwrap();
         let select = component_with_custom_id(&value, "oab_help_project").unwrap();
 
         assert_eq!(
@@ -9503,6 +9559,26 @@ mod tests {
             select["options"].as_array().unwrap().len(),
             SELECT_MENU_PAGE_SIZE
         );
+    }
+
+    #[test]
+    fn all_sessions_caps_options_and_links_to_the_selected_project() {
+        let mut entries = (1..=30)
+            .map(|thread_id| managed_entry(thread_id, TaskState::Ready, SessionState::Persisted))
+            .collect::<Vec<_>>();
+        entries[1].task.workspace_alias = "example-library".into();
+        entries[1].task.project_channel_id = 42;
+        let value =
+            serde_json::to_value(all_sessions_message(&entries, Some(2), None)).unwrap();
+        let select = component_with_custom_id(&value, "oab_all_sessions:select").unwrap();
+        assert_eq!(
+            select["options"].as_array().unwrap().len(),
+            SELECT_MENU_PAGE_SIZE
+        );
+        assert!(value.to_string().contains("@example-library"));
+        assert!(value
+            .to_string()
+            .contains("https://discord.com/channels/1/42"));
     }
 
     #[test]
