@@ -7,14 +7,17 @@
 //! Supported keys:
 //! - `thread.name` — rename the current Discord/Slack thread
 //! - `session.publish` — publish an exited Cursor chat to a Discord project
+//! - `session.mirror` — mirror a trusted local Cursor handoff event to Discord
 
 #[cfg(unix)]
 use openab_core::adapter::{ChannelRef, ChatAdapter};
 #[cfg(all(unix, feature = "discord"))]
-use openab_core::acp::SessionPool;
+use openab_core::acp::{SessionPool, SessionState};
 #[cfg(all(unix, feature = "discord"))]
 use openab_core::project_registry::{ProjectBinding, ProjectRegistry};
 use serde::{Deserialize, Serialize};
+#[cfg(all(unix, feature = "discord"))]
+use std::collections::{HashSet, VecDeque};
 use std::path::PathBuf;
 #[cfg(unix)]
 use std::sync::Arc;
@@ -202,6 +205,46 @@ struct SessionPublishRequest {
     title: Option<String>,
 }
 
+#[cfg(all(unix, feature = "discord"))]
+#[derive(Debug, Deserialize)]
+struct SessionMirrorRequest {
+    event_id: String,
+    kind: String,
+    content: String,
+}
+
+#[cfg(all(unix, feature = "discord"))]
+#[derive(Default)]
+struct MirrorEventCache {
+    ids: HashSet<String>,
+    order: VecDeque<String>,
+}
+
+#[cfg(all(unix, feature = "discord"))]
+impl MirrorEventCache {
+    const LIMIT: usize = 2048;
+
+    fn insert(&mut self, event_id: &str) -> bool {
+        if !self.ids.insert(event_id.to_string()) {
+            return false;
+        }
+        self.order.push_back(event_id.to_string());
+        while self.order.len() > Self::LIMIT {
+            if let Some(expired) = self.order.pop_front() {
+                self.ids.remove(&expired);
+            }
+        }
+        true
+    }
+
+    fn remove(&mut self, event_id: &str) {
+        self.ids.remove(event_id);
+        if let Some(index) = self.order.iter().position(|item| item == event_id) {
+            self.order.remove(index);
+        }
+    }
+}
+
 /// Concrete handler for `openab run` — dispatches to platform adapters.
 #[cfg(unix)]
 pub struct RuntimeHandler {
@@ -212,6 +255,8 @@ pub struct RuntimeHandler {
     shard: ShardSlot,
     #[cfg(feature = "discord")]
     session_publish: Option<SessionPublishContext>,
+    #[cfg(feature = "discord")]
+    mirror_events: tokio::sync::Mutex<MirrorEventCache>,
 }
 
 #[cfg(unix)]
@@ -228,6 +273,8 @@ impl RuntimeHandler {
             shard,
             #[cfg(feature = "discord")]
             session_publish,
+            #[cfg(feature = "discord")]
+            mirror_events: tokio::sync::Mutex::new(MirrorEventCache::default()),
         }
     }
 
@@ -288,6 +335,105 @@ impl RuntimeHandler {
             },
         }
     }
+
+    #[cfg(feature = "discord")]
+    async fn mirror_session_event(&self, thread_id: Option<&str>, value: &str) -> Response {
+        let result: anyhow::Result<String> = async {
+            let thread_id = thread_id
+                .filter(|value| value.chars().all(|character| character.is_ascii_digit()))
+                .ok_or_else(|| anyhow::anyhow!("a numeric Discord thread ID is required"))?;
+            let request: SessionMirrorRequest = serde_json::from_str(value)
+                .map_err(|error| anyhow::anyhow!("invalid mirror request: {error}"))?;
+            validate_mirror_request(&request)?;
+
+            let publisher = self
+                .session_publish
+                .as_ref()
+                .ok_or_else(|| anyhow::anyhow!("Discord session mirroring is unavailable"))?;
+            let session_key = format!("discord:{thread_id}");
+            let snapshot = publisher.pool.session_snapshot(&session_key).await;
+            if snapshot.state == SessionState::None {
+                anyhow::bail!("Discord thread has no resumable Cursor session");
+            }
+            if !snapshot.externally_detached {
+                anyhow::bail!("session is not detached for a local Cursor handoff");
+            }
+
+            let adapter = self
+                .adapters
+                .get("discord")
+                .ok_or_else(|| anyhow::anyhow!("Discord adapter is unavailable"))?;
+            {
+                let mut events = self.mirror_events.lock().await;
+                if !events.insert(&request.event_id) {
+                    return Ok("duplicate event already mirrored".to_string());
+                }
+            }
+            let channel = ChannelRef {
+                platform: "discord".into(),
+                channel_id: thread_id.to_string(),
+                thread_id: None,
+                parent_id: None,
+                origin_event_id: None,
+            };
+            let message = format_mirror_message(&request.kind, &request.content);
+            for chunk in openab_core::format::split_message(&message, adapter.message_limit()) {
+                if let Err(error) = adapter.send_message(&channel, &chunk).await {
+                    self.mirror_events.lock().await.remove(&request.event_id);
+                    return Err(error);
+                }
+            }
+            Ok("local Cursor event mirrored to Discord".to_string())
+        }
+        .await;
+
+        match result {
+            Ok(message) => Response {
+                ok: true,
+                message,
+                value: None,
+            },
+            Err(error) => Response {
+                ok: false,
+                message: format!("session mirror failed: {error}"),
+                value: None,
+            },
+        }
+    }
+}
+
+#[cfg(all(unix, feature = "discord"))]
+fn validate_mirror_request(request: &SessionMirrorRequest) -> anyhow::Result<()> {
+    if request.event_id.is_empty()
+        || request.event_id.len() > 128
+        || !request
+            .event_id
+            .chars()
+            .all(|character| character.is_ascii_alphanumeric() || character == '-')
+    {
+        anyhow::bail!("event_id must be 1-128 ASCII letters, digits, or hyphens");
+    }
+    if !matches!(request.kind.as_str(), "user" | "assistant" | "status") {
+        anyhow::bail!("kind must be user, assistant, or status");
+    }
+    if request.content.trim().is_empty() || request.content.chars().count() > 50_000 {
+        anyhow::bail!("content must contain 1-50000 characters");
+    }
+    Ok(())
+}
+
+#[cfg(all(unix, feature = "discord"))]
+fn format_mirror_message(kind: &str, content: &str) -> String {
+    let label = match kind {
+        "user" => "You",
+        "assistant" => "Cursor",
+        _ => "Handoff",
+    };
+    let content = content
+        .replace("@everyone", "@\u{200b}everyone")
+        .replace("@here", "@\u{200b}here")
+        .replace("<@", "<@\u{200b}");
+    format!("💻 **Cursor local · {label}**\n{content}")
 }
 
 #[cfg(all(unix, feature = "discord"))]
@@ -344,6 +490,8 @@ impl CtlHandler for RuntimeHandler {
         match key {
             #[cfg(feature = "discord")]
             "session.publish" => self.publish_session(value).await,
+            #[cfg(feature = "discord")]
+            "session.mirror" => self.mirror_session_event(thread_id, value).await,
             "thread.name" => {
                 let Some((adapter, tid)) = self.resolve(thread_id).await else {
                     return Response {
@@ -584,6 +732,43 @@ mod tests {
         assert_eq!(parsed.key, "thread.name");
         assert_eq!(parsed.value.as_deref(), Some("hello"));
         assert_eq!(parsed.thread_id.as_deref(), Some("123"));
+    }
+
+    #[cfg(feature = "discord")]
+    #[test]
+    fn mirror_request_validation_rejects_untrusted_shapes() {
+        let valid = SessionMirrorRequest {
+            event_id: "f42d9f13-c5bb-4d2a-a30c-9f419b138e98".into(),
+            kind: "assistant".into(),
+            content: "done".into(),
+        };
+        assert!(validate_mirror_request(&valid).is_ok());
+
+        let invalid = SessionMirrorRequest {
+            event_id: "../../event".into(),
+            kind: "tool".into(),
+            content: String::new(),
+        };
+        assert!(validate_mirror_request(&invalid).is_err());
+    }
+
+    #[cfg(feature = "discord")]
+    #[test]
+    fn mirror_message_labels_source_and_suppresses_mentions() {
+        let message = format_mirror_message("assistant", "hello @everyone <@123>");
+        assert!(message.starts_with("💻 **Cursor local · Cursor**"));
+        assert!(!message.contains("@everyone"));
+        assert!(!message.contains("<@123>"));
+    }
+
+    #[cfg(feature = "discord")]
+    #[test]
+    fn mirror_event_cache_deduplicates_and_allows_failed_retry() {
+        let mut cache = MirrorEventCache::default();
+        assert!(cache.insert("event-1"));
+        assert!(!cache.insert("event-1"));
+        cache.remove("event-1");
+        assert!(cache.insert("event-1"));
     }
 
     #[tokio::test]
