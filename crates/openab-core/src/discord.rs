@@ -462,7 +462,7 @@ fn task_status_embed(task: &TaskRecord) -> CreateEmbed {
         embed = embed.field(
             "在電腦執行",
             format!(
-                "```bash\nmake session-resume THREAD_ID={}\n```\n正常離開 Cursor 後，回到這個 thread 傳送下一則訊息。",
+                "```bash\nmake session-resume-sync THREAD_ID={}\n```\n本機的新對話會同步到此處；輸入 `/exit` 後可回 Discord 接續。",
                 task.thread_id
             ),
             false,
@@ -1496,7 +1496,7 @@ fn help_topic_message(
         ),
         "cursor" => (
             "🖥️ 回到電腦接續",
-            "1. 等目前的 Discord 回覆完成。\n2. 點 **Continue on computer**。\n3. 複製卡片顯示的 `make session-resume ...` 到主機執行。\n4. 正常離開 Cursor 後，再回同一個 thread。",
+            "1. 等目前的 Discord 回覆完成。\n2. 點 **Continue on computer**。\n3. 複製卡片顯示的 `make session-resume-sync ...` 到主機執行。\n4. 輸入 `/exit` 後，再回同一個 thread。",
         ),
         "attach" => (
             "📤 將本機 Cursor chat 發佈到 Discord",
@@ -5414,7 +5414,7 @@ impl Handler {
                     Ok(()) => {
                         task_state_update = Some(TaskState::Cursor);
                         format!(
-                        "✅ Ready for Cursor on the host. Run `make session-resume THREAD_ID={}`. Do not send Discord messages until the terminal UI exits.",
+                        "✅ Ready for Cursor on the host. Run `make session-resume-sync THREAD_ID={}`. Do not send Discord messages until the synchronized shell exits.",
                         comp.channel_id.get()
                     )
                     }
@@ -9243,7 +9243,7 @@ mod tests {
     fn cursor_task_card_contains_copyable_resume_command() {
         let embed =
             serde_json::to_string(&task_status_embed(&ui_task(TaskState::Cursor, None))).unwrap();
-        assert!(embed.contains("make session-resume THREAD_ID=3"));
+        assert!(embed.contains("make session-resume-sync THREAD_ID=3"));
     }
 
     #[test]
