@@ -674,7 +674,30 @@ pub struct DiscordProjectCommandConfig {
     /// Names only; values are never read from the Discord payload.
     #[serde(default)]
     pub env_passthrough: Vec<String>,
+    /// When true, Discord shows a book dropdown from `books/` before running.
+    /// `args` must contain exactly one literal `{{book}}` placeholder that is
+    /// replaced with the selected directory name after validation.
+    #[serde(default)]
+    pub book_select: bool,
 }
+
+/// Literal arg token replaced by a validated `books/{slug}` directory name.
+pub const PROJECT_COMMAND_BOOK_PLACEHOLDER: &str = "{{book}}";
+
+/// Prefix of the Discord component custom id that runs a repository command.
+///
+/// Lives here rather than in `discord`, which is feature-gated, so the length
+/// bound below is checked even in builds without Discord.
+pub const PROJECT_COMMAND_RUN_CUSTOM_ID_PREFIX: &str = "oab_project_command:run:";
+
+/// Longest `books/` directory name offered in the Discord book picker.
+///
+/// Bounded together with the command id so the run button's custom id always
+/// fits Discord's limit; a longer directory is simply not offered.
+pub const PROJECT_COMMAND_BOOK_SLUG_MAX_LEN: usize = 48;
+
+/// Discord's hard limit on a message component custom id.
+const DISCORD_CUSTOM_ID_MAX_LEN: usize = 100;
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "kebab-case")]
@@ -863,6 +886,53 @@ fn validate_discord_project_commands(
             command.workspace_alias,
             command.id
         );
+        // The placeholder may sit inside a larger argument so that `make`-style
+        // `KEY={{book}}` tokens work; it must still appear exactly once overall.
+        let book_placeholders: usize = command
+            .args
+            .iter()
+            .map(|arg| arg.matches(PROJECT_COMMAND_BOOK_PLACEHOLDER).count())
+            .sum();
+        if command.book_select {
+            anyhow::ensure!(
+                command.runner == DiscordProjectCommandRunner::Local,
+                "discord.project_commands book_select for '{}:{}' is only supported for local runners",
+                command.workspace_alias,
+                command.id
+            );
+            anyhow::ensure!(
+                book_placeholders == 1,
+                "discord.project_commands book_select for '{}:{}' requires exactly one `{}` arg placeholder",
+                command.workspace_alias,
+                command.id,
+                PROJECT_COMMAND_BOOK_PLACEHOLDER
+            );
+            anyhow::ensure!(
+                command.requires_confirmation,
+                "discord.project_commands book_select for '{}:{}' must require confirmation",
+                command.workspace_alias,
+                command.id
+            );
+            anyhow::ensure!(
+                PROJECT_COMMAND_RUN_CUSTOM_ID_PREFIX.len()
+                    + command.id.len()
+                    + 1
+                    + PROJECT_COMMAND_BOOK_SLUG_MAX_LEN
+                    <= DISCORD_CUSTOM_ID_MAX_LEN,
+                "discord.project_commands book_select id for '{}:{}' is too long; a book-scoped run button must stay within Discord's {}-character custom id limit",
+                command.workspace_alias,
+                command.id,
+                DISCORD_CUSTOM_ID_MAX_LEN
+            );
+        } else {
+            anyhow::ensure!(
+                book_placeholders == 0,
+                "discord.project_commands '{}:{}' uses `{}` but book_select is false",
+                command.workspace_alias,
+                command.id,
+                PROJECT_COMMAND_BOOK_PLACEHOLDER
+            );
+        }
         if command.runner == DiscordProjectCommandRunner::GitPushBroker {
             anyhow::ensure!(
                 command.program == "git" && command.args == ["push"],
@@ -3247,6 +3317,116 @@ requires_confirmation = true
         assert_eq!(commands[0].timeout_seconds, 30);
         assert!(commands[0].requires_confirmation);
         assert_eq!(commands[0].runner, DiscordProjectCommandRunner::Local);
+        assert!(!commands[0].book_select);
+    }
+
+    #[test]
+    fn discord_project_commands_accept_book_select_with_placeholder() {
+        let cfg = parse_config_str(
+            r#"
+[discord]
+bot_token = "token"
+
+[[discord.project_commands]]
+workspace_alias = "example-library"
+id = "force_sync_art_gallery"
+label = "Force sync art gallery"
+program = "python3"
+args = ["sync.py", "--book", "{{book}}", "--force"]
+requires_confirmation = true
+book_select = true
+"#,
+            "test",
+        )
+        .expect("book_select command should parse");
+        let command = &cfg.discord.unwrap().project_commands[0];
+        assert!(command.book_select);
+        assert_eq!(command.args[2], "{{book}}");
+    }
+
+    #[test]
+    fn discord_project_commands_accept_a_placeholder_inside_a_make_variable() {
+        let cfg = parse_config_str(
+            r#"
+[discord]
+bot_token = "token"
+
+[[discord.project_commands]]
+workspace_alias = "example-library"
+id = "build_upload_epub_book"
+label = "Build & upload EPUB"
+program = "make"
+args = ["epub", "BOOK={{book}}", "UPLOAD=gdrive"]
+requires_confirmation = true
+book_select = true
+"#,
+            "test",
+        )
+        .expect("an embedded placeholder should parse");
+        let command = &cfg.discord.unwrap().project_commands[0];
+        assert_eq!(command.args[1], "BOOK={{book}}");
+    }
+
+    #[test]
+    fn discord_project_commands_reject_book_select_without_placeholder() {
+        let error = parse_config_str(
+            r#"
+[discord]
+bot_token = "token"
+[[discord.project_commands]]
+workspace_alias = "example-library"
+id = "force"
+label = "Force"
+program = "python3"
+args = ["sync.py", "--force"]
+requires_confirmation = true
+book_select = true
+"#,
+            "test",
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("exactly one"));
+    }
+
+    #[test]
+    fn discord_project_commands_reject_book_select_id_that_overflows_custom_id() {
+        let error = parse_config_str(
+            r#"
+[discord]
+bot_token = "token"
+[[discord.project_commands]]
+workspace_alias = "example-library"
+id = "force_sync_the_whole_art_gallery"
+label = "Force"
+program = "python3"
+args = ["sync.py", "--book", "{{book}}"]
+requires_confirmation = true
+book_select = true
+"#,
+            "test",
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("custom id limit"));
+    }
+
+    #[test]
+    fn discord_project_commands_reject_placeholder_without_book_select() {
+        let error = parse_config_str(
+            r#"
+[discord]
+bot_token = "token"
+[[discord.project_commands]]
+workspace_alias = "example-library"
+id = "force"
+label = "Force"
+program = "python3"
+args = ["sync.py", "--book", "{{book}}"]
+requires_confirmation = true
+"#,
+            "test",
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("book_select is false"));
     }
 
     #[test]

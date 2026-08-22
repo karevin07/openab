@@ -1,13 +1,19 @@
 //! Safe execution of administrator-configured repository commands.
 
-use crate::config::DiscordProjectCommandConfig;
+use crate::config::{
+    DiscordProjectCommandConfig, PROJECT_COMMAND_BOOK_PLACEHOLDER,
+    PROJECT_COMMAND_BOOK_SLUG_MAX_LEN,
+};
 use anyhow::{bail, Context, Result};
-use std::path::Path;
+use std::fs;
+use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncRead, AsyncReadExt};
 
 const CAPTURE_LIMIT_BYTES: usize = 32 * 1024;
+/// Discord String Select hard limit.
+pub const BOOK_SELECT_MAX_OPTIONS: usize = 25;
 
 #[derive(Debug)]
 pub struct ProjectCommandOutput {
@@ -50,6 +56,127 @@ fn kill_process_group(pid: Option<u32>) {
     }
 }
 
+/// Whether `slug` is a safe book directory name (no path traversal).
+pub fn is_valid_book_slug(slug: &str) -> bool {
+    !slug.is_empty()
+        && slug.len() <= PROJECT_COMMAND_BOOK_SLUG_MAX_LEN
+        && slug
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+}
+
+/// List book directory names under `workspace/books/`, sorted.
+///
+/// Returns at most [`BOOK_SELECT_MAX_OPTIONS`] entries plus the total count so
+/// callers can show a truncation note.
+pub fn list_workspace_books(workspace: &Path) -> Result<(Vec<String>, usize)> {
+    let books_root = workspace.join("books");
+    if !books_root.is_dir() {
+        bail!("workspace has no books/ directory");
+    }
+    let mut slugs = Vec::new();
+    for entry in fs::read_dir(&books_root).context("could not read books/ directory")? {
+        let entry = entry.context("could not read books/ entry")?;
+        let file_type = entry.file_type().context("could not stat books/ entry")?;
+        if !file_type.is_dir() {
+            continue;
+        }
+        let name = entry.file_name();
+        let Some(slug) = name.to_str() else {
+            continue;
+        };
+        if !is_valid_book_slug(slug) {
+            continue;
+        }
+        slugs.push(slug.to_string());
+    }
+    slugs.sort();
+    let total = slugs.len();
+    if slugs.len() > BOOK_SELECT_MAX_OPTIONS {
+        slugs.truncate(BOOK_SELECT_MAX_OPTIONS);
+    }
+    Ok((slugs, total))
+}
+
+/// Confirm `slug` names an existing directory under `workspace/books/`.
+pub fn validate_workspace_book(workspace: &Path, slug: &str) -> Result<PathBuf> {
+    if !is_valid_book_slug(slug) {
+        bail!("invalid book slug");
+    }
+    let book_dir = workspace.join("books").join(slug);
+    let canonical_books = workspace
+        .join("books")
+        .canonicalize()
+        .context("books/ directory is unavailable")?;
+    let canonical_book = book_dir
+        .canonicalize()
+        .context("selected book directory is unavailable")?;
+    if !canonical_book.starts_with(&canonical_books) || !canonical_book.is_dir() {
+        bail!("selected book is outside books/");
+    }
+    Ok(canonical_book)
+}
+
+/// Replace the single `{{book}}` placeholder when `book_select` is enabled.
+pub fn resolve_project_command_args(
+    command: &DiscordProjectCommandConfig,
+    book_slug: Option<&str>,
+) -> Result<Vec<String>> {
+    if command.book_select {
+        let slug = book_slug.context("book_select command requires a selected book")?;
+        if !is_valid_book_slug(slug) {
+            bail!("invalid book slug");
+        }
+        let mut replaced = false;
+        let args = command
+            .args
+            .iter()
+            .map(|arg| {
+                if arg.contains(PROJECT_COMMAND_BOOK_PLACEHOLDER) {
+                    replaced = true;
+                    arg.replace(PROJECT_COMMAND_BOOK_PLACEHOLDER, slug)
+                } else {
+                    arg.clone()
+                }
+            })
+            .collect();
+        if !replaced {
+            bail!("book_select command is missing the {PROJECT_COMMAND_BOOK_PLACEHOLDER} placeholder");
+        }
+        return Ok(args);
+    }
+    if book_slug.is_some() {
+        bail!("command does not accept a book selection");
+    }
+    if command
+        .args
+        .iter()
+        .any(|arg| arg.contains(PROJECT_COMMAND_BOOK_PLACEHOLDER))
+    {
+        bail!("command args still contain an unresolved book placeholder");
+    }
+    Ok(command.args.clone())
+}
+
+/// Display string for confirmation cards after optional book substitution.
+pub fn project_command_argv_display(
+    command: &DiscordProjectCommandConfig,
+    book_slug: Option<&str>,
+) -> Result<String> {
+    let args = resolve_project_command_args(command, book_slug)?;
+    Ok(std::iter::once(command.program.as_str())
+        .chain(args.iter().map(String::as_str))
+        .map(|value| {
+            if value.chars().any(char::is_whitespace) {
+                format!("{value:?}")
+            } else {
+                value.to_string()
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" "))
+}
+
 /// Execute one pre-validated command directly inside a repository workspace.
 ///
 /// No shell is involved, arguments are literal, and the inherited environment
@@ -57,6 +184,7 @@ fn kill_process_group(pid: Option<u32>) {
 pub async fn run_project_command(
     command: &DiscordProjectCommandConfig,
     workspace: &Path,
+    book_slug: Option<&str>,
 ) -> Result<ProjectCommandOutput> {
     let workspace = workspace
         .canonicalize()
@@ -65,9 +193,16 @@ pub async fn run_project_command(
         bail!("repository command workspace is not a Git repository");
     }
 
+    if command.book_select {
+        let slug = book_slug.context("book_select command requires a selected book")?;
+        validate_workspace_book(&workspace, slug)?;
+    }
+
+    let args = resolve_project_command_args(command, book_slug)?;
+
     let mut process = tokio::process::Command::new(&command.program);
     process
-        .args(&command.args)
+        .args(&args)
         .current_dir(&workspace)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -179,6 +314,7 @@ mod tests {
             timeout_seconds: 5,
             requires_confirmation: false,
             env_passthrough: Vec::new(),
+            book_select: false,
         }
     }
 
@@ -195,6 +331,7 @@ mod tests {
         let output = run_project_command(
             &command("printf", &["literal;not-shell-expanded"]),
             workspace.path(),
+            None,
         )
         .await
         .unwrap();
@@ -217,7 +354,9 @@ mod tests {
 
         let mut config = command("printenv", &[]);
         config.env_passthrough = vec!["OPENAB_TEST_WANTED".into()];
-        let output = run_project_command(&config, dir.path()).await.unwrap();
+        let output = run_project_command(&config, dir.path(), None)
+            .await
+            .unwrap();
 
         std::env::remove_var("OPENAB_TEST_WANTED");
         std::env::remove_var("OPENAB_TEST_UNWANTED");
@@ -235,14 +374,16 @@ mod tests {
         std::fs::create_dir_all(dir.path().join(".git")).unwrap();
         let mut config = command("printenv", &[]);
         config.env_passthrough = vec!["OPENAB_TEST_DEFINITELY_UNSET".into()];
-        let output = run_project_command(&config, dir.path()).await.unwrap();
+        let output = run_project_command(&config, dir.path(), None)
+            .await
+            .unwrap();
         assert!(!output.stdout.contains("OPENAB_TEST_DEFINITELY_UNSET"));
     }
 
     #[tokio::test]
     async fn rejects_non_repository_workspace() {
         let workspace = tempfile::tempdir().unwrap();
-        let error = run_project_command(&command("git", &["status"]), workspace.path())
+        let error = run_project_command(&command("git", &["status"]), workspace.path(), None)
             .await
             .unwrap_err();
 
@@ -256,12 +397,70 @@ mod tests {
         let mut configured = command("sleep", &["5"]);
         configured.timeout_seconds = 1;
 
-        let output = run_project_command(&configured, workspace.path())
+        let output = run_project_command(&configured, workspace.path(), None)
             .await
             .unwrap();
 
         assert!(output.timed_out);
         assert_eq!(output.exit_code, None);
         assert!(output.elapsed < Duration::from_secs(3));
+    }
+
+    #[test]
+    fn resolves_book_placeholder_only_when_book_select_is_enabled() {
+        let mut configured = command("python3", &["sync.py", "--book", "{{book}}", "--force"]);
+        configured.book_select = true;
+        configured.requires_confirmation = true;
+        let args = resolve_project_command_args(&configured, Some("heshi-mentu")).unwrap();
+        assert_eq!(args, ["sync.py", "--book", "heshi-mentu", "--force"]);
+
+        let err = resolve_project_command_args(&configured, None).unwrap_err();
+        assert!(err.to_string().contains("requires a selected book"));
+
+        let plain = command("python3", &["sync.py", "--yes"]);
+        let err = resolve_project_command_args(&plain, Some("heshi-mentu")).unwrap_err();
+        assert!(err.to_string().contains("does not accept a book selection"));
+    }
+
+    #[test]
+    fn resolves_a_placeholder_embedded_in_a_make_variable() {
+        let mut configured = command("make", &["epub", "BOOK={{book}}", "UPLOAD=gdrive"]);
+        configured.book_select = true;
+        configured.requires_confirmation = true;
+        let args = resolve_project_command_args(&configured, Some("heshi-mentu")).unwrap();
+        assert_eq!(args, ["epub", "BOOK=heshi-mentu", "UPLOAD=gdrive"]);
+    }
+
+    #[test]
+    fn lists_and_validates_book_directories() {
+        let workspace = repository_workspace();
+        let books = workspace.path().join("books");
+        fs::create_dir_all(books.join("heshi-mentu")).unwrap();
+        fs::create_dir_all(books.join("blood-chalice")).unwrap();
+        fs::write(books.join("readme.txt"), "no").unwrap();
+        fs::create_dir_all(books.join("bad_name")).unwrap();
+
+        let (slugs, total) = list_workspace_books(workspace.path()).unwrap();
+        assert_eq!(total, 2);
+        assert_eq!(slugs, ["blood-chalice", "heshi-mentu"]);
+        assert!(validate_workspace_book(workspace.path(), "heshi-mentu").is_ok());
+        assert!(validate_workspace_book(workspace.path(), "../etc").is_err());
+        assert!(validate_workspace_book(workspace.path(), "missing-book").is_err());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn substitutes_selected_book_into_argv() {
+        let workspace = repository_workspace();
+        fs::create_dir_all(workspace.path().join("books/heshi-mentu")).unwrap();
+        let mut configured = command("printf", &["%s", "{{book}}"]);
+        configured.book_select = true;
+        configured.requires_confirmation = true;
+
+        let output = run_project_command(&configured, workspace.path(), Some("heshi-mentu"))
+            .await
+            .unwrap();
+        assert_eq!(output.exit_code, Some(0));
+        assert_eq!(output.stdout, "heshi-mentu");
     }
 }

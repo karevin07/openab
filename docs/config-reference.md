@@ -149,6 +149,47 @@ requires_confirmation = false
 | `args` | no | Literal arguments; maximum 32 entries and 512 bytes per entry. |
 | `timeout_seconds` | no | `1`–`1800`; default `300`. |
 | `requires_confirmation` | no | Show the exact command and require a second click; default `false`. |
+| `env_passthrough` | no | Names of environment variables copied from OpenAB into the cleared child env. |
+| `book_select` | no | When `true`, Discord shows a dropdown of `books/` directory names before confirmation. `args` must contain the literal `{{book}}` placeholder exactly once; it may be an argument on its own or embedded in a larger one such as `BOOK={{book}}`, and OpenAB substitutes the selected slug after validating the directory exists. Requires `requires_confirmation = true` and a local runner. Default `false`. Directory names are limited to 48 characters of `[a-z0-9-]`, and the command `id` to 27, so the run button's custom id stays inside Discord's 100-character limit; longer directories are not offered. |
+
+Example — force-sync one example-library book (fingerprint skip disabled):
+
+```toml
+[[discord.project_commands]]
+workspace_alias = "example-library"
+id = "force_sync_art_gallery"
+label = "Force sync art gallery"
+description = "下拉選一本書，強制重傳該書全部定稿 PNG"
+program = "python3"
+args = [
+  "/run/openab-bridge/sync-example-library-art-gallery.py",
+  "--book", "{{book}}",
+  "--force",
+  "--ensure-forum",
+  "--yes",
+]
+env_passthrough = ["DISCORD_BOT_TOKEN", "DISCORD_ADMIN_GUILD_ID"]
+timeout_seconds = 1800
+requires_confirmation = true
+book_select = true
+```
+
+Example — build and upload one book's EPUB through the repository Makefile:
+
+```toml
+[[discord.project_commands]]
+workspace_alias = "example-library"
+id = "build_upload_epub_book"
+label = "Build & upload EPUB"
+program = "make"
+args = ["epub", "BOOK={{book}}", "UPLOAD=gdrive"]
+timeout_seconds = 1800
+requires_confirmation = true
+book_select = true
+```
+
+The child inherits OpenAB's own `PATH`, so any interpreter the recipe shells out to (`uv`, `python3`)
+must be reachable from it, not only from an interactive shell's profile.
 
 The child starts with a cleared environment and receives only baseline home, path, user, and locale
 variables. Output is capped at 32 KiB per stream, duplicate concurrent runs of the same command are
