@@ -7,6 +7,7 @@ use crate::bot_turns::{BotTurnTracker, TurnAction, TurnSeverity, BOT_TURN_LIMIT_
 use crate::config::{
     resolve_project_action, AllowBots, AllowUsers, CronJobConfig, DiscordProjectActionConfig,
     DiscordProjectCommandConfig, DiscordProjectCommandRunner, SttConfig,
+    PROJECT_COMMAND_RUN_CUSTOM_ID_PREFIX,
 };
 use crate::cron::{
     job_applies_to_project, next_run_unix, sticky_thread_id_for, CronToggleStore,
@@ -23,7 +24,10 @@ use crate::dispatch::DispatchTarget;
 use crate::directives::resolve_workspace;
 use crate::format;
 use crate::media;
-use crate::project_command::{run_project_command, ProjectCommandOutput};
+use crate::project_command::{
+    list_workspace_books, project_command_argv_display, run_project_command,
+    validate_workspace_book, ProjectCommandOutput, BOOK_SELECT_MAX_OPTIONS,
+};
 use crate::git_push_broker::GitPushBrokerClient;
 use crate::project_registry::{ProjectAccessTarget, ProjectBinding, ProjectRegistry};
 use crate::remind::{self, ReminderStore};
@@ -1066,18 +1070,81 @@ fn task_commands_message(
 }
 
 fn project_command_display(command: &DiscordProjectCommandConfig) -> String {
-    let display = std::iter::once(command.program.as_str())
-        .chain(command.args.iter().map(String::as_str))
-        .map(|value| {
-            if value.chars().any(char::is_whitespace) {
-                format!("{:?}", value)
-            } else {
-                value.to_string()
-            }
-        })
-        .collect::<Vec<_>>()
-        .join(" ");
-    truncate_for_discord(&display, 400)
+    truncate_for_discord(
+        &project_command_argv_display(command, None).unwrap_or_else(|_| {
+            std::iter::once(command.program.as_str())
+                .chain(command.args.iter().map(String::as_str))
+                .collect::<Vec<_>>()
+                .join(" ")
+        }),
+        400,
+    )
+}
+
+fn project_command_display_with_book(
+    command: &DiscordProjectCommandConfig,
+    book_slug: Option<&str>,
+) -> String {
+    truncate_for_discord(
+        &project_command_argv_display(command, book_slug).unwrap_or_else(|_| {
+            project_command_display(command)
+        }),
+        400,
+    )
+}
+
+fn project_command_book_picker_message(
+    binding: &ProjectBinding,
+    command: &DiscordProjectCommandConfig,
+    books: &[String],
+    total_books: usize,
+) -> CreateInteractionResponseMessage {
+    let mut description = format!(
+        "選擇要套用 **{}** 的書籍（來自 `books/`）。選完後仍會再確認一次才執行。",
+        command.label
+    );
+    if total_books > books.len() {
+        description.push_str(&format!(
+            "\n目前列出前 {} 本（共 {} 本；Discord 下拉上限 {}）。",
+            books.len(),
+            total_books,
+            BOOK_SELECT_MAX_OPTIONS
+        ));
+    }
+    let options = books
+        .iter()
+        .map(|slug| CreateSelectMenuOption::new(slug, slug))
+        .collect::<Vec<_>>();
+    CreateInteractionResponseMessage::new()
+        .embed(
+            CreateEmbed::new()
+                .title(format!("📚 Select book · {}", command.label))
+                .description(description)
+                .colour(0x9B59B6)
+                .field(
+                    "Repository",
+                    inline_code(&format!("@{}", binding.workspace_alias)),
+                    true,
+                )
+                .field(
+                    "Command template",
+                    inline_code(&project_command_display(command)),
+                    false,
+                ),
+        )
+        .components(vec![
+            CreateActionRow::SelectMenu(
+                CreateSelectMenu::new(
+                    format!("oab_project_command:pick:{}", command.id),
+                    CreateSelectMenuKind::String { options },
+                )
+                .placeholder("選擇書籍 slug"),
+            ),
+            CreateActionRow::Buttons(vec![CreateButton::new("oab_project_command:cancel")
+                .label("Cancel")
+                .style(ButtonStyle::Secondary)]),
+        ])
+        .ephemeral(true)
 }
 
 fn project_commands_message(
@@ -1142,33 +1209,47 @@ fn project_commands_message(
 fn project_command_confirmation_message(
     binding: &ProjectBinding,
     command: &DiscordProjectCommandConfig,
+    book_slug: Option<&str>,
 ) -> CreateInteractionResponseMessage {
     let execution = match command.runner {
         DiscordProjectCommandRunner::Local => "Local allowlisted executable",
         DiscordProjectCommandRunner::GitPushBroker => "Isolated Git credential broker",
     };
-    CreateInteractionResponseMessage::new()
-        .embed(
-            CreateEmbed::new()
-                .title("⚠️ Confirm repository command")
-                .description("這個固定指令被標記為需要確認。確認後會直接在 repository 執行。")
-                .colour(0xE67E22)
-                .field(
-                    "Repository",
-                    inline_code(&format!("@{}", binding.workspace_alias)),
-                    true,
-                )
-                .field("Command", inline_code(&project_command_display(command)), false)
-                .field("Execution", execution, false)
-                .field(
-                    "Cursor session",
-                    "Unchanged · command output is shown only in this ephemeral card",
-                    false,
-                )
-                .field("Timeout", format!("{} seconds", command.timeout_seconds), true),
+    let run_custom_id = match book_slug {
+        Some(slug) => format!(
+            "{PROJECT_COMMAND_RUN_CUSTOM_ID_PREFIX}{}:{}",
+            command.id, slug
+        ),
+        None => format!("{PROJECT_COMMAND_RUN_CUSTOM_ID_PREFIX}{}", command.id),
+    };
+    let mut embed = CreateEmbed::new()
+        .title("⚠️ Confirm repository command")
+        .description("這個固定指令被標記為需要確認。確認後會直接在 repository 執行。")
+        .colour(0xE67E22)
+        .field(
+            "Repository",
+            inline_code(&format!("@{}", binding.workspace_alias)),
+            true,
         )
+        .field(
+            "Command",
+            inline_code(&project_command_display_with_book(command, book_slug)),
+            false,
+        )
+        .field("Execution", execution, false)
+        .field(
+            "Cursor session",
+            "Unchanged · command output is shown only in this ephemeral card",
+            false,
+        )
+        .field("Timeout", format!("{} seconds", command.timeout_seconds), true);
+    if let Some(slug) = book_slug {
+        embed = embed.field("Book", inline_code(slug), true);
+    }
+    CreateInteractionResponseMessage::new()
+        .embed(embed)
         .components(vec![CreateActionRow::Buttons(vec![
-            CreateButton::new(format!("oab_project_command:run:{}", command.id))
+            CreateButton::new(run_custom_id)
                 .label("Run command")
                 .style(ButtonStyle::Danger),
             CreateButton::new("oab_project_command:cancel")
@@ -6255,13 +6336,19 @@ impl Handler {
         comp: &serenity::model::application::ComponentInteraction,
         binding: ProjectBinding,
         command: DiscordProjectCommandConfig,
+        book_slug: Option<String>,
     ) {
         if let Err(error) = comp.defer_ephemeral(&ctx.http).await {
             tracing::error!(%error, command_id = %command.id, "failed to defer repository command");
             return;
         }
 
-        let run_key = format!("{}:{}", binding.channel_id, command.id);
+        let run_key = format!(
+            "{}:{}:{}",
+            binding.channel_id,
+            command.id,
+            book_slug.as_deref().unwrap_or("-")
+        );
         let inserted = {
             let mut running = self.project_command_runs.lock().await;
             running.insert(run_key.clone())
@@ -6306,10 +6393,11 @@ impl Handler {
                         tracing::info!(
                             workspace_alias = %binding.workspace_alias,
                             command_id = %command.id,
+                            book_slug = book_slug.as_deref().unwrap_or(""),
                             user_id = %comp.user.id,
                             "repository command started"
                         );
-                        run_project_command(&command, &workspace).await
+                        run_project_command(&command, &workspace, book_slug.as_deref()).await
                     }
                     Err(error) => Err(error),
                 }
@@ -6320,6 +6408,13 @@ impl Handler {
             running.remove(&run_key);
         }
 
+        let mut display_command = command.clone();
+        if let Ok(args) =
+            crate::project_command::resolve_project_command_args(&command, book_slug.as_deref())
+        {
+            display_command.args = args;
+            display_command.book_select = false;
+        }
         let content = match result {
             Ok(output) => {
                 tracing::info!(
@@ -6329,7 +6424,7 @@ impl Handler {
                     timed_out = output.timed_out,
                     "repository command finished"
                 );
-                project_command_result_content(&binding, &command, &output)
+                project_command_result_content(&binding, &display_command, &output)
             }
             Err(error) => {
                 tracing::warn!(
@@ -6407,15 +6502,66 @@ impl Handler {
             return;
         };
 
+        if command.book_select {
+            let aliases = self.router.workspace_aliases_map();
+            let workspace = match resolve_workspace(
+                &format!("@{}", binding.workspace_alias),
+                &aliases,
+                &self.router.bot_home_path(),
+                &self.router.workspace_root_path(),
+            ) {
+                Ok(path) => path,
+                Err(message) => {
+                    let response = CreateInteractionResponse::Message(
+                        CreateInteractionResponseMessage::new()
+                            .content(format!("⚠️ {message}"))
+                            .ephemeral(true),
+                    );
+                    let _ = comp.create_response(&ctx.http, response).await;
+                    return;
+                }
+            };
+            match list_workspace_books(&workspace) {
+                Ok((books, total)) if !books.is_empty() => {
+                    let response = CreateInteractionResponse::Message(
+                        project_command_book_picker_message(&binding, &command, &books, total),
+                    );
+                    if let Err(error) = comp.create_response(&ctx.http, response).await {
+                        tracing::error!(%error, command_id = %command.id, "failed to open book picker");
+                    }
+                }
+                Ok(_) => {
+                    let response = CreateInteractionResponse::Message(
+                        CreateInteractionResponseMessage::new()
+                            .content("⚠️ 這個 repository 的 `books/` 沒有可選書籍。")
+                            .ephemeral(true),
+                    );
+                    let _ = comp.create_response(&ctx.http, response).await;
+                }
+                Err(error) => {
+                    let response = CreateInteractionResponse::Message(
+                        CreateInteractionResponseMessage::new()
+                            .content(format!(
+                                "⚠️ 無法列出書籍：{}",
+                                suppress_mentions(&truncate_for_discord(&error.to_string(), 500))
+                            ))
+                            .ephemeral(true),
+                    );
+                    let _ = comp.create_response(&ctx.http, response).await;
+                }
+            }
+            return;
+        }
+
         if command.requires_confirmation {
             let response = CreateInteractionResponse::Message(
-                project_command_confirmation_message(&binding, &command),
+                project_command_confirmation_message(&binding, &command, None),
             );
             if let Err(error) = comp.create_response(&ctx.http, response).await {
                 tracing::error!(%error, command_id = %command.id, "failed to confirm repository command");
             }
         } else {
-            self.execute_project_command_interaction(ctx, comp, binding, command)
+            self.execute_project_command_interaction(ctx, comp, binding, command, None)
                 .await;
         }
     }
@@ -6456,15 +6602,7 @@ impl Handler {
             let _ = comp.create_response(&ctx.http, response).await;
             return;
         }
-        let Some(command_id) = action.strip_prefix("run:") else {
-            let response = CreateInteractionResponse::Message(
-                CreateInteractionResponseMessage::new()
-                    .content("⚠️ This repository command control is no longer valid.")
-                    .ephemeral(true),
-            );
-            let _ = comp.create_response(&ctx.http, response).await;
-            return;
-        };
+
         let binding = match self.project_binding_for_channel(ctx, comp.channel_id).await {
             Ok((binding, _)) => binding,
             Err(message) => {
@@ -6477,8 +6615,100 @@ impl Handler {
                 return;
             }
         };
-        let command = self.project_command_for(&binding.workspace_alias, command_id);
-        let Some(command) = command.cloned() else {
+
+        if let Some(command_id) = action.strip_prefix("pick:") {
+            let selected_book = match &comp.data.kind {
+                ComponentInteractionDataKind::StringSelect { values } => {
+                    values.first().cloned()
+                }
+                _ => None,
+            };
+            let Some(book_slug) = selected_book else {
+                let response = CreateInteractionResponse::Message(
+                    CreateInteractionResponseMessage::new()
+                        .content("⚠️ 請選擇一本書籍。")
+                        .ephemeral(true),
+                );
+                let _ = comp.create_response(&ctx.http, response).await;
+                return;
+            };
+            let Some(command) = self
+                .project_command_for(&binding.workspace_alias, command_id)
+                .cloned()
+            else {
+                let response = CreateInteractionResponse::Message(
+                    CreateInteractionResponseMessage::new()
+                        .content("⚠️ This repository command was removed before confirmation.")
+                        .ephemeral(true),
+                );
+                let _ = comp.create_response(&ctx.http, response).await;
+                return;
+            };
+            if !command.book_select {
+                let response = CreateInteractionResponse::Message(
+                    CreateInteractionResponseMessage::new()
+                        .content("⚠️ This repository command no longer asks for a book.")
+                        .ephemeral(true),
+                );
+                let _ = comp.create_response(&ctx.http, response).await;
+                return;
+            }
+            let aliases = self.router.workspace_aliases_map();
+            let workspace = match resolve_workspace(
+                &format!("@{}", binding.workspace_alias),
+                &aliases,
+                &self.router.bot_home_path(),
+                &self.router.workspace_root_path(),
+            ) {
+                Ok(path) => path,
+                Err(message) => {
+                    let response = CreateInteractionResponse::Message(
+                        CreateInteractionResponseMessage::new()
+                            .content(format!("⚠️ {message}"))
+                            .ephemeral(true),
+                    );
+                    let _ = comp.create_response(&ctx.http, response).await;
+                    return;
+                }
+            };
+            if let Err(error) = validate_workspace_book(&workspace, &book_slug) {
+                let response = CreateInteractionResponse::Message(
+                    CreateInteractionResponseMessage::new()
+                        .content(format!(
+                            "⚠️ 無效的書籍選擇：{}",
+                            suppress_mentions(&truncate_for_discord(&error.to_string(), 400))
+                        ))
+                        .ephemeral(true),
+                );
+                let _ = comp.create_response(&ctx.http, response).await;
+                return;
+            }
+            let response = CreateInteractionResponse::UpdateMessage(
+                project_command_confirmation_message(&binding, &command, Some(&book_slug)),
+            );
+            if let Err(error) = comp.create_response(&ctx.http, response).await {
+                tracing::error!(%error, command_id = %command.id, "failed to confirm book-scoped command");
+            }
+            return;
+        }
+
+        let Some(run_tail) = action.strip_prefix("run:") else {
+            let response = CreateInteractionResponse::Message(
+                CreateInteractionResponseMessage::new()
+                    .content("⚠️ This repository command control is no longer valid.")
+                    .ephemeral(true),
+            );
+            let _ = comp.create_response(&ctx.http, response).await;
+            return;
+        };
+        let (command_id, book_slug) = match run_tail.split_once(':') {
+            Some((command_id, book_slug)) => (command_id, Some(book_slug.to_string())),
+            None => (run_tail, None),
+        };
+        let Some(command) = self
+            .project_command_for(&binding.workspace_alias, command_id)
+            .cloned()
+        else {
             let response = CreateInteractionResponse::Message(
                 CreateInteractionResponseMessage::new()
                     .content("⚠️ This repository command was removed before confirmation.")
@@ -6487,7 +6717,46 @@ impl Handler {
             let _ = comp.create_response(&ctx.http, response).await;
             return;
         };
-        self.execute_project_command_interaction(ctx, comp, binding, command)
+        if command.book_select {
+            let Some(book_slug) = book_slug.as_deref() else {
+                let response = CreateInteractionResponse::Message(
+                    CreateInteractionResponseMessage::new()
+                        .content("⚠️ 這個指令需要先選擇書籍。")
+                        .ephemeral(true),
+                );
+                let _ = comp.create_response(&ctx.http, response).await;
+                return;
+            };
+            let aliases = self.router.workspace_aliases_map();
+            if let Ok(workspace) = resolve_workspace(
+                &format!("@{}", binding.workspace_alias),
+                &aliases,
+                &self.router.bot_home_path(),
+                &self.router.workspace_root_path(),
+            ) {
+                if let Err(error) = validate_workspace_book(&workspace, book_slug) {
+                    let response = CreateInteractionResponse::Message(
+                        CreateInteractionResponseMessage::new()
+                            .content(format!(
+                                "⚠️ 無效的書籍選擇：{}",
+                                suppress_mentions(&truncate_for_discord(&error.to_string(), 400))
+                            ))
+                            .ephemeral(true),
+                    );
+                    let _ = comp.create_response(&ctx.http, response).await;
+                    return;
+                }
+            }
+        } else if book_slug.is_some() {
+            let response = CreateInteractionResponse::Message(
+                CreateInteractionResponseMessage::new()
+                    .content("⚠️ This repository command does not accept a book selection.")
+                    .ephemeral(true),
+            );
+            let _ = comp.create_response(&ctx.http, response).await;
+            return;
+        }
+        self.execute_project_command_interaction(ctx, comp, binding, command, book_slug)
             .await;
     }
 
@@ -8917,6 +9186,7 @@ mod tests {
             timeout_seconds: 30,
             requires_confirmation: true,
             env_passthrough: Vec::new(),
+            book_select: false,
         }
     }
 
@@ -9455,11 +9725,42 @@ mod tests {
         let confirmation = serde_json::to_string(&project_command_confirmation_message(
             &ui_binding(),
             &ui_project_command("git-status"),
+            None,
         ))
         .unwrap();
         assert!(confirmation.contains("oab_project_command:run:git-status"));
         assert!(confirmation.contains("oab_project_command:cancel"));
         assert!(confirmation.contains("git status --short"));
+
+        let mut force = ui_project_command("force-sync");
+        force.book_select = true;
+        force.program = "python3".into();
+        force.args = vec![
+            "sync.py".into(),
+            "--book".into(),
+            "{{book}}".into(),
+            "--force".into(),
+        ];
+        let book_confirm = serde_json::to_string(&project_command_confirmation_message(
+            &ui_binding(),
+            &force,
+            Some("heshi-mentu"),
+        ))
+        .unwrap();
+        assert!(book_confirm.contains("oab_project_command:run:force-sync:heshi-mentu"));
+        assert!(book_confirm.contains("heshi-mentu"));
+        assert!(book_confirm.contains("--force"));
+
+        let picker = serde_json::to_string(&project_command_book_picker_message(
+            &ui_binding(),
+            &force,
+            &["blood-chalice".into(), "heshi-mentu".into()],
+            2,
+        ))
+        .unwrap();
+        assert!(picker.contains("oab_project_command:pick:force-sync"));
+        assert!(picker.contains("heshi-mentu"));
+        assert!(picker.contains("選擇書籍 slug"));
     }
 
     #[test]
