@@ -2403,170 +2403,122 @@ impl Handler {
             .await;
         true
     }
-}
 
-#[serenity::async_trait]
-impl EventHandler for Handler {
-    async fn message(&self, ctx: Context, msg: Message) {
-        let bot_id = ctx.cache.current_user().id;
-        let effective_allowed_channels = self.effective_allowed_channels();
-
-        // Early multibot detection: cache that another bot is present.
-        // Runs before self-check and bot gating so we always detect other bots. (#481)
-        if msg.author.bot && msg.author.id != bot_id {
-            let key = msg.channel_id.to_string();
-            {
-                let mut cache = self.multibot_threads.lock().await;
-                cache
-                    .entry(key.clone())
-                    .or_insert_with(tokio::time::Instant::now);
-            }
-            // Persist to disk — multibot is irreversible
-            self.multibot_cache.mark_multibot(&key).await;
+    /// Whether a bot-authored message is admitted to normal dispatch.
+    ///
+    /// Bot message gating (from upstream #321). Bot messages in ambient
+    /// contexts are routed before this and never reach it, unless they
+    /// @mention this bot.
+    async fn admits_bot_message(
+        &self,
+        ctx: &Context,
+        msg: &Message,
+        bot_id: serenity::model::id::UserId,
+        is_mentioned: bool,
+    ) -> bool {
+        if !msg.author.bot {
+            return true;
         }
 
-        // Bot turn counting: runs before self-check so ALL bot messages
-        // (including own) count toward the per-thread limit. This means
-        // soft_limit=20 = 20 total bot messages in the thread (~10 per bot
-        // in a two-bot ping-pong). (#483)
-        {
-            let thread_key = msg.channel_id.to_string();
-            let mut tracker = self.bot_turns.lock().await;
-            if msg.author.bot {
-                match tracker.classify_bot_message(&thread_key) {
-                    TurnAction::Continue => {}
-                    TurnAction::SilentStop => return,
-                    TurnAction::WarnAndStop {
-                        severity,
-                        turns,
-                        user_message,
-                    } => {
-                        match severity {
-                            TurnSeverity::Hard => tracing::warn!(
-                                channel_id = %msg.channel_id,
-                                turns,
-                                "hard bot turn limit reached",
-                            ),
-                            TurnSeverity::Soft => tracing::info!(
-                                channel_id = %msg.channel_id,
-                                turns,
-                                max = self.max_bot_turns,
-                                "soft bot turn limit reached",
-                            ),
-                        }
-                        // Only post the warning if this bot is allowed in the channel/thread.
-                        // Bot turn counting intentionally runs before channel gating so ALL
-                        // bot messages are counted, but the *warning message* must respect
-                        // channel permissions — otherwise bots that never participated in a
-                        // thread will spam it with warnings.
-                        //
-                        // Must match the full thread allowlist semantics: a thread is allowed
-                        // if its own channel_id OR its parent_id is in allowed_channels.
-                        let ch = msg.channel_id.get();
-                        let in_allowed_channel = effective_allowed_channels.contains(&ch);
-                        let mut allowed_here = self.allow_all_channels || in_allowed_channel;
-                        if !allowed_here {
-                            // Reuse detect_thread() for thread allowlist semantics.
-                            // Only called on the WarnAndStop path (once per soft/hard
-                            // limit hit), not on every bot message.
-                            if let Ok(serenity::model::channel::Channel::Guild(gc)) =
-                                msg.channel_id.to_channel(&ctx.http).await
-                            {
-                                let (in_thread, _) = detect_thread(
-                                    gc.thread_metadata.is_some(),
-                                    gc.parent_id.map(|id| id.get()),
-                                    gc.owner_id.map(|id| id.get()),
-                                    bot_id.get(),
-                                    &effective_allowed_channels,
-                                    self.allow_all_channels,
-                                    in_allowed_channel,
-                                );
-                                if in_thread {
-                                    allowed_here = true;
-                                }
-                            }
-                        }
-                        if msg.author.id != bot_id && allowed_here {
-                            // Only warn if this bot actually participated in the
-                            // thread — prevents uninvolved bots from spamming
-                            // warnings in shared channels. (#727)
-                            // Second value is `is_multibot`; not needed here.
-                            let (participated, _) = self
-                                .bot_participated_in_thread(&ctx.http, msg.channel_id, bot_id)
-                                .await;
-                            if participated {
-                                // Dedup: skip if another bot already posted the same
-                                // warning in this thread. Prevents N duplicate warnings
-                                // when N bot processes each hit the soft limit. (#530)
-                                let recent = msg
-                                    .channel_id
-                                    .messages(
-                                        &ctx.http,
-                                        serenity::builder::GetMessages::new().limit(10),
-                                    )
-                                    .await
-                                    .unwrap_or_default();
-                                let pairs: Vec<(bool, &str)> = recent
-                                    .iter()
-                                    .map(|m| (m.author.bot, m.content.as_str()))
-                                    .collect();
-                                let already_warned = turn_limit_warning_present(&pairs);
-                                if !already_warned {
-                                    let _ = msg.channel_id.say(&ctx.http, &user_message).await;
-                                }
-                            }
-                        }
-                        return;
+        // Trusted bot admission override: when a bot listed in `trusted_bot_ids`
+        // explicitly @mentions this bot, bypass the entire `allow_bot_messages`
+        // mode check. This treats the trusted bot's @mention identically to a
+        // human @mention — the bot becomes involved in the thread and the message
+        // is dispatched regardless of the `allow_bot_messages` setting.
+        //
+        // Rationale: `trusted_bot_ids` expresses admin-level trust. A trusted bot
+        // that @mentions this bot is performing a deliberate handoff/coordination
+        // action, equivalent to a human pulling the bot into a conversation.
+        //
+        // Safety: requires both (1) explicit @mention AND (2) sender in
+        // trusted_bot_ids. Messages from trusted bots without @mention still
+        // follow normal gating. Empty trusted_bot_ids (default) disables this
+        // entirely — no behavioral change for existing deployments.
+        let trusted_mention =
+            is_trusted_bot_mention(is_mentioned, &self.trusted_bot_ids, msg.author.id.get());
+
+        if !trusted_mention {
+            match self.allow_bot_messages {
+                AllowBots::Off => return false,
+                AllowBots::Mentions => {
+                    if !is_mentioned {
+                        return false;
                     }
                 }
-            } else if matches!(msg.kind, MessageType::Regular | MessageType::InlineReply)
-                && !msg.content.is_empty()
+                AllowBots::All => {
+                    let cap = MAX_CONSECUTIVE_BOT_TURNS as usize;
+                    let limit = std::cmp::min(MAX_CONSECUTIVE_BOT_TURNS, 100) as u8;
+                    let history = ctx
+                        .cache
+                        .channel_messages(msg.channel_id)
+                        .map(|msgs| {
+                            let mut recent: Vec<_> = msgs
+                                .iter()
+                                .filter(|(mid, _)| **mid < msg.id)
+                                .map(|(_, m)| m.clone())
+                                .collect();
+                            recent.sort_unstable_by_key(|m| std::cmp::Reverse(m.id));
+                            recent.truncate(cap);
+                            recent
+                        })
+                        .filter(|msgs| !msgs.is_empty());
+
+                    let recent = if let Some(cached) = history {
+                        cached
+                    } else {
+                        match msg
+                            .channel_id
+                            .messages(
+                                &ctx.http,
+                                serenity::builder::GetMessages::new()
+                                    .before(msg.id)
+                                    .limit(limit),
+                            )
+                            .await
+                        {
+                            Ok(msgs) => msgs,
+                            Err(e) => {
+                                tracing::warn!(channel_id = %msg.channel_id, error = %e, "failed to fetch history for bot turn cap, rejecting (fail-closed)");
+                                return false;
+                            }
+                        }
+                    };
+
+                    let consecutive_bot = recent
+                        .iter()
+                        .take_while(|m| m.author.bot && m.author.id != bot_id)
+                        .count();
+                    if consecutive_bot >= cap {
+                        tracing::warn!(channel_id = %msg.channel_id, cap, "bot turn cap reached, ignoring");
+                        return false;
+                    }
+                }
+            }
+
+            if !self.trusted_bot_ids.is_empty()
+                && !self.trusted_bot_ids.contains(&msg.author.id.get())
             {
-                tracker.on_human_message(&thread_key);
+                tracing::debug!(bot_id = %msg.author.id, "bot not in trusted_bot_ids, ignoring");
+                return false;
             }
         }
+        true
+    }
 
-        // Ignore own messages (after counting toward bot turns above)
-        if msg.author.id == bot_id {
-            return;
-        }
-
-        let adapter = self.discord_adapter(&ctx);
-
-        let channel_id = msg.channel_id.get();
-        let in_allowed_channel =
-            self.allow_all_channels || effective_allowed_channels.contains(&channel_id);
-
-        let is_mentioned = msg.mentions_user_id(bot_id)
-            || msg.content.contains(&format!("<@{}>", bot_id))
-            || (!self.allowed_role_ids.is_empty()
-                && msg
-                    .mention_roles
-                    .iter()
-                    .any(|r| self.allowed_role_ids.contains(&r.get())));
-
-        // Early-gating optimization for bot messages to avoid unnecessary
-        // async/HTTP thread detection calls when ambient mode is inactive and
-        // the bot would gate it out anyway. (#1197 regression safety)
-        if msg.author.bot && !is_mentioned && self.ambient.is_none() {
-            match self.allow_bot_messages {
-                AllowBots::Off | AllowBots::Mentions => return,
-                AllowBots::All => {} // fall through — still needs thread detection for normal dispatch
-            }
-        }
-
-        // Thread detection: single to_channel() call for both allowed and
-        // non-allowed channels. Moved before bot gating so ambient context
-        // can be resolved early — bot messages in ambient contexts must bypass
-        // discord-level bot gating (#1197).
-        let (
-            in_thread,
-            bot_owns_thread,
-            thread_parent_id,
-            is_dm,
-            is_structural_thread,
-            structural_parent_id,
-        ) = match msg.channel_id.to_channel(&ctx.http).await {
+    /// Where this message sits: thread, DM, or plain channel.
+    ///
+    /// Resolved from a single `to_channel()` call and computed before bot
+    /// gating so an ambient context can be recognised first — bot messages
+    /// bound for ambient must bypass discord-level bot gating (#1197).
+    async fn message_channel_context(
+        &self,
+        ctx: &Context,
+        msg: &Message,
+        bot_id: serenity::model::id::UserId,
+        effective_allowed_channels: &HashSet<u64>,
+        in_allowed_channel: bool,
+    ) -> MessageChannelContext {
+        match msg.channel_id.to_channel(&ctx.http).await {
             Ok(serenity::model::channel::Channel::Guild(gc)) => {
                 let parent = gc.parent_id.map(|id| id.get().to_string());
                 let has_thread_metadata = gc.thread_metadata.is_some();
@@ -2589,286 +2541,171 @@ impl EventHandler for Handler {
                     bot_owns = ?result.1,
                     "thread check"
                 );
-                (
-                    result.0,
-                    result.1.unwrap_or(false),
-                    if has_thread_metadata { parent } else { None },
-                    false,
-                    has_thread_metadata,
-                    if has_thread_metadata {
-                        parent_u64
-                    } else {
-                        None
-                    },
-                )
+                MessageChannelContext {
+                    in_thread: result.0,
+                    bot_owns_thread: result.1.unwrap_or(false),
+                    thread_parent_id: if has_thread_metadata { parent } else { None },
+                    is_dm: false,
+                    is_structural_thread: has_thread_metadata,
+                    structural_parent_id: if has_thread_metadata { parent_u64 } else { None },
+                }
             }
             Ok(serenity::model::channel::Channel::Private(_)) => {
                 tracing::debug!(channel_id = %msg.channel_id, "DM channel");
-                (false, false, None, true, false, None)
+                MessageChannelContext {
+                    in_thread: false,
+                    bot_owns_thread: false,
+                    thread_parent_id: None,
+                    is_dm: true,
+                    is_structural_thread: false,
+                    structural_parent_id: None,
+                }
             }
             Ok(other) => {
                 tracing::debug!(channel_id = %msg.channel_id, kind = ?other, "not a guild thread");
-                (false, false, None, false, false, None)
+                MessageChannelContext {
+                    in_thread: false,
+                    bot_owns_thread: false,
+                    thread_parent_id: None,
+                    is_dm: false,
+                    is_structural_thread: false,
+                    structural_parent_id: None,
+                }
             }
             Err(e) => {
                 tracing::debug!(channel_id = %msg.channel_id, error = %e, "to_channel failed");
-                (false, false, None, false, false, None)
-            }
-        };
-
-        // Check if message is in an ambient context (resolved early so bot
-        // messages destined for ambient can bypass discord-level bot gating).
-        let in_ambient_context = self.ambient.as_ref().is_some_and(|ambient| {
-            ambient.should_buffer(
-                channel_id,
-                is_structural_thread,
-                bot_owns_thread,
-                structural_parent_id,
-            )
-        });
-        // Managed project channels are dedicated bot entrypoints: a human's
-        // top-level message starts a task without requiring an @mention. Once
-        // the task moves into a thread, the normal involved-thread rules apply.
-        let implicit_project_prompt = !msg.author.bot
-            && !is_structural_thread
-            && self.project_registry.contains_channel(channel_id);
-
-        // --- Ambient early-route for bot messages ---
-        // Bot messages in an ambient context that do NOT @mention this bot are
-        // routed directly to the ambient buffer, bypassing discord-level bot
-        // gating entirely. Ambient mode is passive observation — the bot gating
-        // logic (allow_bot_messages mode, trusted_bot_ids) only applies to
-        // messages that would trigger an active response. (#1197)
-        //
-        // @mention from a bot in ambient context → discard buffer + fall through
-        // to normal bot gating + dispatch (same as before).
-        if msg.author.bot && in_ambient_context && !is_mentioned {
-            if let Some(ambient) = self.ambient.as_ref() {
-                if !ambient.allow_bot_messages() {
-                    debug!(channel_id = %msg.channel_id, bot_id = %msg.author.id, "ambient early-route: bot msg rejected (allow_bot_messages=false)");
-                } else if self
-                    .submit_ambient(ambient, &adapter, &msg, bot_id, channel_id)
-                    .await
-                {
-                    debug!(channel_id = %msg.channel_id, bot_id = %msg.author.id, "ambient early-route: bot msg buffered");
+                MessageChannelContext {
+                    in_thread: false,
+                    bot_owns_thread: false,
+                    thread_parent_id: None,
+                    is_dm: false,
+                    is_structural_thread: false,
+                    structural_parent_id: None,
                 }
             }
-            return;
         }
+    }
 
-        // Bot message gating (from upstream #321)
-        // NOTE: Bot messages in ambient contexts are handled above and never
-        // reach here (unless they @mention this bot).
+    /// Count this message toward the thread's bot-turn limit, warning once
+    /// when a limit is crossed.
+    ///
+    /// Runs before the self-check so *all* bot messages count, including this
+    /// bot's own: `soft_limit = 20` means 20 bot messages in the thread, about
+    /// ten each in a two-bot ping-pong. (#483)
+    async fn count_bot_turn(
+        &self,
+        ctx: &Context,
+        msg: &Message,
+        bot_id: serenity::model::id::UserId,
+        effective_allowed_channels: &HashSet<u64>,
+    ) {
+        let thread_key = msg.channel_id.to_string();
+        let mut tracker = self.bot_turns.lock().await;
         if msg.author.bot {
-            // Trusted bot admission override: when a bot listed in `trusted_bot_ids`
-            // explicitly @mentions this bot, bypass the entire `allow_bot_messages`
-            // mode check. This treats the trusted bot's @mention identically to a
-            // human @mention — the bot becomes involved in the thread and the message
-            // is dispatched regardless of the `allow_bot_messages` setting.
-            //
-            // Rationale: `trusted_bot_ids` expresses admin-level trust. A trusted bot
-            // that @mentions this bot is performing a deliberate handoff/coordination
-            // action, equivalent to a human pulling the bot into a conversation.
-            //
-            // Safety: requires both (1) explicit @mention AND (2) sender in
-            // trusted_bot_ids. Messages from trusted bots without @mention still
-            // follow normal gating. Empty trusted_bot_ids (default) disables this
-            // entirely — no behavioral change for existing deployments.
-            let trusted_mention =
-                is_trusted_bot_mention(is_mentioned, &self.trusted_bot_ids, msg.author.id.get());
-
-            if !trusted_mention {
-                match self.allow_bot_messages {
-                    AllowBots::Off => return,
-                    AllowBots::Mentions => {
-                        if !is_mentioned {
-                            return;
+            match tracker.classify_bot_message(&thread_key) {
+                TurnAction::Continue => {}
+                TurnAction::SilentStop => return,
+                TurnAction::WarnAndStop {
+                    severity,
+                    turns,
+                    user_message,
+                } => {
+                    match severity {
+                        TurnSeverity::Hard => tracing::warn!(
+                            channel_id = %msg.channel_id,
+                            turns,
+                            "hard bot turn limit reached",
+                        ),
+                        TurnSeverity::Soft => tracing::info!(
+                            channel_id = %msg.channel_id,
+                            turns,
+                            max = self.max_bot_turns,
+                            "soft bot turn limit reached",
+                        ),
+                    }
+                    // Only post the warning if this bot is allowed in the channel/thread.
+                    // Bot turn counting intentionally runs before channel gating so ALL
+                    // bot messages are counted, but the *warning message* must respect
+                    // channel permissions — otherwise bots that never participated in a
+                    // thread will spam it with warnings.
+                    //
+                    // Must match the full thread allowlist semantics: a thread is allowed
+                    // if its own channel_id OR its parent_id is in allowed_channels.
+                    let ch = msg.channel_id.get();
+                    let in_allowed_channel = effective_allowed_channels.contains(&ch);
+                    let mut allowed_here = self.allow_all_channels || in_allowed_channel;
+                    if !allowed_here {
+                        // Reuse detect_thread() for thread allowlist semantics.
+                        // Only called on the WarnAndStop path (once per soft/hard
+                        // limit hit), not on every bot message.
+                        if let Ok(serenity::model::channel::Channel::Guild(gc)) =
+                            msg.channel_id.to_channel(&ctx.http).await
+                        {
+                            let (in_thread, _) = detect_thread(
+                                gc.thread_metadata.is_some(),
+                                gc.parent_id.map(|id| id.get()),
+                                gc.owner_id.map(|id| id.get()),
+                                bot_id.get(),
+                                &effective_allowed_channels,
+                                self.allow_all_channels,
+                                in_allowed_channel,
+                            );
+                            if in_thread {
+                                allowed_here = true;
+                            }
                         }
                     }
-                    AllowBots::All => {
-                        let cap = MAX_CONSECUTIVE_BOT_TURNS as usize;
-                        let limit = std::cmp::min(MAX_CONSECUTIVE_BOT_TURNS, 100) as u8;
-                        let history = ctx
-                            .cache
-                            .channel_messages(msg.channel_id)
-                            .map(|msgs| {
-                                let mut recent: Vec<_> = msgs
-                                    .iter()
-                                    .filter(|(mid, _)| **mid < msg.id)
-                                    .map(|(_, m)| m.clone())
-                                    .collect();
-                                recent.sort_unstable_by_key(|m| std::cmp::Reverse(m.id));
-                                recent.truncate(cap);
-                                recent
-                            })
-                            .filter(|msgs| !msgs.is_empty());
-
-                        let recent = if let Some(cached) = history {
-                            cached
-                        } else {
-                            match msg
+                    if msg.author.id != bot_id && allowed_here {
+                        // Only warn if this bot actually participated in the
+                        // thread — prevents uninvolved bots from spamming
+                        // warnings in shared channels. (#727)
+                        // Second value is `is_multibot`; not needed here.
+                        let (participated, _) = self
+                            .bot_participated_in_thread(&ctx.http, msg.channel_id, bot_id)
+                            .await;
+                        if participated {
+                            // Dedup: skip if another bot already posted the same
+                            // warning in this thread. Prevents N duplicate warnings
+                            // when N bot processes each hit the soft limit. (#530)
+                            let recent = msg
                                 .channel_id
                                 .messages(
                                     &ctx.http,
-                                    serenity::builder::GetMessages::new()
-                                        .before(msg.id)
-                                        .limit(limit),
+                                    serenity::builder::GetMessages::new().limit(10),
                                 )
                                 .await
-                            {
-                                Ok(msgs) => msgs,
-                                Err(e) => {
-                                    tracing::warn!(channel_id = %msg.channel_id, error = %e, "failed to fetch history for bot turn cap, rejecting (fail-closed)");
-                                    return;
-                                }
+                                .unwrap_or_default();
+                            let pairs: Vec<(bool, &str)> = recent
+                                .iter()
+                                .map(|m| (m.author.bot, m.content.as_str()))
+                                .collect();
+                            let already_warned = turn_limit_warning_present(&pairs);
+                            if !already_warned {
+                                let _ = msg.channel_id.say(&ctx.http, &user_message).await;
                             }
-                        };
-
-                        let consecutive_bot = recent
-                            .iter()
-                            .take_while(|m| m.author.bot && m.author.id != bot_id)
-                            .count();
-                        if consecutive_bot >= cap {
-                            tracing::warn!(channel_id = %msg.channel_id, cap, "bot turn cap reached, ignoring");
-                            return;
                         }
                     }
-                }
-
-                if !self.trusted_bot_ids.is_empty()
-                    && !self.trusted_bot_ids.contains(&msg.author.id.get())
-                {
-                    tracing::debug!(bot_id = %msg.author.id, "bot not in trusted_bot_ids, ignoring");
                     return;
                 }
             }
+        } else if matches!(msg.kind, MessageType::Regular | MessageType::InlineReply)
+            && !msg.content.is_empty()
+        {
+            tracker.on_human_message(&thread_key);
         }
+    }
 
-        // DM gating: allow_dm must be true, otherwise reject
-        if is_dm && !self.allow_dm {
-            tracing::debug!(channel_id = %msg.channel_id, "DM rejected (allow_dm=false)");
-            return;
-        }
-
-        if !is_dm && !in_allowed_channel && !in_thread && !in_ambient_context {
-            return;
-        }
-
-        // --- Ambient Mode routing ---
-        // Route to ambient when the message belongs to an ambient context:
-        //  - a top-level message directly in an ambient channel, or
-        //  - a message in a thread under an ambient channel (including
-        //    bot-owned threads — the bot passively observes all threads).
-        // @mention in an ambient context → discard buffer + normal dispatch.
-        // NOTE: Bot messages without @mention are already handled by the
-        // early-route above; this block handles human messages and bot @mentions.
-        if in_ambient_context {
-            let ambient = self.ambient.as_ref().unwrap();
-            if !is_dm {
-                if is_mentioned {
-                    // Discard ambient buffer — mention takes priority.
-                    ambient.discard_buffer(&channel_id.to_string()).await;
-                    // Fall through to normal dispatch below.
-                } else {
-                    // Route to ambient buffer (not normal dispatch).
-                    // Bot messages only if allow_bot_messages is true for ambient.
-                    if msg.author.bot && !ambient.allow_bot_messages() {
-                        return;
-                    }
-                    self.submit_ambient(ambient, &adapter, &msg, bot_id, channel_id)
-                        .await;
-                    return;
-                }
-            }
-        }
-
-        // User message gating (mirrors Slack's AllowUsers logic).
-        // Mentions: always require @mention, even in bot's own threads.
-        // Involved (default): skip @mention if the bot owns the thread
-        //   (Option A) OR has previously posted in it (Option B).
-        // MultibotMentions: same as Involved, but if other bots are also
-        //   in the thread, require @mention to avoid all bots responding.
-        // DMs are treated as implicit @mention (mirrors Slack behavior).
-        if !is_mentioned && !is_dm && !implicit_project_prompt {
-            // Resolving involvement can cost an HTTP fetch, so only pay for it
-            // where the answer can change the outcome: `Mentions` never consults
-            // it, outside a thread there is nothing to be involved in, and owning
-            // the thread already implies involvement. `MultibotMentions` still
-            // fetches in the owned case — not for involvement, but because it is
-            // the only way to learn whether another bot is present.
-            let (involved, other_bot_present) = match self.allow_user_messages {
-                AllowUsers::Mentions => (false, false),
-                _ if !in_thread => (false, false),
-                AllowUsers::Involved if bot_owns_thread => (true, false),
-                AllowUsers::MultibotMentions if bot_owns_thread => {
-                    let (_, other_bot) = self
-                        .bot_participated_in_thread(&ctx.http, msg.channel_id, bot_id)
-                        .await;
-                    (true, other_bot)
-                }
-                _ => {
-                    self.bot_participated_in_thread(&ctx.http, msg.channel_id, bot_id)
-                        .await
-                }
-            };
-            if !should_process_user_message(
-                self.allow_user_messages,
-                is_mentioned,
-                in_thread,
-                involved,
-                other_bot_present,
-            ) {
-                tracing::debug!(
-                    channel_id = %msg.channel_id,
-                    mode = ?self.allow_user_messages,
-                    in_thread,
-                    involved,
-                    other_bot_present,
-                    "user message gated out"
-                );
-                return;
-            }
-        }
-
-        if is_denied_user(
-            msg.author.bot,
-            self.allow_all_users,
-            &self.allowed_users,
-            msg.author.id.get(),
-        ) {
-            tracing::info!(user_id = %msg.author.id, "denied user, ignoring");
-            let msg_ref = discord_msg_ref(&msg);
-            let _ = adapter.add_reaction(&msg_ref, "🚫").await;
-            return;
-        }
-
-        let prompt = resolve_mentions(&msg.content, bot_id, &self.allowed_role_ids);
-
-        // No text and no attachments → skip
-        if prompt.is_empty() && msg.attachments.is_empty() {
-            return;
-        }
-
-        let display_name = msg
-            .member
-            .as_ref()
-            .and_then(|m| m.nick.as_ref())
-            .or(msg.author.global_name.as_ref())
-            .unwrap_or(&msg.author.name);
-        let sender = build_sender_context(
-            &msg.author.id.to_string(),
-            &msg.author.name,
-            display_name,
-            &msg.channel_id.to_string(),
-            thread_parent_id.as_deref(),
-            msg.author.bot,
-            &msg.timestamp.to_rfc3339().unwrap_or_default(),
-            &msg.id.to_string(),
-            &bot_id.to_string(),
-        );
-
-        // Build extra content blocks from attachments (audio -> STT, text -> inline,
-        // image -> encode, video -> URL for agent-side inspection).
+    /// Turn one message's attachments into extra content blocks.
+    ///
+    /// Audio goes to STT, text is inlined under a size cap, images are encoded
+    /// or uploaded to the filestore, and video becomes a URL the agent fetches
+    /// itself. Images that could not be read come back named, so the caller can
+    /// tell the user which ones were dropped.
+    async fn collect_attachment_blocks(
+        &self,
+        msg: &Message,
+        adapter: &Arc<dyn ChatAdapter>,
+    ) -> MessageAttachments {
         let mut extra_blocks = Vec::new();
         let mut echo_entries: Vec<crate::stt::EchoEntry> = Vec::new();
         let mut failed_image_files: Vec<String> = Vec::new();
@@ -3026,6 +2863,286 @@ impl EventHandler for Handler {
                 }
             }
         }
+
+        MessageAttachments {
+            extra_blocks,
+            echo_entries,
+            failed_image_files,
+        }
+    }
+}
+
+/// What [`Handler::collect_attachment_blocks`] pulled out of one message.
+struct MessageAttachments {
+    extra_blocks: Vec<ContentBlock>,
+    echo_entries: Vec<crate::stt::EchoEntry>,
+    failed_image_files: Vec<String>,
+}
+
+/// The channel-shaped facts about one incoming message.
+///
+/// Named rather than a six-wide tuple: every field is a `bool` or an
+/// `Option<..>`, so positional destructuring silently tolerates a swap.
+struct MessageChannelContext {
+    in_thread: bool,
+    bot_owns_thread: bool,
+    thread_parent_id: Option<String>,
+    is_dm: bool,
+    is_structural_thread: bool,
+    structural_parent_id: Option<u64>,
+}
+
+#[serenity::async_trait]
+impl EventHandler for Handler {
+    async fn message(&self, ctx: Context, msg: Message) {
+        let bot_id = ctx.cache.current_user().id;
+        let effective_allowed_channels = self.effective_allowed_channels();
+
+        // Early multibot detection: cache that another bot is present.
+        // Runs before self-check and bot gating so we always detect other bots. (#481)
+        if msg.author.bot && msg.author.id != bot_id {
+            let key = msg.channel_id.to_string();
+            {
+                let mut cache = self.multibot_threads.lock().await;
+                cache
+                    .entry(key.clone())
+                    .or_insert_with(tokio::time::Instant::now);
+            }
+            // Persist to disk — multibot is irreversible
+            self.multibot_cache.mark_multibot(&key).await;
+        }
+
+        self.count_bot_turn(&ctx, &msg, bot_id, &effective_allowed_channels)
+            .await;
+
+        // Ignore own messages (after counting toward bot turns above)
+        if msg.author.id == bot_id {
+            return;
+        }
+
+        let adapter = self.discord_adapter(&ctx);
+
+        let channel_id = msg.channel_id.get();
+        let in_allowed_channel =
+            self.allow_all_channels || effective_allowed_channels.contains(&channel_id);
+
+        let is_mentioned = msg.mentions_user_id(bot_id)
+            || msg.content.contains(&format!("<@{}>", bot_id))
+            || (!self.allowed_role_ids.is_empty()
+                && msg
+                    .mention_roles
+                    .iter()
+                    .any(|r| self.allowed_role_ids.contains(&r.get())));
+
+        // Early-gating optimization for bot messages to avoid unnecessary
+        // async/HTTP thread detection calls when ambient mode is inactive and
+        // the bot would gate it out anyway. (#1197 regression safety)
+        if msg.author.bot && !is_mentioned && self.ambient.is_none() {
+            match self.allow_bot_messages {
+                AllowBots::Off | AllowBots::Mentions => return,
+                AllowBots::All => {} // fall through — still needs thread detection for normal dispatch
+            }
+        }
+
+        // Thread detection: single to_channel() call for both allowed and
+        // non-allowed channels. Moved before bot gating so ambient context
+        // can be resolved early — bot messages in ambient contexts must bypass
+        // discord-level bot gating (#1197).
+        let MessageChannelContext {
+            in_thread,
+            bot_owns_thread,
+            thread_parent_id,
+            is_dm,
+            is_structural_thread,
+            structural_parent_id,
+        } = self
+            .message_channel_context(
+                &ctx,
+                &msg,
+                bot_id,
+                &effective_allowed_channels,
+                in_allowed_channel,
+            )
+            .await;
+
+        // Check if message is in an ambient context (resolved early so bot
+        // messages destined for ambient can bypass discord-level bot gating).
+        let in_ambient_context = self.ambient.as_ref().is_some_and(|ambient| {
+            ambient.should_buffer(
+                channel_id,
+                is_structural_thread,
+                bot_owns_thread,
+                structural_parent_id,
+            )
+        });
+        // Managed project channels are dedicated bot entrypoints: a human's
+        // top-level message starts a task without requiring an @mention. Once
+        // the task moves into a thread, the normal involved-thread rules apply.
+        let implicit_project_prompt = !msg.author.bot
+            && !is_structural_thread
+            && self.project_registry.contains_channel(channel_id);
+
+        // --- Ambient early-route for bot messages ---
+        // Bot messages in an ambient context that do NOT @mention this bot are
+        // routed directly to the ambient buffer, bypassing discord-level bot
+        // gating entirely. Ambient mode is passive observation — the bot gating
+        // logic (allow_bot_messages mode, trusted_bot_ids) only applies to
+        // messages that would trigger an active response. (#1197)
+        //
+        // @mention from a bot in ambient context → discard buffer + fall through
+        // to normal bot gating + dispatch (same as before).
+        if msg.author.bot && in_ambient_context && !is_mentioned {
+            if let Some(ambient) = self.ambient.as_ref() {
+                if !ambient.allow_bot_messages() {
+                    debug!(channel_id = %msg.channel_id, bot_id = %msg.author.id, "ambient early-route: bot msg rejected (allow_bot_messages=false)");
+                } else if self
+                    .submit_ambient(ambient, &adapter, &msg, bot_id, channel_id)
+                    .await
+                {
+                    debug!(channel_id = %msg.channel_id, bot_id = %msg.author.id, "ambient early-route: bot msg buffered");
+                }
+            }
+            return;
+        }
+
+        // Bot messages in ambient contexts are handled above and never reach
+        // here unless they @mention this bot.
+        if !self.admits_bot_message(&ctx, &msg, bot_id, is_mentioned).await {
+            return;
+        }
+
+        // DM gating: allow_dm must be true, otherwise reject
+        if is_dm && !self.allow_dm {
+            tracing::debug!(channel_id = %msg.channel_id, "DM rejected (allow_dm=false)");
+            return;
+        }
+
+        if !is_dm && !in_allowed_channel && !in_thread && !in_ambient_context {
+            return;
+        }
+
+        // --- Ambient Mode routing ---
+        // Route to ambient when the message belongs to an ambient context:
+        //  - a top-level message directly in an ambient channel, or
+        //  - a message in a thread under an ambient channel (including
+        //    bot-owned threads — the bot passively observes all threads).
+        // @mention in an ambient context → discard buffer + normal dispatch.
+        // NOTE: Bot messages without @mention are already handled by the
+        // early-route above; this block handles human messages and bot @mentions.
+        if in_ambient_context {
+            let ambient = self.ambient.as_ref().unwrap();
+            if !is_dm {
+                if is_mentioned {
+                    // Discard ambient buffer — mention takes priority.
+                    ambient.discard_buffer(&channel_id.to_string()).await;
+                    // Fall through to normal dispatch below.
+                } else {
+                    // Route to ambient buffer (not normal dispatch).
+                    // Bot messages only if allow_bot_messages is true for ambient.
+                    if msg.author.bot && !ambient.allow_bot_messages() {
+                        return;
+                    }
+                    self.submit_ambient(ambient, &adapter, &msg, bot_id, channel_id)
+                        .await;
+                    return;
+                }
+            }
+        }
+
+        // User message gating (mirrors Slack's AllowUsers logic).
+        // Mentions: always require @mention, even in bot's own threads.
+        // Involved (default): skip @mention if the bot owns the thread
+        //   (Option A) OR has previously posted in it (Option B).
+        // MultibotMentions: same as Involved, but if other bots are also
+        //   in the thread, require @mention to avoid all bots responding.
+        // DMs are treated as implicit @mention (mirrors Slack behavior).
+        if !is_mentioned && !is_dm && !implicit_project_prompt {
+            // Resolving involvement can cost an HTTP fetch, so only pay for it
+            // where the answer can change the outcome: `Mentions` never consults
+            // it, outside a thread there is nothing to be involved in, and owning
+            // the thread already implies involvement. `MultibotMentions` still
+            // fetches in the owned case — not for involvement, but because it is
+            // the only way to learn whether another bot is present.
+            let (involved, other_bot_present) = match self.allow_user_messages {
+                AllowUsers::Mentions => (false, false),
+                _ if !in_thread => (false, false),
+                AllowUsers::Involved if bot_owns_thread => (true, false),
+                AllowUsers::MultibotMentions if bot_owns_thread => {
+                    let (_, other_bot) = self
+                        .bot_participated_in_thread(&ctx.http, msg.channel_id, bot_id)
+                        .await;
+                    (true, other_bot)
+                }
+                _ => {
+                    self.bot_participated_in_thread(&ctx.http, msg.channel_id, bot_id)
+                        .await
+                }
+            };
+            if !should_process_user_message(
+                self.allow_user_messages,
+                is_mentioned,
+                in_thread,
+                involved,
+                other_bot_present,
+            ) {
+                tracing::debug!(
+                    channel_id = %msg.channel_id,
+                    mode = ?self.allow_user_messages,
+                    in_thread,
+                    involved,
+                    other_bot_present,
+                    "user message gated out"
+                );
+                return;
+            }
+        }
+
+        if is_denied_user(
+            msg.author.bot,
+            self.allow_all_users,
+            &self.allowed_users,
+            msg.author.id.get(),
+        ) {
+            tracing::info!(user_id = %msg.author.id, "denied user, ignoring");
+            let msg_ref = discord_msg_ref(&msg);
+            let _ = adapter.add_reaction(&msg_ref, "🚫").await;
+            return;
+        }
+
+        let prompt = resolve_mentions(&msg.content, bot_id, &self.allowed_role_ids);
+
+        // No text and no attachments → skip
+        if prompt.is_empty() && msg.attachments.is_empty() {
+            return;
+        }
+
+        let display_name = msg
+            .member
+            .as_ref()
+            .and_then(|m| m.nick.as_ref())
+            .or(msg.author.global_name.as_ref())
+            .unwrap_or(&msg.author.name);
+        let sender = build_sender_context(
+            &msg.author.id.to_string(),
+            &msg.author.name,
+            display_name,
+            &msg.channel_id.to_string(),
+            thread_parent_id.as_deref(),
+            msg.author.bot,
+            &msg.timestamp.to_rfc3339().unwrap_or_default(),
+            &msg.id.to_string(),
+            &bot_id.to_string(),
+        );
+
+        // Build extra content blocks from attachments (audio -> STT, text -> inline,
+        // image -> encode, video -> URL for agent-side inspection).
+        let MessageAttachments {
+            extra_blocks,
+            echo_entries,
+            failed_image_files,
+        } = self
+            .collect_attachment_blocks(&msg, &adapter)
+            .await;
 
         tracing::debug!(
             num_extra_blocks = extra_blocks.len(),
@@ -4658,7 +4775,7 @@ impl Handler {
         }
 
         let content = self
-            .run_project_command(ctx, cmd)
+            .handle_project_slash_command(ctx, cmd)
             .await
             .unwrap_or_else(|error| {
                 tracing::warn!(%error, user_id = %cmd.user.id, "project command rejected");
@@ -4672,7 +4789,7 @@ impl Handler {
         }
     }
 
-    async fn run_project_command(
+    async fn handle_project_slash_command(
         &self,
         ctx: &Context,
         cmd: &serenity::model::application::CommandInteraction,

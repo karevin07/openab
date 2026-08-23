@@ -1000,6 +1000,8 @@ async fn main() -> anyhow::Result<()> {
     #[cfg(not(feature = "discord"))]
     let shared_discord_adapter: Option<Arc<dyn adapter::ChatAdapter>> = None;
 
+    // Only the Slack adapter takes this; a Discord-only build never reads it.
+    #[cfg_attr(not(feature = "slack"), allow(unused_variables))]
     let session_ttl_dur = std::time::Duration::from_secs(ttl_secs);
 
     // Initialize multibot cache
