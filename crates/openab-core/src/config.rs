@@ -2132,6 +2132,10 @@ pub struct AgentPresentationConfig {
     pub name: String,
     pub local_handoff_enabled: bool,
     pub local_publish_enabled: bool,
+    /// Expose the Discord `/knowledge` home card and its Notion-oriented
+    /// prompt launchers. Disabled by default so development agents keep their
+    /// existing command surface.
+    pub knowledge_ui_enabled: bool,
 }
 
 impl Default for AgentPresentationConfig {
@@ -2140,6 +2144,7 @@ impl Default for AgentPresentationConfig {
             name: "Cursor".to_string(),
             local_handoff_enabled: true,
             local_publish_enabled: true,
+            knowledge_ui_enabled: false,
         }
     }
 }
@@ -5007,6 +5012,7 @@ cancel_strategy = "noop"
         assert_eq!(cfg.agent.presentation.name, "Cursor");
         assert!(cfg.agent.presentation.local_handoff_enabled);
         assert!(cfg.agent.presentation.local_publish_enabled);
+        assert!(!cfg.agent.presentation.knowledge_ui_enabled);
     }
 
     #[test]
@@ -5020,6 +5026,7 @@ bot_token = "x"
 name = "OpenCode"
 local_handoff_enabled = false
 local_publish_enabled = false
+knowledge_ui_enabled = true
 "#,
             "test",
         )
@@ -5027,6 +5034,7 @@ local_publish_enabled = false
         assert_eq!(cfg.agent.presentation.name, "OpenCode");
         assert!(!cfg.agent.presentation.local_handoff_enabled);
         assert!(!cfg.agent.presentation.local_publish_enabled);
+        assert!(cfg.agent.presentation.knowledge_ui_enabled);
     }
 
     #[test]

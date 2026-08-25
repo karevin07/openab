@@ -737,6 +737,110 @@ fn project_info_embed(binding: &ProjectBinding) -> CreateEmbed {
         .footer(CreateEmbedFooter::new("Managed by OpenAB"))
 }
 
+fn knowledge_home_message() -> CreateInteractionResponseMessage {
+    CreateInteractionResponseMessage::new()
+        .embed(
+            CreateEmbed::new()
+                .title("📚 知識整理小幫手")
+                .description(
+                    "快速收錄文章、查詢 Notion，或整理 Side Project 筆記。每次操作會建立獨立 thread，方便持續追問。",
+                )
+                .colour(0x2F80ED)
+                .field(
+                    "安全規則",
+                    "查詢預設唯讀；收錄與專案更新會先提供預覽，取得確認後才寫入 Notion。",
+                    false,
+                )
+                .footer(CreateEmbedFooter::new(
+                    "也可以直接 @知識整理小幫手 描述需求",
+                )),
+        )
+        .components(vec![
+            CreateActionRow::Buttons(vec![
+                CreateButton::new("oab_knowledge:capture")
+                    .label("➕ 收錄文章")
+                    .style(ButtonStyle::Primary),
+                CreateButton::new("oab_knowledge:search")
+                    .label("🔎 查詢知識")
+                    .style(ButtonStyle::Secondary),
+                CreateButton::new("oab_knowledge:project")
+                    .label("🛠️ 專案筆記")
+                    .style(ButtonStyle::Secondary),
+            ]),
+            CreateActionRow::Buttons(vec![
+                CreateButton::new("oab_knowledge:recent")
+                    .label("🕘 最近收錄")
+                    .style(ButtonStyle::Secondary),
+                CreateButton::new("oab_knowledge:help")
+                    .label("❓ 使用說明")
+                    .style(ButtonStyle::Secondary),
+            ]),
+        ])
+}
+
+fn knowledge_capture_modal() -> CreateModal {
+    CreateModal::new("oab_knowledge_modal:capture", "收錄文章").components(vec![
+        CreateActionRow::InputText(
+            CreateInputText::new(InputTextStyle::Paragraph, "網址或內容", "source")
+                .placeholder("貼上文章網址、Notion 頁面連結或要整理的文字")
+                .min_length(1)
+                .max_length(4000),
+        ),
+        CreateActionRow::InputText(
+            CreateInputText::new(InputTextStyle::Paragraph, "收藏原因（選填）", "note")
+                .placeholder("為什麼想收藏？希望保留哪些重點？")
+                .max_length(1000)
+                .required(false),
+        ),
+        CreateActionRow::InputText(
+            CreateInputText::new(InputTextStyle::Short, "分類提示（選填）", "classification")
+                .placeholder("例如：AI、新聞、Guide、Project 名稱")
+                .max_length(200)
+                .required(false),
+        ),
+    ])
+}
+
+fn knowledge_search_modal() -> CreateModal {
+    CreateModal::new("oab_knowledge_modal:search", "查詢知識").components(vec![
+        CreateActionRow::InputText(
+            CreateInputText::new(InputTextStyle::Paragraph, "想查詢的問題", "question")
+                .placeholder("例如：Project Alpha 目前採用哪個控制方案？")
+                .min_length(1)
+                .max_length(4000),
+        ),
+        CreateActionRow::InputText(
+            CreateInputText::new(InputTextStyle::Short, "範圍（選填）", "scope")
+                .placeholder("Project、主題、時間範圍或文章類型")
+                .max_length(300)
+                .required(false),
+        ),
+    ])
+}
+
+fn knowledge_project_modal() -> CreateModal {
+    CreateModal::new("oab_knowledge_modal:project", "整理專案筆記").components(vec![
+        CreateActionRow::InputText(
+            CreateInputText::new(InputTextStyle::Short, "Project", "project")
+                .placeholder("例如：Project Alpha")
+                .min_length(1)
+                .max_length(200),
+        ),
+        CreateActionRow::InputText(
+            CreateInputText::new(InputTextStyle::Paragraph, "筆記內容", "note")
+                .placeholder("貼上規格、決策、實驗結果、踩坑或進度")
+                .min_length(1)
+                .max_length(4000),
+        ),
+        CreateActionRow::InputText(
+            CreateInputText::new(InputTextStyle::Short, "類型提示（選填）", "kind")
+                .placeholder("Project Spec、Decision 或 Experiment")
+                .max_length(100)
+                .required(false),
+        ),
+    ])
+}
+
 fn project_welcome_components(tasks: &[TaskRecord]) -> Vec<CreateActionRow> {
     let mut primary = vec![
         CreateButton::new("oab_project:new")
@@ -3731,7 +3835,7 @@ impl EventHandler for Handler {
         ));
 
         // Build the shared command list once.
-        let commands = vec![
+        let mut commands = vec![
             CreateCommand::new("models").description("Select the AI model for this session"),
             CreateCommand::new("agents").description("Select the agent mode for this session"),
             CreateCommand::new("cancel").description("Cancel the current operation"),
@@ -3900,6 +4004,12 @@ impl EventHandler for Handler {
                     "Export all messages (up to 5000). Default is last 100.",
                 )),
         ];
+        if agent_presentation().knowledge_ui_enabled {
+            commands.push(
+                CreateCommand::new("knowledge")
+                    .description("Open the knowledge capture and Notion search home card"),
+            );
+        }
 
         // Register global commands only. Registering the same commands per-guild
         // makes Discord show duplicate slash commands in guild command pickers.
@@ -3970,6 +4080,9 @@ impl EventHandler for Handler {
             Interaction::Command(cmd) if cmd.data.name == "help" => {
                 self.handle_help_command(&ctx, &cmd).await;
             }
+            Interaction::Command(cmd) if cmd.data.name == "knowledge" => {
+                self.handle_knowledge_command(&ctx, &cmd).await;
+            }
             Interaction::Command(cmd) if cmd.data.name == "workspace" => {
                 self.handle_workspace_command(&ctx, &cmd).await;
             }
@@ -3999,6 +4112,9 @@ impl EventHandler for Handler {
             }
             Interaction::Component(comp) if comp.data.custom_id.starts_with("oab_task:") => {
                 self.handle_task_control(&ctx, &comp).await;
+            }
+            Interaction::Component(comp) if comp.data.custom_id.starts_with("oab_knowledge:") => {
+                self.handle_knowledge_component(&ctx, &comp).await;
             }
             Interaction::Component(comp)
                 if comp.data.custom_id.starts_with("oab_admin:")
@@ -4045,6 +4161,11 @@ impl EventHandler for Handler {
             }
             Interaction::Modal(modal) if modal.data.custom_id == "oab_project_new" => {
                 self.handle_project_new_task_modal(&ctx, &modal).await;
+            }
+            Interaction::Modal(modal)
+                if modal.data.custom_id.starts_with("oab_knowledge_modal:") =>
+            {
+                self.handle_knowledge_modal(&ctx, &modal).await;
             }
             Interaction::Modal(modal) if modal.data.custom_id == "oab_admin_category_create" => {
                 self.handle_admin_category_modal(&ctx, &modal).await;
@@ -4894,6 +5015,280 @@ impl Handler {
             active,
             stale, unavailable, moved, "project channel reconciliation completed"
         );
+    }
+
+    async fn handle_knowledge_command(
+        &self,
+        ctx: &Context,
+        cmd: &serenity::model::application::CommandInteraction,
+    ) {
+        if !agent_presentation().knowledge_ui_enabled {
+            let _ = cmd.create_response(&ctx.http, CreateInteractionResponse::Message(
+                CreateInteractionResponseMessage::new().content("⚠️ Knowledge UI is disabled for this agent.").ephemeral(true),
+            )).await;
+            return;
+        }
+        if let Err(message) = self.resolve_command_scope(ctx, cmd).await {
+            let _ = cmd.create_response(&ctx.http, CreateInteractionResponse::Message(
+                CreateInteractionResponseMessage::new().content(message).ephemeral(true),
+            )).await;
+            return;
+        }
+        if let Err(error) = cmd.create_response(
+            &ctx.http,
+            CreateInteractionResponse::Message(knowledge_home_message()),
+        ).await {
+            tracing::error!(%error, "failed to show Knowledge Home");
+        }
+    }
+
+    async fn submit_knowledge_prompt(
+        &self,
+        ctx: &Context,
+        scope: DiscordCommandScope,
+        user: &serenity::model::user::User,
+        title: &str,
+        prompt: String,
+    ) -> Result<u64, String> {
+        let title = truncate_for_discord(title.trim(), 100);
+        let parent_id = scope.channel_ref.parent_id.as_deref()
+            .and_then(|value| value.parse::<u64>().ok());
+        let (target_id, target_parent_id) = if parent_id.is_some() {
+            (scope.channel_ref.channel_id.parse::<u64>()
+                .map_err(|_| "The current Discord thread ID is invalid.".to_string())?, parent_id)
+        } else {
+            let channel_id = scope.channel_ref.channel_id.parse::<u64>()
+                .map_err(|_| "The current Discord channel ID is invalid.".to_string())?;
+            let starter = ChannelId::new(channel_id).send_message(
+                &ctx.http,
+                CreateMessage::new().content(format!(
+                    "📚 **{}**\nStarted by <@{}> via Knowledge Home",
+                    suppress_mentions(&title.replace(['*', '`'], "")), user.id,
+                )),
+            ).await.map_err(|error| format!("Could not create knowledge request: {error}"))?;
+            let thread = match ChannelId::new(channel_id).create_thread_from_message(
+                &ctx.http,
+                starter.id,
+                CreateThread::new(&title).auto_archive_duration(AutoArchiveDuration::OneDay),
+            ).await {
+                Ok(thread) => thread,
+                Err(error) => {
+                    let _ = starter.delete(&ctx.http).await;
+                    return Err(format!("Could not create knowledge thread: {error}"));
+                }
+            };
+            (thread.id.get(), Some(channel_id))
+        };
+
+        let preview = suppress_mentions(&truncate_for_discord(&prompt, 1800));
+        let trigger = ChannelId::new(target_id).send_message(
+            &ctx.http,
+            CreateMessage::new().content(format!(
+                "👤 **Request from <@{}>**\n{}", user.id, preview,
+            )),
+        ).await.map_err(|error| format!("Could not post knowledge request: {error}"))?;
+        let channel_ref = ChannelRef {
+            platform: "discord".into(),
+            channel_id: target_id.to_string(),
+            thread_id: None,
+            parent_id: target_parent_id.map(|id| id.to_string()),
+            origin_event_id: None,
+        };
+        let trigger_ref = MessageRef {
+            channel: channel_ref.clone(),
+            message_id: trigger.id.to_string(),
+        };
+        let display_name = user.global_name.as_deref().unwrap_or(&user.name);
+        let sender = build_sender_context(
+            &user.id.to_string(), &user.name, display_name, &target_id.to_string(),
+            channel_ref.parent_id.as_deref(), false, &chrono::Utc::now().to_rfc3339(),
+            &trigger.id.to_string(), &ctx.cache.current_user().id.to_string(),
+        );
+        let dispatcher = self.dispatcher.clone();
+        let adapter = self.discord_adapter(ctx);
+        tokio::spawn(async move {
+            let thread_key = dispatcher.key("discord", &channel_ref.channel_id, &sender.sender_id);
+            let request = crate::dispatch::BufferedMessage {
+                sender_json: serde_json::to_string(&sender).unwrap_or_default(),
+                sender_name: sender.sender_name,
+                estimated_tokens: crate::dispatch::estimate_tokens(&prompt, &[]),
+                prompt,
+                extra_blocks: Vec::new(),
+                trigger_msg: trigger_ref,
+                arrived_at: std::time::Instant::now(),
+                other_bot_present: false,
+                recipient: None,
+            };
+            if let Err(error) = dispatcher.submit(
+                thread_key, channel_ref.clone(), adapter.clone(), request,
+            ).await {
+                tracing::error!(%error, channel_id = %channel_ref.channel_id, "knowledge request dispatch failed");
+                let _ = adapter.send_message(
+                    &channel_ref,
+                    &format!("⚠️ Knowledge request could not be started: {error}"),
+                ).await;
+            }
+        });
+        Ok(target_id)
+    }
+
+    async fn handle_knowledge_component(
+        &self,
+        ctx: &Context,
+        comp: &serenity::model::application::ComponentInteraction,
+    ) {
+        if !agent_presentation().knowledge_ui_enabled {
+            let _ = comp.create_response(&ctx.http, CreateInteractionResponse::Message(
+                CreateInteractionResponseMessage::new().content("⚠️ Knowledge UI is disabled for this agent.").ephemeral(true),
+            )).await;
+            return;
+        }
+        let scope = match self.resolve_session_scope(
+            ctx, comp.user.id.get(), comp.user.bot, comp.channel_id,
+        ).await {
+            Ok(scope) => scope,
+            Err(message) => {
+                let _ = comp.create_response(&ctx.http, CreateInteractionResponse::Message(
+                    CreateInteractionResponseMessage::new().content(message).ephemeral(true),
+                )).await;
+                return;
+            }
+        };
+        let action = comp.data.custom_id.strip_prefix("oab_knowledge:").unwrap_or("");
+        let modal = match action {
+            "capture" => Some(knowledge_capture_modal()),
+            "search" => Some(knowledge_search_modal()),
+            "project" => Some(knowledge_project_modal()),
+            _ => None,
+        };
+        if let Some(modal) = modal {
+            if let Err(error) = comp.create_response(
+                &ctx.http, CreateInteractionResponse::Modal(modal),
+            ).await {
+                tracing::error!(%error, action, "failed to open Knowledge Home modal");
+            }
+            return;
+        }
+        if action == "help" {
+            let message = CreateInteractionResponseMessage::new().embed(
+                CreateEmbed::new()
+                    .title("❓ 知識整理小幫手使用方式")
+                    .description(
+                        "**收錄文章**：先整理欄位與重複項目，確認後才寫入。\n**查詢知識**：唯讀搜尋 Notion 並附來源。\n**專案筆記**：比對既有 Project 文件後提出新增或更新建議。\n**最近收錄**：唯讀列出 Knowledge Library 最近 5 筆。",
+                    )
+                    .colour(0x2F80ED),
+            ).ephemeral(true);
+            let _ = comp.create_response(
+                &ctx.http, CreateInteractionResponse::Message(message),
+            ).await;
+            return;
+        }
+        if action == "recent" {
+            if let Err(error) = comp.defer_ephemeral(&ctx.http).await {
+                tracing::error!(%error, "failed to defer recent knowledge request");
+                return;
+            }
+            let prompt = "使用 notion-knowledge Skill 的 Search 模式，唯讀查詢 Knowledge Library 最近收錄的 5 筆內容。依建立或更新時間由新到舊列出標題、Content Type、Project（若有）、Status、Lifecycle 與 Notion 連結。不要修改 Notion。".to_string();
+            let result = self.submit_knowledge_prompt(
+                ctx, scope, &comp.user, "最近收錄", prompt,
+            ).await;
+            let content = result.map_or_else(
+                |error| format!("⚠️ 無法開始查詢：{error}"),
+                |thread_id| format!("✅ 已在 <#{thread_id}> 查詢最近收錄。"),
+            );
+            let _ = comp.edit_response(
+                &ctx.http, EditInteractionResponse::new().content(content),
+            ).await;
+            return;
+        }
+        let _ = comp.create_response(&ctx.http, CreateInteractionResponse::Message(
+            CreateInteractionResponseMessage::new()
+                .content("⚠️ 這個知識整理操作已失效，請重新執行 `/knowledge`。")
+                .ephemeral(true),
+        )).await;
+    }
+
+    async fn handle_knowledge_modal(
+        &self,
+        ctx: &Context,
+        modal: &serenity::model::application::ModalInteraction,
+    ) {
+        if !agent_presentation().knowledge_ui_enabled {
+            let _ = modal.create_response(&ctx.http, CreateInteractionResponse::Message(
+                CreateInteractionResponseMessage::new().content("⚠️ Knowledge UI is disabled for this agent.").ephemeral(true),
+            )).await;
+            return;
+        }
+        let scope = match self.resolve_session_scope(
+            ctx, modal.user.id.get(), modal.user.bot, modal.channel_id,
+        ).await {
+            Ok(scope) => scope,
+            Err(message) => {
+                let _ = modal.create_response(&ctx.http, CreateInteractionResponse::Message(
+                    CreateInteractionResponseMessage::new().content(message).ephemeral(true),
+                )).await;
+                return;
+            }
+        };
+        let action = modal.data.custom_id.strip_prefix("oab_knowledge_modal:").unwrap_or("");
+        let optional = |id| modal_input_value(modal, id)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .unwrap_or("未提供");
+        let request = match action {
+            "capture" => modal_input_value(modal, "source")
+                .map(str::trim).filter(|value| !value.is_empty()).map(|source| (
+                    "收錄文章",
+                    format!(
+                        "使用 notion-knowledge Skill 的 Capture 模式處理以下資料。先讀取來源、檢查 Knowledge Library 重複項目並產生收錄預覽；不要直接寫入 Notion，等待我在 thread 明確確認。\n\n來源或內容：\n{source}\n\n收藏原因：{}\n分類提示：{}",
+                        optional("note"), optional("classification"),
+                    ),
+                )),
+            "search" => modal_input_value(modal, "question")
+                .map(str::trim).filter(|value| !value.is_empty()).map(|question| (
+                    "查詢知識",
+                    format!(
+                        "使用 notion-knowledge Skill 的 Search／Synthesis 模式，唯讀查詢 Notion 並附上相關頁面連結。不要修改 Notion。\n\n問題：\n{question}\n\n查詢範圍：{}",
+                        optional("scope"),
+                    ),
+                )),
+            "project" => {
+                let project = modal_input_value(modal, "project")
+                    .map(str::trim).filter(|value| !value.is_empty());
+                let note = modal_input_value(modal, "note")
+                    .map(str::trim).filter(|value| !value.is_empty());
+                project.zip(note).map(|(project, note)| (
+                    "整理專案筆記",
+                    format!(
+                        "使用 notion-knowledge Skill 的 Project Update 模式處理以下 Side Project 筆記。先搜尋並比對同一 Project 的現行文件，判斷適合新增或更新的內容並顯示預覽；不要直接寫入 Notion，等待我在 thread 明確確認。\n\nProject：{project}\n類型提示：{}\n\n筆記內容：\n{note}",
+                        optional("kind"),
+                    ),
+                ))
+            }
+            _ => None,
+        };
+        let Some((title, prompt)) = request else {
+            let _ = modal.create_response(&ctx.http, CreateInteractionResponse::Message(
+                CreateInteractionResponseMessage::new()
+                    .content("⚠️ 必填內容不可為空，請重新操作 Knowledge Home。")
+                    .ephemeral(true),
+            )).await;
+            return;
+        };
+        if let Err(error) = modal.defer_ephemeral(&ctx.http).await {
+            tracing::error!(%error, action, "failed to defer Knowledge Home modal");
+            return;
+        }
+        let result = self.submit_knowledge_prompt(
+            ctx, scope, &modal.user, title, prompt,
+        ).await;
+        let content = result.map_or_else(
+            |error| format!("⚠️ 無法開始知識整理：{error}"),
+            |thread_id| format!("✅ 已在 <#{thread_id}> 開始處理。"),
+        );
+        let _ = modal.edit_response(
+            &ctx.http, EditInteractionResponse::new().content(content),
+        ).await;
     }
 
     async fn handle_project_command(
@@ -9510,6 +9905,37 @@ mod tests {
             env_passthrough: Vec::new(),
             book_select: false,
         }
+    }
+
+    #[test]
+    fn knowledge_home_exposes_only_safe_prompt_launchers() {
+        let value = serde_json::to_value(knowledge_home_message()).unwrap();
+        let rendered = value.to_string();
+        assert!(rendered.contains("oab_knowledge:capture"));
+        assert!(rendered.contains("oab_knowledge:search"));
+        assert!(rendered.contains("oab_knowledge:project"));
+        assert!(rendered.contains("oab_knowledge:recent"));
+        assert!(rendered.contains("oab_knowledge:help"));
+        assert!(rendered.contains("取得確認後才寫入 Notion"));
+        assert!(!rendered.contains("confirm"));
+    }
+
+    #[test]
+    fn knowledge_modals_collect_the_expected_fields() {
+        let capture = serde_json::to_value(knowledge_capture_modal()).unwrap().to_string();
+        assert!(capture.contains("oab_knowledge_modal:capture"));
+        assert!(capture.contains("source"));
+        assert!(capture.contains("classification"));
+
+        let search = serde_json::to_value(knowledge_search_modal()).unwrap().to_string();
+        assert!(search.contains("oab_knowledge_modal:search"));
+        assert!(search.contains("question"));
+        assert!(search.contains("scope"));
+
+        let project = serde_json::to_value(knowledge_project_modal()).unwrap().to_string();
+        assert!(project.contains("oab_knowledge_modal:project"));
+        assert!(project.contains("project"));
+        assert!(project.contains("kind"));
     }
 
     #[test]
