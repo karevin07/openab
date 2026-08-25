@@ -2108,6 +2108,7 @@ struct AgentConfigRaw {
     working_dir: String,
     env: HashMap<String, String>,
     inherit_env: Vec<String>,
+    presentation: AgentPresentationConfig,
 }
 
 impl Default for AgentConfigRaw {
@@ -2118,6 +2119,27 @@ impl Default for AgentConfigRaw {
             working_dir: default_working_dir(),
             env: HashMap::new(),
             inherit_env: Vec::new(),
+            presentation: AgentPresentationConfig::default(),
+        }
+    }
+}
+
+/// Product-facing agent identity and optional local workflow capabilities.
+/// Defaults preserve the existing Cursor UX.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
+pub struct AgentPresentationConfig {
+    pub name: String,
+    pub local_handoff_enabled: bool,
+    pub local_publish_enabled: bool,
+}
+
+impl Default for AgentPresentationConfig {
+    fn default() -> Self {
+        Self {
+            name: "Cursor".to_string(),
+            local_handoff_enabled: true,
+            local_publish_enabled: true,
         }
     }
 }
@@ -2129,6 +2151,7 @@ pub struct AgentConfig {
     pub working_dir: String,
     pub env: HashMap<String, String>,
     pub inherit_env: Vec<String>,
+    pub presentation: AgentPresentationConfig,
     /// Whether the command was explicitly set in config (vs defaulted from env/fallback).
     pub command_explicit: bool,
 }
@@ -2141,6 +2164,7 @@ impl Default for AgentConfig {
             working_dir: default_working_dir(),
             env: HashMap::new(),
             inherit_env: Vec::new(),
+            presentation: AgentPresentationConfig::default(),
             command_explicit: false,
         }
     }
@@ -2167,6 +2191,7 @@ impl<'de> serde::Deserialize<'de> for AgentConfig {
             working_dir: raw.working_dir,
             env: raw.env,
             inherit_env: raw.inherit_env,
+            presentation: raw.presentation,
             command_explicit: cmd_explicit,
         })
     }
@@ -2731,6 +2756,15 @@ fn parse_config_inner(expanded: &str, source: &str) -> anyhow::Result<Config> {
     let mut config: Config = toml::from_str(expanded)
         .map_err(|e| anyhow::anyhow!("failed to parse config from {source}: {e}"))?;
 
+    anyhow::ensure!(
+        !config.agent.presentation.name.trim().is_empty(),
+        "agent.presentation.name must not be empty"
+    );
+    anyhow::ensure!(
+        config.agent.presentation.name.chars().count() <= 32,
+        "agent.presentation.name must be at most 32 characters"
+    );
+
     if let Some(discord) = &config.discord {
         validate_discord_project_actions(&discord.project_actions)?;
         validate_discord_project_commands(&discord.project_commands)?;
@@ -2821,6 +2855,7 @@ fn parse_config_inner(expanded: &str, source: &str) -> anyhow::Result<Config> {
                 working_dir: config.agent.working_dir.clone(),
                 env: config.agent.env.clone(),
                 inherit_env: config.agent.inherit_env.clone(),
+                presentation: config.agent.presentation.clone(),
                 command_explicit: true, // synthesized counts as explicit
             };
         }
@@ -4964,6 +4999,44 @@ cancel_strategy = "noop"
         let cfg = parse_config(toml, "test").unwrap();
         let ac = cfg.agentcore.unwrap();
         assert_eq!(ac.cancel_strategy, AgentCoreCancelStrategy::Noop);
+    }
+
+    #[test]
+    fn agent_presentation_defaults_preserve_cursor_workflows() {
+        let cfg = parse_config_str("[discord]\nbot_token = \"x\"\n", "test").unwrap();
+        assert_eq!(cfg.agent.presentation.name, "Cursor");
+        assert!(cfg.agent.presentation.local_handoff_enabled);
+        assert!(cfg.agent.presentation.local_publish_enabled);
+    }
+
+    #[test]
+    fn agent_presentation_parses_acp_capabilities() {
+        let cfg = parse_config_str(
+            r#"
+[discord]
+bot_token = "x"
+
+[agent.presentation]
+name = "OpenCode"
+local_handoff_enabled = false
+local_publish_enabled = false
+"#,
+            "test",
+        )
+        .unwrap();
+        assert_eq!(cfg.agent.presentation.name, "OpenCode");
+        assert!(!cfg.agent.presentation.local_handoff_enabled);
+        assert!(!cfg.agent.presentation.local_publish_enabled);
+    }
+
+    #[test]
+    fn agent_presentation_rejects_empty_name() {
+        let error = parse_config_str(
+            "[discord]\nbot_token = \"x\"\n[agent.presentation]\nname = \"  \"\n",
+            "test",
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("must not be empty"));
     }
 
     #[test]

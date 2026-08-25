@@ -410,6 +410,8 @@ async fn main() -> anyhow::Result<()> {
     let raw_expanded = config::load_config_raw_from_source(&config_source).await?;
 
     let mut cfg = config::parse_config_str(&raw_expanded, &config_source)?;
+    #[cfg(feature = "discord")]
+    openab_core::discord::configure_agent_presentation(cfg.agent.presentation.clone());
     info!(
         agent_cmd = %cfg.agent.command,
         pool_max = cfg.pool.max_sessions,

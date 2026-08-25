@@ -5,8 +5,8 @@ use crate::adapter::{
 };
 use crate::bot_turns::{BotTurnTracker, TurnAction, TurnSeverity, BOT_TURN_LIMIT_WARNING_PREFIX};
 use crate::config::{
-    resolve_project_action, AllowBots, AllowUsers, CronJobConfig, DiscordProjectActionConfig,
-    DiscordProjectCommandConfig, DiscordProjectCommandRunner, SttConfig,
+    resolve_project_action, AgentPresentationConfig, AllowBots, AllowUsers, CronJobConfig,
+    DiscordProjectActionConfig, DiscordProjectCommandConfig, DiscordProjectCommandRunner, SttConfig,
     PROJECT_COMMAND_RUN_CUSTOM_ID_PREFIX,
 };
 use crate::cron::{
@@ -80,6 +80,18 @@ pub(crate) const SELECT_OPTION_TEXT_MAX: usize = 100;
 
 /// Keep workspace catalogs comfortably below Discord's 2000-character limit.
 const WORKSPACE_LIST_LIMIT: usize = 25;
+
+static AGENT_PRESENTATION: OnceLock<AgentPresentationConfig> = OnceLock::new();
+
+/// Configure the process-wide Discord product identity before the client starts.
+/// Each OpenAB process owns exactly one ACP backend.
+pub fn configure_agent_presentation(presentation: AgentPresentationConfig) {
+    let _ = AGENT_PRESENTATION.set(presentation);
+}
+
+fn agent_presentation() -> &'static AgentPresentationConfig {
+    AGENT_PRESENTATION.get_or_init(AgentPresentationConfig::default)
+}
 
 pub(crate) fn first_string_select(kind: &ComponentInteractionDataKind) -> Option<&str> {
     match kind {
@@ -213,36 +225,49 @@ fn format_workspace_list(
 fn session_state_presentation(
     state: SessionState,
     externally_detached: bool,
-) -> (&'static str, u32, &'static str) {
+) -> (String, u32, String) {
+    let presentation = agent_presentation();
     if externally_detached {
         return (
-            "Cursor 接手中",
+            format!("{} 接手中", presentation.name),
             0x9B59B6,
-            "主機上的 Cursor terminal 正在使用這個 session；正常離開後再回 Discord 繼續。",
+            format!(
+                "主機上的 {} terminal 正在使用這個 session；正常離開後再回 Discord 繼續。",
+                presentation.name
+            ),
         );
     }
-    match state {
+    let (state, colour, guidance) = match state {
         SessionState::Active => (
             "執行中",
             0x2ECC71,
-            "Agent 正在處理任務；可停止目前工作，但不要同時從 Cursor 操作。",
+            if presentation.local_handoff_enabled {
+                "Agent 正在處理任務；可停止目前工作，但不要同時從 Cursor 操作。".to_string()
+            } else {
+                format!("{} 正在處理任務；可停止目前工作。", presentation.name)
+            },
         ),
         SessionState::Suspended => (
             "可在 Discord 接續",
             0xF1C40F,
-            "Session context 已保存；在這個 thread 傳送下一則訊息即可接續。",
+            "Session context 已保存；在這個 thread 傳送下一則訊息即可接續。".to_string(),
         ),
         SessionState::Persisted => (
             "可在 Discord 接續",
             0x3498DB,
-            "Session context 已保存；在這個 thread 傳送下一則訊息即可載入。",
+            "Session context 已保存；在這個 thread 傳送下一則訊息即可載入。".to_string(),
         ),
         SessionState::None => (
             "尚未開始",
             0x95A5A6,
-            "傳送第一個開發需求以建立 Cursor session，或 attach 一個本機 chat。",
+            if presentation.local_publish_enabled {
+                "傳送第一個開發需求以建立 Cursor session，或 attach 一個本機 chat。".to_string()
+            } else {
+                format!("傳送第一個開發需求以建立 {} session。", presentation.name)
+            },
         ),
-    }
+    };
+    (state.to_string(), colour, guidance)
 }
 
 const SESSION_CLOSE_CONFIRMATION: &str = "⚠️ **Close this session?** This stops current work, drops buffered messages, and removes the OpenAB session mapping. Choose whether to archive the Discord thread too. The repository and Cursor checkpoint are always kept.";
@@ -313,11 +338,12 @@ fn session_control_card(
             inline_code(&channel_id.to_string()),
             false,
         )
-        .footer(CreateEmbedFooter::new(
-            "一個 Discord thread 對應一個 Cursor session",
-        ));
+        .footer(CreateEmbedFooter::new(format!(
+            "一個 Discord thread 對應一個 {} session",
+            agent_presentation().name
+        )));
     let has_session = snapshot.state != SessionState::None;
-    let buttons = CreateActionRow::Buttons(vec![
+    let mut buttons = vec![
         CreateButton::new("oab_session:refresh")
             .label("↻ Refresh")
             .style(ButtonStyle::Secondary),
@@ -325,10 +351,16 @@ fn session_control_card(
             .label("■ Stop")
             .style(ButtonStyle::Secondary)
             .disabled(snapshot.state != SessionState::Active || snapshot.externally_detached),
-        CreateButton::new("oab_session:detach")
-            .label("↗ Prepare for Cursor")
-            .style(ButtonStyle::Primary)
-            .disabled(!has_session || snapshot.externally_detached),
+    ];
+    if agent_presentation().local_handoff_enabled {
+        buttons.push(
+            CreateButton::new("oab_session:detach")
+                .label(format!("↗ Prepare for {}", agent_presentation().name))
+                .style(ButtonStyle::Primary)
+                .disabled(!has_session || snapshot.externally_detached),
+        );
+    }
+    buttons.extend([
         CreateButton::new("oab_session:close")
             .label("✕ Close…")
             .style(ButtonStyle::Danger)
@@ -337,7 +369,7 @@ fn session_control_card(
             .label("? Help")
             .style(ButtonStyle::Secondary),
     ]);
-    let mut components = vec![buttons];
+    let mut components = vec![CreateActionRow::Buttons(buttons)];
     if let Some(task) = task.filter(|task| {
         task.queued_messages > 0 || matches!(task.state, TaskState::Queued | TaskState::Running)
     }) {
@@ -550,15 +582,23 @@ fn task_control_rows(task: &TaskRecord) -> Vec<CreateActionRow> {
                 .style(ButtonStyle::Secondary),
             help(),
         ],
-        TaskState::Ready => vec![
-            CreateButton::new("oab_session:detach")
-                .label("🖥️ Continue on computer")
-                .style(ButtonStyle::Secondary),
-            CreateButton::new("oab_session:close")
-                .label("✕ Close…")
-                .style(ButtonStyle::Danger),
-            help(),
-        ],
+        TaskState::Ready => {
+            let mut buttons = Vec::new();
+            if agent_presentation().local_handoff_enabled {
+                buttons.push(
+                    CreateButton::new("oab_session:detach")
+                        .label("🖥️ Continue on computer")
+                        .style(ButtonStyle::Secondary),
+                );
+            }
+            buttons.extend([
+                CreateButton::new("oab_session:close")
+                    .label("✕ Close…")
+                    .style(ButtonStyle::Danger),
+                help(),
+            ]);
+            buttons
+        }
         TaskState::Cursor => vec![
             CreateButton::new("oab_session:refresh")
                 .label("↻ Check status")
@@ -566,19 +606,26 @@ fn task_control_rows(task: &TaskRecord) -> Vec<CreateActionRow> {
             project(),
             help(),
         ],
-        TaskState::Failed => vec![
-            CreateButton::new("oab_task:error")
+        TaskState::Failed => {
+            let mut buttons = vec![CreateButton::new("oab_task:error")
                 .label("🔍 Error details")
-                .style(ButtonStyle::Secondary),
-            CreateButton::new("oab_session:detach")
-                .label("🖥️ Use Cursor")
-                .style(ButtonStyle::Secondary),
-            CreateButton::new("oab_session:close")
-                .label("✕ Close…")
-                .style(ButtonStyle::Danger),
-            project(),
-            help(),
-        ],
+                .style(ButtonStyle::Secondary)];
+            if agent_presentation().local_handoff_enabled {
+                buttons.push(
+                    CreateButton::new("oab_session:detach")
+                        .label(format!("🖥️ Use {}", agent_presentation().name))
+                        .style(ButtonStyle::Secondary),
+                );
+            }
+            buttons.extend([
+                CreateButton::new("oab_session:close")
+                    .label("✕ Close…")
+                    .style(ButtonStyle::Danger),
+                project(),
+                help(),
+            ]);
+            buttons
+        }
         TaskState::Closed => vec![project(), help()],
     };
 
@@ -675,7 +722,10 @@ fn project_info_embed(binding: &ProjectBinding) -> CreateEmbed {
     CreateEmbed::new()
         .title(format!("📁 @{}", binding.workspace_alias))
         .description(
-            "This channel is a project home. Each top-level development request creates an isolated Discord thread and Cursor session.",
+            format!(
+                "This channel is a project home. Each top-level development request creates an isolated Discord thread and {} session.",
+                agent_presentation().name
+            ),
         )
         .colour(0x5865F2)
         .field(
@@ -688,13 +738,19 @@ fn project_info_embed(binding: &ProjectBinding) -> CreateEmbed {
 }
 
 fn project_welcome_components(tasks: &[TaskRecord]) -> Vec<CreateActionRow> {
-    let mut rows = vec![CreateActionRow::Buttons(vec![
+    let mut primary = vec![
         CreateButton::new("oab_project:new")
             .label("▶ New task")
             .style(ButtonStyle::Primary),
-        CreateButton::new("oab_project:attach")
-            .label("📤 Attach local chat")
-            .style(ButtonStyle::Success),
+    ];
+    if agent_presentation().local_publish_enabled {
+        primary.push(
+            CreateButton::new("oab_project:attach")
+                .label("📤 Attach local chat")
+                .style(ButtonStyle::Success),
+        );
+    }
+    primary.extend([
         CreateButton::new("oab_project:actions")
             .label("⚡ New task templates")
             .style(ButtonStyle::Secondary),
@@ -704,7 +760,8 @@ fn project_welcome_components(tasks: &[TaskRecord]) -> Vec<CreateActionRow> {
         CreateButton::new("oab_help:open")
             .label("? Help")
             .style(ButtonStyle::Secondary),
-    ])];
+    ]);
+    let mut rows = vec![CreateActionRow::Buttons(primary)];
     rows.push(CreateActionRow::Buttons(vec![
         CreateButton::new("oab_project:commands")
             .label("⌨ Repository commands")
@@ -1338,14 +1395,23 @@ fn project_welcome_message(binding: &ProjectBinding, tasks: &[TaskRecord]) -> Cr
             "1 · Start a task",
             "Tap **New task** for a custom request or **New task templates** to start a new thread from a preset. **Repository commands** run without a model and never create a session.",
             false,
-        )
-        .field(
+        );
+    let embed = if agent_presentation().local_publish_enabled {
+        embed.field(
             "2 · Attach a local chat",
             "Use the button below to select a recent exited Cursor chat from this repository.",
             false,
         )
+    } else {
+        embed
+    };
+    let embed = embed
         .field(
-            "3 · Continue and control",
+            if agent_presentation().local_publish_enabled {
+                "3 · Continue and control"
+            } else {
+                "2 · Continue and control"
+            },
             "In a task thread, use **Continue**, **Quick actions**, or **Commands** to keep working without creating another thread.",
             false,
         )
@@ -1361,14 +1427,23 @@ fn project_welcome_edit(binding: &ProjectBinding, tasks: &[TaskRecord]) -> EditM
             "1 · Start a task",
             "Tap **New task** for a custom request or **New task templates** to start a new thread from a preset. **Repository commands** run without a model and never create a session.",
             false,
-        )
-        .field(
+        );
+    let embed = if agent_presentation().local_publish_enabled {
+        embed.field(
             "2 · Attach a local chat",
             "Use the button below to select a recent exited Cursor chat from this repository.",
             false,
         )
+    } else {
+        embed
+    };
+    let embed = embed
         .field(
-            "3 · Continue and control",
+            if agent_presentation().local_publish_enabled {
+                "3 · Continue and control"
+            } else {
+                "2 · Continue and control"
+            },
             "In a task thread, use **Continue**, **Quick actions**, or **Commands** to keep working without creating another thread.",
             false,
         )
@@ -1439,12 +1514,18 @@ fn help_action_center(
         .colour(0x5865F2)
         .field(
             "工作方式",
-            "Project channel = repository\nTask thread = Cursor session",
+            format!(
+                "Project channel = repository\nTask thread = {} session",
+                agent_presentation().name
+            ),
             false,
-        )
-        .footer(CreateEmbedFooter::new(
-            "Discord 與 Cursor terminal 不要同時操作同一個 session",
-        ));
+        );
+    if agent_presentation().local_handoff_enabled {
+        embed = embed.footer(CreateEmbedFooter::new(format!(
+            "Discord 與 {} terminal 不要同時操作同一個 session",
+            agent_presentation().name
+        )));
+    }
     if let Some(url) = image_url {
         embed = embed.thumbnail(url);
     }
@@ -1461,7 +1542,10 @@ fn help_action_center(
         if let Some(task) = task {
         let (_, state, _) = task_state_presentation(task.state);
         let guidance = match task.state {
-            TaskState::Ready => "可直接繼續目前 Cursor session，或執行 repository 指令。",
+            TaskState::Ready if agent_presentation().local_handoff_enabled => {
+                "可直接繼續目前 Cursor session，或執行 repository 指令。"
+            }
+            TaskState::Ready => "可直接繼續目前 session，或執行 repository 指令。",
             TaskState::Queued | TaskState::Running => {
                 "Agent 執行中：常用工作會排入佇列依序執行；repository 指令不經過 session，會立刻執行。"
             }
@@ -1512,23 +1596,34 @@ fn help_action_center(
             components.push(CreateActionRow::Buttons(task_buttons));
         }
     }
-    components.push(CreateActionRow::Buttons(vec![
+    let mut help_buttons = vec![
         CreateButton::new("oab_help:discord")
             .label("📱 Start on Discord")
             .style(ButtonStyle::Primary),
-        CreateButton::new("oab_help:cursor")
-            .label("🖥️ Continue on computer")
-            .style(ButtonStyle::Secondary),
-        CreateButton::new("oab_help:attach")
-            .label("📤 Publish local chat")
-            .style(ButtonStyle::Secondary),
+    ];
+    if agent_presentation().local_handoff_enabled {
+        help_buttons.push(
+            CreateButton::new("oab_help:cursor")
+                .label("🖥️ Continue on computer")
+                .style(ButtonStyle::Secondary),
+        );
+    }
+    if agent_presentation().local_publish_enabled {
+        help_buttons.push(
+            CreateButton::new("oab_help:attach")
+                .label("📤 Publish local chat")
+                .style(ButtonStyle::Secondary),
+        );
+    }
+    help_buttons.extend([
         CreateButton::new("oab_help:sessions")
             .label("🧠 Manage sessions")
             .style(ButtonStyle::Secondary),
         CreateButton::new("oab_help:troubleshoot")
             .label("🛠️ Troubleshoot")
             .style(ButtonStyle::Secondary),
-    ]));
+    ]);
+    components.push(CreateActionRow::Buttons(help_buttons));
     let mut utility_buttons = Vec::new();
     if all_sessions_enabled {
         utility_buttons.push(
@@ -1681,11 +1776,13 @@ fn help_project_message(
                 .label("▶ New task")
                 .style(ButtonStyle::Primary),
         );
-        buttons.push(
-            CreateButton::new("oab_project:attach")
-                .label("📤 Attach local chat")
-                .style(ButtonStyle::Secondary),
-        );
+        if agent_presentation().local_publish_enabled {
+            buttons.push(
+                CreateButton::new("oab_project:attach")
+                    .label("📤 Attach local chat")
+                    .style(ButtonStyle::Secondary),
+            );
+        }
         buttons.push(
             CreateButton::new("oab_project:actions")
                 .label("⚡ New task templates")
@@ -3580,6 +3677,59 @@ impl EventHandler for Handler {
     async fn ready(&self, ctx: Context, ready: Ready) {
         info!(user = %ready.user.name, "discord bot connected");
 
+        let session_description = if agent_presentation().local_handoff_enabled
+            && agent_presentation().local_publish_enabled
+        {
+            format!(
+                "Attach, inspect, detach, or close a {} session",
+                agent_presentation().name
+            )
+        } else {
+            format!("Manage {} session lifecycle", agent_presentation().name)
+        };
+        let mut session_command = CreateCommand::new("session")
+            .description(session_description)
+            .add_option(CreateCommandOption::new(
+                CommandOptionType::SubCommand,
+                "status",
+                "Show session lifecycle state and workspace",
+            ));
+        if agent_presentation().local_publish_enabled {
+            session_command = session_command.add_option(
+                CreateCommandOption::new(
+                    CommandOptionType::SubCommand,
+                    "attach",
+                    "Attach an exited local chat to this project or thread",
+                )
+                .add_sub_option(
+                    CreateCommandOption::new(
+                        CommandOptionType::String,
+                        "chat_id",
+                        "Select a recent exited chat from this project",
+                    )
+                    .required(true)
+                    .set_autocomplete(true),
+                )
+                .add_sub_option(CreateCommandOption::new(
+                    CommandOptionType::String,
+                    "title",
+                    "New thread title when run in a project channel",
+                )),
+            );
+        }
+        if agent_presentation().local_handoff_enabled {
+            session_command = session_command.add_option(CreateCommandOption::new(
+                CommandOptionType::SubCommand,
+                "detach",
+                "Pause Discord ownership so a local ACP client can resume it",
+            ));
+        }
+        session_command = session_command.add_option(CreateCommandOption::new(
+            CommandOptionType::SubCommand,
+            "close",
+            "Close this session and clear buffered messages",
+        ));
+
         // Build the shared command list once.
         let commands = vec![
             CreateCommand::new("models").description("Select the AI model for this session"),
@@ -3588,8 +3738,13 @@ impl EventHandler for Handler {
             CreateCommand::new("cancel-all")
                 .description("Cancel current operation and drop all buffered messages"),
             CreateCommand::new("reset").description("Reset the conversation session"),
-            CreateCommand::new("help")
-                .description("Show the Discord and Cursor handoff quick guide"),
+            CreateCommand::new("help").description(
+                if agent_presentation().local_handoff_enabled {
+                    "Show the Discord and Cursor handoff quick guide"
+                } else {
+                    "Show the Discord development quick guide"
+                },
+            ),
             CreateCommand::new("workspace")
                 .description("Inspect workspace routing for this channel or session")
                 .add_option(CreateCommandOption::new(
@@ -3602,44 +3757,7 @@ impl EventHandler for Handler {
                     "list",
                     "List configured workspace aliases",
                 )),
-            CreateCommand::new("session")
-                .description("Attach, inspect, detach, or close a Cursor session")
-                .add_option(CreateCommandOption::new(
-                    CommandOptionType::SubCommand,
-                    "status",
-                    "Show session lifecycle state and workspace",
-                ))
-                .add_option(
-                    CreateCommandOption::new(
-                        CommandOptionType::SubCommand,
-                        "attach",
-                        "Attach an exited local Cursor chat to this project or thread",
-                    )
-                    .add_sub_option(
-                        CreateCommandOption::new(
-                            CommandOptionType::String,
-                            "chat_id",
-                            "Select a recent exited Cursor chat from this project",
-                        )
-                        .required(true)
-                        .set_autocomplete(true),
-                    )
-                    .add_sub_option(CreateCommandOption::new(
-                        CommandOptionType::String,
-                        "title",
-                        "New thread title when run in a project channel",
-                    )),
-                )
-                .add_option(CreateCommandOption::new(
-                    CommandOptionType::SubCommand,
-                    "detach",
-                    "Pause Discord ownership so a local ACP client can resume it",
-                ))
-                .add_option(CreateCommandOption::new(
-                    CommandOptionType::SubCommand,
-                    "close",
-                    "Close this session and clear buffered messages",
-                )),
+            session_command,
             CreateCommand::new("project")
                 .description("Create and manage private workspace channels")
                 .default_member_permissions(Permissions::MANAGE_CHANNELS)
@@ -4167,6 +4285,20 @@ impl Handler {
             permissions,
         );
         let task = self.task_registry.task_for_thread(comp.channel_id.get());
+        if (topic == "cursor" && !agent_presentation().local_handoff_enabled)
+            || (topic == "attach" && !agent_presentation().local_publish_enabled)
+        {
+            let response = CreateInteractionResponse::Message(
+                CreateInteractionResponseMessage::new()
+                    .content(format!(
+                        "⚠️ {} does not support this local workflow.",
+                        agent_presentation().name
+                    ))
+                    .ephemeral(true),
+            );
+            let _ = comp.create_response(&ctx.http, response).await;
+            return;
+        }
         if matches!(topic, "open" | "back") {
             let avatar_url = ctx.cache.current_user().avatar_url();
             let response = if topic == "back" {
@@ -5433,6 +5565,18 @@ impl Handler {
             })
             .unwrap_or(&[]);
         if subcommand == "attach" {
+            if !agent_presentation().local_publish_enabled {
+                let response = CreateInteractionResponse::Message(
+                    CreateInteractionResponseMessage::new()
+                        .content(format!(
+                            "⚠️ {} does not support publishing local chats.",
+                            agent_presentation().name
+                        ))
+                        .ephemeral(true),
+                );
+                let _ = cmd.create_response(&ctx.http, response).await;
+                return;
+            }
             let chat_id = options
                 .iter()
                 .find(|option| option.name == "chat_id")
@@ -5488,6 +5632,18 @@ impl Handler {
         }
 
         let mut task_state_update = None;
+        if subcommand == "detach" && !agent_presentation().local_handoff_enabled {
+            let _ = cmd
+                .edit_response(
+                    &ctx.http,
+                    EditInteractionResponse::new().content(format!(
+                        "⚠️ {} does not support local session handoff.",
+                        agent_presentation().name
+                    )),
+                )
+                .await;
+            return;
+        }
         let content = if subcommand == "close" {
             let dropped = self
                 .dispatcher
@@ -5567,6 +5723,19 @@ impl Handler {
             .custom_id
             .strip_prefix("oab_session:")
             .unwrap_or("");
+
+        if action == "detach" && !agent_presentation().local_handoff_enabled {
+            let response = CreateInteractionResponse::Message(
+                CreateInteractionResponseMessage::new()
+                    .content(format!(
+                        "⚠️ {} does not support local session handoff.",
+                        agent_presentation().name
+                    ))
+                    .ephemeral(true),
+            );
+            let _ = comp.create_response(&ctx.http, response).await;
+            return;
+        }
 
         if action == "close" {
             let confirmation = CreateInteractionResponseMessage::new()
@@ -6287,6 +6456,18 @@ impl Handler {
             return;
         }
         if action == "attach" {
+            if !agent_presentation().local_publish_enabled {
+                let response = CreateInteractionResponse::Message(
+                    CreateInteractionResponseMessage::new()
+                        .content(format!(
+                            "⚠️ {} does not support publishing local chats.",
+                            agent_presentation().name
+                        ))
+                        .ephemeral(true),
+                );
+                let _ = comp.create_response(&ctx.http, response).await;
+                return;
+            }
             let chats = match self.available_cursor_chats(&binding, "").await {
                 Ok(chats) => chats,
                 Err(error) => {
@@ -6882,6 +7063,18 @@ impl Handler {
         ctx: &Context,
         modal: &serenity::model::application::ModalInteraction,
     ) {
+        if !agent_presentation().local_publish_enabled {
+            let response = CreateInteractionResponse::Message(
+                CreateInteractionResponseMessage::new()
+                    .content(format!(
+                        "⚠️ {} does not support publishing local chats.",
+                        agent_presentation().name
+                    ))
+                    .ephemeral(true),
+            );
+            let _ = modal.create_response(&ctx.http, response).await;
+            return;
+        }
         if modal.user.bot
             || is_denied_user(
                 false,
@@ -7188,6 +7381,18 @@ impl Handler {
         ctx: &Context,
         comp: &serenity::model::application::ComponentInteraction,
     ) {
+        if !agent_presentation().local_publish_enabled {
+            let response = CreateInteractionResponse::Message(
+                CreateInteractionResponseMessage::new()
+                    .content(format!(
+                        "⚠️ {} does not support publishing local chats.",
+                        agent_presentation().name
+                    ))
+                    .ephemeral(true),
+            );
+            let _ = comp.create_response(&ctx.http, response).await;
+            return;
+        }
         if comp.user.bot
             || is_denied_user(
                 false,
