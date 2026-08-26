@@ -55,6 +55,7 @@ use serenity::model::gateway::Ready;
 use serenity::model::id::{ChannelId, MessageId, UserId};
 use serenity::model::permissions::Permissions;
 use serenity::prelude::*;
+use serde::Deserialize;
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::LazyLock;
@@ -744,6 +745,123 @@ struct KnowledgeScheduledSource {
     description: &'static str,
 }
 
+const KNOWLEDGE_CARDS_PREFIX: &str = "OPENAB_KNOWLEDGE_CARDS_V1";
+
+#[derive(Debug, Deserialize)]
+struct KnowledgeCardEnvelope {
+    kind: String,
+    heading: String,
+    items: Vec<KnowledgeCardItem>,
+}
+
+#[derive(Debug, Deserialize)]
+struct KnowledgeCardItem {
+    title: String,
+    url: String,
+    #[serde(default)]
+    meta: String,
+    #[serde(default)]
+    summary: String,
+    #[serde(default)]
+    source_id: String,
+    #[serde(default)]
+    target_page_id: String,
+    #[serde(default)]
+    queue_page_id: String,
+    #[serde(default)]
+    delete_after: String,
+}
+
+fn truncate_chars(value: &str, max: usize) -> String {
+    if value.chars().count() <= max {
+        return value.to_string();
+    }
+    if max == 0 {
+        return String::new();
+    }
+    let shortened = value.chars().take(max - 1).collect::<String>();
+    format!("{}…", shortened.trim_end())
+}
+
+fn compact_notion_page_id(value: &str) -> Option<String> {
+    let compact = value.replace('-', "");
+    (compact.len() == 32 && compact.chars().all(|ch| ch.is_ascii_hexdigit()))
+        .then(|| compact.to_ascii_lowercase())
+}
+
+fn knowledge_source_is_known(source_id: &str) -> bool {
+    knowledge_scheduled_source(source_id).is_some()
+}
+
+fn knowledge_cards_message(content: &str) -> Option<CreateMessage> {
+    let (prefix, payload) = content.trim().split_once('\n')?;
+    if prefix.trim() != KNOWLEDGE_CARDS_PREFIX {
+        return None;
+    }
+    let envelope: KnowledgeCardEnvelope = serde_json::from_str(payload.trim()).ok()?;
+    if envelope.items.is_empty() || envelope.items.len() > 5 {
+        return None;
+    }
+    if envelope.kind != "search" && envelope.kind != "retention" {
+        return None;
+    }
+
+    let mut embeds = Vec::with_capacity(envelope.items.len());
+    let mut keep_options = Vec::new();
+    for item in &envelope.items {
+        if !item.url.starts_with("https://app.notion.com/") || item.title.trim().is_empty() {
+            return None;
+        }
+        let mut description = String::new();
+        if !item.meta.trim().is_empty() {
+            description.push_str(&format!("**{}**", truncate_chars(item.meta.trim(), 160)));
+        }
+        if !item.summary.trim().is_empty() {
+            if !description.is_empty() {
+                description.push_str("\n\n");
+            }
+            description.push_str(&truncate_chars(item.summary.trim(), 280));
+        }
+        if envelope.kind == "retention" {
+            if item.delete_after.trim().is_empty() || !knowledge_source_is_known(&item.source_id) {
+                return None;
+            }
+            let target_page_id = compact_notion_page_id(&item.target_page_id)?;
+            let queue_page_id = compact_notion_page_id(&item.queue_page_id)?;
+            if !description.is_empty() {
+                description.push_str("\n\n");
+            }
+            description.push_str(&format!("預定清理：`{}`", truncate_chars(item.delete_after.trim(), 32)));
+            keep_options.push(
+                CreateSelectMenuOption::new(
+                    truncate_chars(&format!("保留｜{}", item.title.trim()), 100),
+                    format!("{}|{}|{}", item.source_id, target_page_id, queue_page_id),
+                )
+                .description("取消這筆待刪除項目"),
+            );
+        }
+        embeds.push(
+            CreateEmbed::new()
+                .title(truncate_chars(item.title.trim(), 120))
+                .url(item.url.trim())
+                .description(description)
+                .colour(if envelope.kind == "retention" { 0xE67E22 } else { 0x2F80ED }),
+        );
+    }
+
+    let mut message = CreateMessage::new()
+        .content(truncate_chars(envelope.heading.trim(), 240))
+        .embeds(embeds);
+    if envelope.kind == "retention" {
+        message = message.components(vec![CreateActionRow::SelectMenu(CreateSelectMenu::new(
+            "oab_knowledge:retention_keep",
+            CreateSelectMenuKind::String { options: keep_options },
+        )
+        .placeholder("選擇要永久保留的文章"))]);
+    }
+    Some(message)
+}
+
 const KNOWLEDGE_SCHEDULED_SOURCES: [KnowledgeScheduledSource; 3] = [
     KnowledgeScheduledSource {
         id: "github_ai_data_weekly",
@@ -793,7 +911,7 @@ fn knowledge_scheduled_source_message(
             CreateEmbed::new()
                 .title(source.title)
                 .description(
-                    "選擇要執行的操作。查詢與整理維持唯讀；清理會先列出重複群組、保留項與待刪頁面，仍須在 thread 內文字確認。",
+                    "選擇要執行的操作。搜尋會使用這個來源的原生欄位並以文章卡片回傳；待刪除清單可直接選擇要永久保留的項目。",
                 )
                 .colour(0x2F80ED),
         )
@@ -807,32 +925,48 @@ fn knowledge_scheduled_source_message(
             CreateButton::new(format!("oab_knowledge:source_synthesis:{}", source.id))
                 .label("📊 跨期整理")
                 .style(ButtonStyle::Secondary),
-            CreateButton::new(format!("oab_knowledge:source_cleanup:{}", source.id))
-                .label("🧹 清理重複")
+            CreateButton::new(format!("oab_knowledge:source_retention:{}", source.id))
+                .label("🗑️ 待刪除")
                 .style(ButtonStyle::Secondary),
         ])])
         .ephemeral(true)
 }
 
 fn knowledge_scheduled_source_search_modal(source: KnowledgeScheduledSource) -> CreateModal {
+    let text = |label, id, placeholder| {
+        CreateActionRow::InputText(
+            CreateInputText::new(InputTextStyle::Short, label, id)
+                .placeholder(placeholder)
+                .max_length(300)
+                .required(false),
+        )
+    };
+    let components = match source.id {
+        "world_stories" => vec![
+            text("標題包含", "title", "例如：日本、王室、文化資產"),
+            text("分類或國家", "native_filter", "例如：王室、Japan"),
+            text("精選／待深入研究", "state", "Featured、Read Later 或不限"),
+            text("故事類型", "secondary_filter", "News、History、Culture…"),
+            text("時間範圍", "range", "例如：最近 4 週、2026 年 8 月"),
+        ],
+        "weekly_reading_digest" => vec![
+            text("標題包含", "title", "例如：Agent reliability"),
+            text("最低推薦度", "native_filter", "例如：★★★★☆"),
+            text("主題", "secondary_filter", "例如：AI Agent、Data Platform"),
+            text("閱讀狀態", "state", "待讀、已讀、收藏、略過"),
+            text("時間範圍", "range", "例如：最近 4 週、2026 年 8 月"),
+        ],
+        _ => vec![
+            text("標題包含", "title", "例如：GitHub AI & Data Weekly"),
+            text("內容關鍵字", "native_filter", "例如：Context Database"),
+            text("週次或時間範圍", "range", "例如：最近 4 期、2026 年 8 月"),
+        ],
+    };
     CreateModal::new(
         format!("oab_knowledge_modal:source_search:{}", source.id),
-        "搜尋排程資料庫",
+        "搜尋排程來源",
     )
-    .components(vec![
-        CreateActionRow::InputText(
-            CreateInputText::new(InputTextStyle::Paragraph, "想查詢的問題", "question")
-                .placeholder("例如：最近有哪些 Agent reliability 文章？")
-                .min_length(1)
-                .max_length(4000),
-        ),
-        CreateActionRow::InputText(
-            CreateInputText::new(InputTextStyle::Short, "時間範圍（選填）", "range")
-                .placeholder("例如：最近 4 期、2026 年 8 月")
-                .max_length(200)
-                .required(false),
-        ),
-    ])
+    .components(components)
 }
 
 fn knowledge_scheduled_source_prompt(
@@ -842,15 +976,15 @@ fn knowledge_scheduled_source_prompt(
     let (title, instruction) = match operation {
         "latest" => (
             format!("{}｜最新文章", source.title),
-            "使用 notion-knowledge Skill 的 Search 模式，唯讀列出最新 5 筆實際文章。依來源資料庫的發布日期或期別由新到舊排序；附上標題、日期、簡短摘要與 Notion 連結。不要把資料庫首頁、View 或 Hub 當成文章，也不要修改 Notion。".to_string(),
+            "使用 notion-knowledge Skill 的 Scheduled Source Search 模式，唯讀列出最新 5 筆實際文章或週報。依來源原生日期或期別由新到舊排序；讀取 discord-cards.md 並依 search card contract 回覆。不要把資料庫首頁、View 或 Hub 當成文章，也不要修改 Notion。".to_string(),
         ),
         "synthesis" => (
             format!("{}｜跨期整理", source.title),
             "使用 notion-knowledge Skill 的 Synthesis 模式，唯讀比較最近 3 期的實際文章。整理重複趨勢、各期獨有主題與值得追蹤的變化，保留日期或期別並附上相關 Notion 連結。不要修改 Notion。".to_string(),
         ),
-        "cleanup" => (
-            format!("{}｜清理重複", source.title),
-            "使用 notion-knowledge Skill 的 Scheduled Source Audit 模式，完整檢查這個來源資料庫內的重複文章。先以 canonical URL 分組，再 fetch 標題相似的候選逐筆核對。只產生清理預覽：每組列出判定理由、建議保留頁面、確切待刪頁面與可能遺失的資訊。不要刪除、封存或修改任何 Notion 頁面；等待我在 thread 針對這批目標文字確認。".to_string(),
+        "retention" => (
+            format!("{}｜待刪除", source.title),
+            "使用 notion-knowledge Skill 的 Retention Review 模式，唯讀查詢 Knowledge Retention Queue 中這個來源 Decision = Pending 的項目，依 Delete After 由近到遠列出最多 5 筆。讀取 discord-cards.md 並依 retention card contract 回覆；不要新增 Queue 項目，也不要修改或刪除來源。".to_string(),
         ),
         _ => return None,
     };
@@ -2314,7 +2448,11 @@ impl ChatAdapter for DiscordAdapter {
         content: &str,
     ) -> anyhow::Result<MessageRef> {
         let ch_id: u64 = Self::resolve_channel(channel).parse()?;
-        let msg = ChannelId::new(ch_id).say(&self.http, content).await?;
+        let msg = if let Some(builder) = knowledge_cards_message(content) {
+            ChannelId::new(ch_id).send_message(&self.http, builder).await?
+        } else {
+            ChannelId::new(ch_id).say(&self.http, content).await?
+        };
         Ok(MessageRef {
             channel: channel.clone(),
             message_id: msg.id.to_string(),
@@ -2355,8 +2493,8 @@ impl ChatAdapter for DiscordAdapter {
             // Invalid message ID, fall back to plain send
             return self.send_message(channel, content).await;
         }
-        let builder = serenity::builder::CreateMessage::new()
-            .content(content)
+        let builder = knowledge_cards_message(content)
+            .unwrap_or_else(|| serenity::builder::CreateMessage::new().content(content))
             .reference_message((ChannelId::new(ch_id), MessageId::new(msg_id)));
         match ChannelId::new(ch_id)
             .send_message(&self.http, builder)
@@ -5333,6 +5471,55 @@ impl Handler {
             }
             return;
         }
+        if action == "retention_keep" {
+            let selected = first_string_select(&comp.data.kind).and_then(|value| {
+                let mut parts = value.split('|');
+                let source_id = parts.next()?;
+                let target_page_id = compact_notion_page_id(parts.next()?)?;
+                let queue_page_id = compact_notion_page_id(parts.next()?)?;
+                if parts.next().is_some() || !knowledge_source_is_known(source_id) {
+                    return None;
+                }
+                Some((source_id.to_string(), target_page_id, queue_page_id))
+            });
+            let Some((source_id, target_page_id, queue_page_id)) = selected else {
+                let _ = comp.create_response(
+                    &ctx.http,
+                    CreateInteractionResponse::Message(
+                        CreateInteractionResponseMessage::new()
+                            .content("⚠️ 這筆待刪除操作已失效，請重新查詢待刪除清單。")
+                            .ephemeral(true),
+                    ),
+                ).await;
+                return;
+            };
+            if let Err(error) = comp.defer_ephemeral(&ctx.http).await {
+                tracing::error!(%error, "failed to defer retention keep request");
+                return;
+            }
+            let source = knowledge_scheduled_source(&source_id).expect("validated source");
+            let prompt = format!(
+                "使用 notion-knowledge Skill 的 Retention Review 模式執行 Retention Keep。這次 Discord 選單操作是使用者對下列單一 Queue 項目的明確保留授權。先依 retention.md fetch 並核對 Queue row、target 與 source；只有 Decision 為 Pending 或 Trash Due 且所有 ID 相符時，才把 Queue Decision 設為 Keep、Confirmed By 設為 Discord user ID、Processed At 設為今天。不要修改來源頁面。寫入後重新 fetch 驗證。\n\nsource_id: {source_id}\ntarget_page_id: {target_page_id}\nqueue_page_id: {queue_page_id}\nDiscord user ID: {}",
+                comp.user.id.get()
+            );
+            let result = self
+                .submit_knowledge_prompt(
+                    ctx,
+                    scope,
+                    &comp.user,
+                    &format!("{}｜永久保留", source.title),
+                    prompt,
+                )
+                .await;
+            let content = result.map_or_else(
+                |error| format!("⚠️ 無法開始保留操作：{error}"),
+                |thread_id| format!("✅ 已在 <#{thread_id}> 開始核對並保留這筆文章。"),
+            );
+            let _ = comp
+                .edit_response(&ctx.http, EditInteractionResponse::new().content(content))
+                .await;
+            return;
+        }
         if let Some(source_action) = action.strip_prefix("source_") {
             let selected = source_action
                 .split_once(':')
@@ -5407,7 +5594,7 @@ impl Handler {
                 CreateEmbed::new()
                     .title("❓ 知識整理小幫手使用方式")
                     .description(
-                        "**收錄文章**：先整理欄位與重複項目，確認後才寫入。\n**查詢知識**：唯讀搜尋 Notion 並附來源。\n**專案筆記**：比對既有 Project 文件後提出新增或更新建議。\n**最近收錄**：唯讀列出 Knowledge Library 最近 5 筆。\n**排程資料庫**：從下拉選單選擇固定來源，可查看最新文章、搜尋、跨期整理或產生重複清理預覽。",
+                        "**收錄文章**：先整理欄位與重複項目，確認後才寫入。\n**查詢知識**：唯讀搜尋 Notion 並附來源。\n**專案筆記**：比對既有 Project 文件後提出新增或更新建議。\n**最近收錄**：唯讀列出 Knowledge Library 最近 5 筆。\n**排程來源**：從下拉選單選擇固定來源，可查看最新文章、依原生欄位搜尋、跨期整理或查看待刪除清單。",
                     )
                     .colour(0x2F80ED),
             ).ephemeral(true);
@@ -5470,15 +5657,16 @@ impl Handler {
             .unwrap_or("未提供");
         let request = if let Some(source_id) = action.strip_prefix("source_search:") {
             let source = knowledge_scheduled_source(source_id);
-            let question = modal_input_value(modal, "question")
-                .map(str::trim)
-                .filter(|value| !value.is_empty());
-            source.zip(question).map(|(source, question)| {
+            source.map(|source| {
                 (
                     format!("{}｜搜尋內容", source.title),
                     format!(
-                        "使用 notion-knowledge Skill 的 Search／Synthesis 模式，唯讀搜尋指定排程資料庫的實際文章並附上相關 Notion 連結。保留日期或期別，不要把資料庫首頁、View 或 Hub 當成文章，也不要修改 Notion。\n\n固定排程資料庫：{}\n只能操作這個已選定的來源，不要改查其他同名資料庫。\n\n問題：\n{question}\n\n時間範圍：{}",
+                        "使用 notion-knowledge Skill 的 Scheduled Source Search 模式，依 scheduled-sources.md 使用指定來源的原生欄位做唯讀查詢。資料庫條件必須使用參數化 SQL；最低推薦度要轉成明確允許值，不能直接比較星號字串。讀取 discord-cards.md 並以 search card contract 回傳最多 5 筆。不要把資料庫首頁、View 或 Hub 當成文章，也不要修改 Notion。\n\n固定排程來源：{}\n只能操作這個已選定的來源，不要改查其他同名資料庫。\n\n標題包含：{}\n原生條件一：{}\n原生條件二：{}\n狀態條件：{}\n時間範圍：{}",
                         source.title,
+                        optional("title"),
+                        optional("native_filter"),
+                        optional("secondary_filter"),
+                        optional("state"),
                         optional("range"),
                     ),
                 )
@@ -10202,7 +10390,7 @@ mod tests {
     }
 
     #[test]
-    fn scheduled_source_actions_are_fixed_and_cleanup_is_preview_only() {
+    fn scheduled_source_actions_expose_native_search_and_retention() {
         let source = knowledge_scheduled_source("github_ai_data_weekly").unwrap();
         let rendered = serde_json::to_value(knowledge_scheduled_source_message(source))
             .unwrap()
@@ -10210,13 +10398,13 @@ mod tests {
         assert!(rendered.contains("oab_knowledge:source_latest:github_ai_data_weekly"));
         assert!(rendered.contains("oab_knowledge:source_search:github_ai_data_weekly"));
         assert!(rendered.contains("oab_knowledge:source_synthesis:github_ai_data_weekly"));
-        assert!(rendered.contains("oab_knowledge:source_cleanup:github_ai_data_weekly"));
-        assert!(rendered.contains("文字確認"));
+        assert!(rendered.contains("oab_knowledge:source_retention:github_ai_data_weekly"));
+        assert!(rendered.contains("永久保留"));
 
-        let (_, cleanup) = knowledge_scheduled_source_prompt(source, "cleanup").unwrap();
-        assert!(cleanup.contains("只產生清理預覽"));
-        assert!(cleanup.contains("不要刪除、封存或修改"));
-        assert!(cleanup.contains(source.title));
+        let (_, retention) = knowledge_scheduled_source_prompt(source, "retention").unwrap();
+        assert!(retention.contains("Knowledge Retention Queue"));
+        assert!(retention.contains("不要新增 Queue 項目"));
+        assert!(retention.contains(source.title));
         assert!(knowledge_scheduled_source_prompt(source, "delete").is_none());
         assert!(knowledge_scheduled_source("unknown").is_none());
     }
@@ -10243,8 +10431,46 @@ mod tests {
             .unwrap()
             .to_string();
         assert!(source_search.contains("oab_knowledge_modal:source_search:world_stories"));
-        assert!(source_search.contains("question"));
+        assert!(source_search.contains("native_filter"));
+        assert!(source_search.contains("secondary_filter"));
+        assert!(source_search.contains("state"));
         assert!(source_search.contains("range"));
+    }
+
+    #[test]
+    fn knowledge_search_card_contract_renders_notion_embeds() {
+        let payload = concat!(
+            "OPENAB_KNOWLEDGE_CARDS_V1\n",
+            r#"{"kind":"search","heading":"找到 1 篇","items":[{"title":"Agent reliability","url":"https://www.notion.so/example-retention-queue","meta":"★★★★★ · AI Agent","summary":"Production reliability notes"}]}"#,
+        );
+        let rendered = serde_json::to_value(knowledge_cards_message(payload).unwrap())
+            .unwrap()
+            .to_string();
+        assert!(rendered.contains("Agent reliability"));
+        assert!(rendered.contains("Production reliability notes"));
+        assert!(!rendered.contains("retention_keep"));
+        assert_eq!(truncate_chars("abcdef", 4), "abc…");
+        assert_eq!(truncate_chars("abc", 4), "abc");
+        assert_eq!(truncate_chars("abc", 0), "");
+    }
+
+    #[test]
+    fn knowledge_retention_cards_validate_ids_and_expose_keep_select() {
+        let payload = concat!(
+            "OPENAB_KNOWLEDGE_CARDS_V1\n",
+            r#"{"kind":"retention","heading":"待確認","items":[{"title":"Old article","url":"https://www.notion.so/example-retention-queue","meta":"Example User Reading List","summary":"45 days old","source_id":"weekly_reading_digest","target_page_id":"eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee","queue_page_id":"ffffffffffffffffffffffffffffffff","delete_after":"2026-09-02"}]}"#,
+        );
+        let rendered = serde_json::to_value(knowledge_cards_message(payload).unwrap())
+            .unwrap()
+            .to_string();
+        assert!(rendered.contains("oab_knowledge:retention_keep"));
+        assert!(rendered.contains("weekly_reading_digest|eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee|ffffffffffffffffffffffffffffffff"));
+        assert!(rendered.contains("2026-09-02"));
+
+        assert!(knowledge_cards_message(
+            "OPENAB_KNOWLEDGE_CARDS_V1\n{\"kind\":\"retention\",\"heading\":\"bad\",\"items\":[{\"title\":\"x\",\"url\":\"https://evil.example/x\",\"source_id\":\"world_stories\",\"target_page_id\":\"bad\",\"queue_page_id\":\"bad\",\"delete_after\":\"2026-09-02\"}]}"
+        )
+        .is_none());
     }
 
     #[test]
