@@ -737,13 +737,139 @@ fn project_info_embed(binding: &ProjectBinding) -> CreateEmbed {
         .footer(CreateEmbedFooter::new("Managed by OpenAB"))
 }
 
+#[derive(Clone, Copy)]
+struct KnowledgeScheduledSource {
+    id: &'static str,
+    title: &'static str,
+    description: &'static str,
+}
+
+const KNOWLEDGE_SCHEDULED_SOURCES: [KnowledgeScheduledSource; 3] = [
+    KnowledgeScheduledSource {
+        id: "github_ai_data_weekly",
+        title: "📚 GitHub AI & Data Weekly",
+        description: "AI、Data 與 GitHub 每週精選",
+    },
+    KnowledgeScheduledSource {
+        id: "world_stories",
+        title: "🌍 World Stories｜世界人物・王室・文化故事",
+        description: "世界人物、王室與文化故事",
+    },
+    KnowledgeScheduledSource {
+        id: "weekly_reading_digest",
+        title: "📚 週六精選文章｜Example User Reading List",
+        description: "每週六精選閱讀清單",
+    },
+];
+
+fn knowledge_scheduled_source(id: &str) -> Option<KnowledgeScheduledSource> {
+    KNOWLEDGE_SCHEDULED_SOURCES
+        .iter()
+        .copied()
+        .find(|source| source.id == id)
+}
+
+fn knowledge_scheduled_source_select() -> CreateActionRow {
+    let options = KNOWLEDGE_SCHEDULED_SOURCES
+        .iter()
+        .map(|source| {
+            CreateSelectMenuOption::new(source.title, source.id).description(source.description)
+        })
+        .collect();
+    CreateActionRow::SelectMenu(
+        CreateSelectMenu::new(
+            "oab_knowledge:scheduled_source",
+            CreateSelectMenuKind::String { options },
+        )
+        .placeholder("選擇排程資料庫"),
+    )
+}
+
+fn knowledge_scheduled_source_message(
+    source: KnowledgeScheduledSource,
+) -> CreateInteractionResponseMessage {
+    CreateInteractionResponseMessage::new()
+        .embed(
+            CreateEmbed::new()
+                .title(source.title)
+                .description(
+                    "選擇要執行的操作。查詢與整理維持唯讀；清理會先列出重複群組、保留項與待刪頁面，仍須在 thread 內文字確認。",
+                )
+                .colour(0x2F80ED),
+        )
+        .components(vec![CreateActionRow::Buttons(vec![
+            CreateButton::new(format!("oab_knowledge:source_latest:{}", source.id))
+                .label("🆕 最新文章")
+                .style(ButtonStyle::Primary),
+            CreateButton::new(format!("oab_knowledge:source_search:{}", source.id))
+                .label("🔎 搜尋內容")
+                .style(ButtonStyle::Secondary),
+            CreateButton::new(format!("oab_knowledge:source_synthesis:{}", source.id))
+                .label("📊 跨期整理")
+                .style(ButtonStyle::Secondary),
+            CreateButton::new(format!("oab_knowledge:source_cleanup:{}", source.id))
+                .label("🧹 清理重複")
+                .style(ButtonStyle::Secondary),
+        ])])
+        .ephemeral(true)
+}
+
+fn knowledge_scheduled_source_search_modal(source: KnowledgeScheduledSource) -> CreateModal {
+    CreateModal::new(
+        format!("oab_knowledge_modal:source_search:{}", source.id),
+        "搜尋排程資料庫",
+    )
+    .components(vec![
+        CreateActionRow::InputText(
+            CreateInputText::new(InputTextStyle::Paragraph, "想查詢的問題", "question")
+                .placeholder("例如：最近有哪些 Agent reliability 文章？")
+                .min_length(1)
+                .max_length(4000),
+        ),
+        CreateActionRow::InputText(
+            CreateInputText::new(InputTextStyle::Short, "時間範圍（選填）", "range")
+                .placeholder("例如：最近 4 期、2026 年 8 月")
+                .max_length(200)
+                .required(false),
+        ),
+    ])
+}
+
+fn knowledge_scheduled_source_prompt(
+    source: KnowledgeScheduledSource,
+    operation: &str,
+) -> Option<(String, String)> {
+    let (title, instruction) = match operation {
+        "latest" => (
+            format!("{}｜最新文章", source.title),
+            "使用 notion-knowledge Skill 的 Search 模式，唯讀列出最新 5 筆實際文章。依來源資料庫的發布日期或期別由新到舊排序；附上標題、日期、簡短摘要與 Notion 連結。不要把資料庫首頁、View 或 Hub 當成文章，也不要修改 Notion。".to_string(),
+        ),
+        "synthesis" => (
+            format!("{}｜跨期整理", source.title),
+            "使用 notion-knowledge Skill 的 Synthesis 模式，唯讀比較最近 3 期的實際文章。整理重複趨勢、各期獨有主題與值得追蹤的變化，保留日期或期別並附上相關 Notion 連結。不要修改 Notion。".to_string(),
+        ),
+        "cleanup" => (
+            format!("{}｜清理重複", source.title),
+            "使用 notion-knowledge Skill 的 Scheduled Source Audit 模式，完整檢查這個來源資料庫內的重複文章。先以 canonical URL 分組，再 fetch 標題相似的候選逐筆核對。只產生清理預覽：每組列出判定理由、建議保留頁面、確切待刪頁面與可能遺失的資訊。不要刪除、封存或修改任何 Notion 頁面；等待我在 thread 針對這批目標文字確認。".to_string(),
+        ),
+        _ => return None,
+    };
+    Some((
+        title,
+        format!(
+            "{instruction}\n\n固定排程資料庫：{}\n只能操作這個已選定的來源，不要改查其他同名資料庫。",
+            source.title
+        ),
+    ))
+}
+
 fn knowledge_home_message() -> CreateInteractionResponseMessage {
     CreateInteractionResponseMessage::new()
         .embed(
             CreateEmbed::new()
                 .title("📚 知識整理小幫手")
                 .description(
-                    "快速收錄文章、查詢 Notion，或整理 Side Project 筆記。每次操作會建立獨立 thread，方便持續追問。",
+                    "快速收錄文章、查詢 Notion、整理 Side Project 筆記，或操作固定排程資料庫。每次操作會建立獨立 thread，方便持續追問。",
                 )
                 .colour(0x2F80ED)
                 .field(
@@ -775,6 +901,7 @@ fn knowledge_home_message() -> CreateInteractionResponseMessage {
                     .label("❓ 使用說明")
                     .style(ButtonStyle::Secondary),
             ]),
+            knowledge_scheduled_source_select(),
         ])
 }
 
@@ -5155,6 +5282,85 @@ impl Handler {
             }
         };
         let action = comp.data.custom_id.strip_prefix("oab_knowledge:").unwrap_or("");
+        if action == "scheduled_source" {
+            let selected = first_string_select(&comp.data.kind)
+                .and_then(knowledge_scheduled_source);
+            let Some(source) = selected else {
+                let _ = comp.create_response(
+                    &ctx.http,
+                    CreateInteractionResponse::Message(
+                        CreateInteractionResponseMessage::new()
+                            .content("⚠️ 這個排程資料庫已失效，請重新執行 `/knowledge`。")
+                            .ephemeral(true),
+                    ),
+                ).await;
+                return;
+            };
+            if let Err(error) = comp.create_response(
+                &ctx.http,
+                CreateInteractionResponse::Message(
+                    knowledge_scheduled_source_message(source),
+                ),
+            ).await {
+                tracing::error!(%error, source = source.id, "failed to show scheduled source actions");
+            }
+            return;
+        }
+        if let Some(source_action) = action.strip_prefix("source_") {
+            let selected = source_action
+                .split_once(':')
+                .and_then(|(operation, source_id)| {
+                    knowledge_scheduled_source(source_id).map(|source| (operation, source))
+                });
+            let Some((operation, source)) = selected else {
+                let _ = comp.create_response(
+                    &ctx.http,
+                    CreateInteractionResponse::Message(
+                        CreateInteractionResponseMessage::new()
+                            .content("⚠️ 這個排程資料庫操作已失效，請重新執行 `/knowledge`。")
+                            .ephemeral(true),
+                    ),
+                ).await;
+                return;
+            };
+            if operation == "search" {
+                if let Err(error) = comp.create_response(
+                    &ctx.http,
+                    CreateInteractionResponse::Modal(
+                        knowledge_scheduled_source_search_modal(source),
+                    ),
+                ).await {
+                    tracing::error!(%error, source = source.id, "failed to open scheduled source search modal");
+                }
+                return;
+            }
+            let Some((title, prompt)) = knowledge_scheduled_source_prompt(source, operation) else {
+                let _ = comp.create_response(
+                    &ctx.http,
+                    CreateInteractionResponse::Message(
+                        CreateInteractionResponseMessage::new()
+                            .content("⚠️ 不支援這個排程資料庫操作，請重新執行 `/knowledge`。")
+                            .ephemeral(true),
+                    ),
+                ).await;
+                return;
+            };
+            if let Err(error) = comp.defer_ephemeral(&ctx.http).await {
+                tracing::error!(%error, operation, source = source.id, "failed to defer scheduled source request");
+                return;
+            }
+            let result = self
+                .submit_knowledge_prompt(ctx, scope, &comp.user, &title, prompt)
+                .await;
+            let content = result.map_or_else(
+                |error| format!("⚠️ 無法開始排程資料庫操作：{error}"),
+                |thread_id| format!("✅ 已在 <#{thread_id}> 開始處理 {}。", source.title),
+            );
+            let _ = comp
+                .edit_response(&ctx.http, EditInteractionResponse::new().content(content))
+                .await;
+            return;
+        }
         let modal = match action {
             "capture" => Some(knowledge_capture_modal()),
             "search" => Some(knowledge_search_modal()),
@@ -5174,7 +5380,7 @@ impl Handler {
                 CreateEmbed::new()
                     .title("❓ 知識整理小幫手使用方式")
                     .description(
-                        "**收錄文章**：先整理欄位與重複項目，確認後才寫入。\n**查詢知識**：唯讀搜尋 Notion 並附來源。\n**專案筆記**：比對既有 Project 文件後提出新增或更新建議。\n**最近收錄**：唯讀列出 Knowledge Library 最近 5 筆。",
+                        "**收錄文章**：先整理欄位與重複項目，確認後才寫入。\n**查詢知識**：唯讀搜尋 Notion 並附來源。\n**專案筆記**：比對既有 Project 文件後提出新增或更新建議。\n**最近收錄**：唯讀列出 Knowledge Library 最近 5 筆。\n**排程資料庫**：從下拉選單選擇固定來源，可查看最新文章、搜尋、跨期整理或產生重複清理預覽。",
                     )
                     .colour(0x2F80ED),
             ).ephemeral(true);
@@ -5235,10 +5441,26 @@ impl Handler {
             .map(str::trim)
             .filter(|value| !value.is_empty())
             .unwrap_or("未提供");
-        let request = match action {
+        let request = if let Some(source_id) = action.strip_prefix("source_search:") {
+            let source = knowledge_scheduled_source(source_id);
+            let question = modal_input_value(modal, "question")
+                .map(str::trim)
+                .filter(|value| !value.is_empty());
+            source.zip(question).map(|(source, question)| {
+                (
+                    format!("{}｜搜尋內容", source.title),
+                    format!(
+                        "使用 notion-knowledge Skill 的 Search／Synthesis 模式，唯讀搜尋指定排程資料庫的實際文章並附上相關 Notion 連結。保留日期或期別，不要把資料庫首頁、View 或 Hub 當成文章，也不要修改 Notion。\n\n固定排程資料庫：{}\n只能操作這個已選定的來源，不要改查其他同名資料庫。\n\n問題：\n{question}\n\n時間範圍：{}",
+                        source.title,
+                        optional("range"),
+                    ),
+                )
+            })
+        } else {
+            match action {
             "capture" => modal_input_value(modal, "source")
                 .map(str::trim).filter(|value| !value.is_empty()).map(|source| (
-                    "收錄文章",
+                    "收錄文章".to_string(),
                     format!(
                         "使用 notion-knowledge Skill 的 Capture 模式處理以下資料。先讀取來源、檢查 Knowledge Library 重複項目並產生收錄預覽；不要直接寫入 Notion，等待我在 thread 明確確認。\n\n來源或內容：\n{source}\n\n收藏原因：{}\n分類提示：{}",
                         optional("note"), optional("classification"),
@@ -5246,7 +5468,7 @@ impl Handler {
                 )),
             "search" => modal_input_value(modal, "question")
                 .map(str::trim).filter(|value| !value.is_empty()).map(|question| (
-                    "查詢知識",
+                    "查詢知識".to_string(),
                     format!(
                         "使用 notion-knowledge Skill 的 Search／Synthesis 模式，唯讀查詢 Notion 並附上相關頁面連結。不要修改 Notion。\n\n問題：\n{question}\n\n查詢範圍：{}",
                         optional("scope"),
@@ -5258,7 +5480,7 @@ impl Handler {
                 let note = modal_input_value(modal, "note")
                     .map(str::trim).filter(|value| !value.is_empty());
                 project.zip(note).map(|(project, note)| (
-                    "整理專案筆記",
+                    "整理專案筆記".to_string(),
                     format!(
                         "使用 notion-knowledge Skill 的 Project Update 模式處理以下 Side Project 筆記。先搜尋並比對同一 Project 的現行文件，判斷適合新增或更新的內容並顯示預覽；不要直接寫入 Notion，等待我在 thread 明確確認。\n\nProject：{project}\n類型提示：{}\n\n筆記內容：\n{note}",
                         optional("kind"),
@@ -5266,6 +5488,7 @@ impl Handler {
                 ))
             }
             _ => None,
+            }
         };
         let Some((title, prompt)) = request else {
             let _ = modal.create_response(&ctx.http, CreateInteractionResponse::Message(
@@ -5280,7 +5503,7 @@ impl Handler {
             return;
         }
         let result = self.submit_knowledge_prompt(
-            ctx, scope, &modal.user, title, prompt,
+            ctx, scope, &modal.user, &title, prompt,
         ).await;
         let content = result.map_or_else(
             |error| format!("⚠️ 無法開始知識整理：{error}"),
@@ -9916,8 +10139,32 @@ mod tests {
         assert!(rendered.contains("oab_knowledge:project"));
         assert!(rendered.contains("oab_knowledge:recent"));
         assert!(rendered.contains("oab_knowledge:help"));
+        assert!(rendered.contains("oab_knowledge:scheduled_source"));
+        assert!(rendered.contains("github_ai_data_weekly"));
+        assert!(rendered.contains("world_stories"));
+        assert!(rendered.contains("weekly_reading_digest"));
         assert!(rendered.contains("取得確認後才寫入 Notion"));
         assert!(!rendered.contains("confirm"));
+    }
+
+    #[test]
+    fn scheduled_source_actions_are_fixed_and_cleanup_is_preview_only() {
+        let source = knowledge_scheduled_source("github_ai_data_weekly").unwrap();
+        let rendered = serde_json::to_value(knowledge_scheduled_source_message(source))
+            .unwrap()
+            .to_string();
+        assert!(rendered.contains("oab_knowledge:source_latest:github_ai_data_weekly"));
+        assert!(rendered.contains("oab_knowledge:source_search:github_ai_data_weekly"));
+        assert!(rendered.contains("oab_knowledge:source_synthesis:github_ai_data_weekly"));
+        assert!(rendered.contains("oab_knowledge:source_cleanup:github_ai_data_weekly"));
+        assert!(rendered.contains("文字確認"));
+
+        let (_, cleanup) = knowledge_scheduled_source_prompt(source, "cleanup").unwrap();
+        assert!(cleanup.contains("只產生清理預覽"));
+        assert!(cleanup.contains("不要刪除、封存或修改"));
+        assert!(cleanup.contains(source.title));
+        assert!(knowledge_scheduled_source_prompt(source, "delete").is_none());
+        assert!(knowledge_scheduled_source("unknown").is_none());
     }
 
     #[test]
@@ -9936,6 +10183,14 @@ mod tests {
         assert!(project.contains("oab_knowledge_modal:project"));
         assert!(project.contains("project"));
         assert!(project.contains("kind"));
+
+        let source = knowledge_scheduled_source("world_stories").unwrap();
+        let source_search = serde_json::to_value(knowledge_scheduled_source_search_modal(source))
+            .unwrap()
+            .to_string();
+        assert!(source_search.contains("oab_knowledge_modal:source_search:world_stories"));
+        assert!(source_search.contains("question"));
+        assert!(source_search.contains("range"));
     }
 
     #[test]
