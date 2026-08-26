@@ -2132,9 +2132,9 @@ pub struct AgentPresentationConfig {
     pub name: String,
     pub local_handoff_enabled: bool,
     pub local_publish_enabled: bool,
-    /// Expose the Discord `/knowledge` home card and its Notion-oriented
-    /// prompt launchers. Disabled by default so development agents keep their
-    /// existing command surface.
+    /// Replace the default development slash-command surface with the Discord
+    /// `/knowledge` home card and its Notion-oriented prompt launchers.
+    /// Disabled by default so development agents keep their existing commands.
     pub knowledge_ui_enabled: bool,
 }
 

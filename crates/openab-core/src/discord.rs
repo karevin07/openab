@@ -863,6 +863,22 @@ fn knowledge_scheduled_source_prompt(
     ))
 }
 
+fn knowledge_slash_command() -> CreateCommand {
+    CreateCommand::new("knowledge")
+        .description("Open the knowledge capture and Notion search home card")
+}
+
+fn apply_knowledge_command_profile(
+    default_commands: Vec<CreateCommand>,
+    knowledge_ui_enabled: bool,
+) -> Vec<CreateCommand> {
+    if knowledge_ui_enabled {
+        vec![knowledge_slash_command()]
+    } else {
+        default_commands
+    }
+}
+
 fn knowledge_home_message() -> CreateInteractionResponseMessage {
     CreateInteractionResponseMessage::new()
         .embed(
@@ -3962,7 +3978,7 @@ impl EventHandler for Handler {
         ));
 
         // Build the shared command list once.
-        let mut commands = vec![
+        let commands = vec![
             CreateCommand::new("models").description("Select the AI model for this session"),
             CreateCommand::new("agents").description("Select the agent mode for this session"),
             CreateCommand::new("cancel").description("Cancel the current operation"),
@@ -4131,12 +4147,10 @@ impl EventHandler for Handler {
                     "Export all messages (up to 5000). Default is last 100.",
                 )),
         ];
-        if agent_presentation().knowledge_ui_enabled {
-            commands.push(
-                CreateCommand::new("knowledge")
-                    .description("Open the knowledge capture and Notion search home card"),
-            );
-        }
+        let commands = apply_knowledge_command_profile(
+            commands,
+            agent_presentation().knowledge_ui_enabled,
+        );
 
         // Register global commands only. Registering the same commands per-guild
         // makes Discord show duplicate slash commands in guild command pickers.
@@ -4181,6 +4195,19 @@ impl EventHandler for Handler {
 
     async fn interaction_create(&self, ctx: Context, interaction: Interaction) {
         match interaction {
+            Interaction::Command(cmd)
+                if agent_presentation().knowledge_ui_enabled
+                    && cmd.data.name != "knowledge" =>
+            {
+                let _ = cmd.create_response(
+                    &ctx.http,
+                    CreateInteractionResponse::Message(
+                        CreateInteractionResponseMessage::new()
+                            .content("⚠️ 這個小幫手的功能都集中在 `/knowledge`。")
+                            .ephemeral(true),
+                    ),
+                ).await;
+            }
             Interaction::Autocomplete(cmd) if cmd.data.name == "project" => {
                 self.handle_project_autocomplete(&ctx, &cmd).await;
             }
@@ -10145,6 +10172,33 @@ mod tests {
         assert!(rendered.contains("weekly_reading_digest"));
         assert!(rendered.contains("取得確認後才寫入 Notion"));
         assert!(!rendered.contains("confirm"));
+    }
+
+    #[test]
+    fn knowledge_profile_replaces_development_slash_commands() {
+        let defaults = vec![
+            CreateCommand::new("help").description("Help"),
+            CreateCommand::new("session").description("Session"),
+        ];
+        let commands = apply_knowledge_command_profile(defaults, true);
+        let names = commands
+            .iter()
+            .map(|command| {
+                serde_json::to_value(command)
+                    .unwrap()
+                    .get("name")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap()
+                    .to_string()
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(names, ["knowledge"]);
+
+        let defaults = vec![CreateCommand::new("help").description("Help")];
+        let commands = apply_knowledge_command_profile(defaults, false);
+        let rendered = serde_json::to_value(commands).unwrap().to_string();
+        assert!(rendered.contains("help"));
+        assert!(!rendered.contains("knowledge"));
     }
 
     #[test]
