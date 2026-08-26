@@ -29,6 +29,7 @@ use crate::project_command::{
     validate_workspace_book, ProjectCommandOutput, BOOK_SELECT_MAX_OPTIONS,
 };
 use crate::git_push_broker::GitPushBrokerClient;
+use crate::knowledge_catalog::{knowledge_catalog, KnowledgeAction, KnowledgeSource};
 use crate::project_registry::{ProjectAccessTarget, ProjectBinding, ProjectRegistry};
 use crate::remind::{self, ReminderStore};
 use crate::task_registry::{TaskRecord, TaskRegistry, TaskState};
@@ -738,21 +739,6 @@ fn project_info_embed(binding: &ProjectBinding) -> CreateEmbed {
         .footer(CreateEmbedFooter::new("Managed by OpenAB"))
 }
 
-#[derive(Clone, Copy)]
-struct KnowledgeScheduledSource {
-    id: &'static str,
-    title: &'static str,
-    description: &'static str,
-}
-
-#[derive(Clone, Copy)]
-struct KnowledgeSideProject {
-    id: &'static str,
-    title: &'static str,
-    notion_project: &'static str,
-    description: &'static str,
-}
-
 const KNOWLEDGE_CARDS_PREFIX: &str = "OPENAB_KNOWLEDGE_CARDS_V1";
 
 #[derive(Debug, Deserialize)]
@@ -904,10 +890,16 @@ fn knowledge_cards_message(content: &str) -> Option<CreateMessage> {
     } else if envelope.kind == "project_note_preview" {
         let project = project.expect("project note kinds validate a project");
         message = message.components(vec![CreateActionRow::Buttons(vec![
-            CreateButton::new(format!("oab_knowledge:project_note_save:{}", project.id))
+            CreateButton::new(format!(
+                "oab_knowledge:project_note_save:{}",
+                project.source_id
+            ))
                 .label("✅ 儲存備忘")
                 .style(ButtonStyle::Success),
-            CreateButton::new(format!("oab_knowledge:project_note_cancel:{}", project.id))
+            CreateButton::new(format!(
+                "oab_knowledge:project_note_cancel:{}",
+                project.source_id
+            ))
                 .label("取消")
                 .style(ButtonStyle::Secondary),
         ])]);
@@ -915,50 +907,152 @@ fn knowledge_cards_message(content: &str) -> Option<CreateMessage> {
     Some(message)
 }
 
-const KNOWLEDGE_SIDE_PROJECTS: [KnowledgeSideProject; 1] = [KnowledgeSideProject {
-    id: "project_notes_alpha",
-    title: "🧰 Example Project Alpha",
-    notion_project: "Project Alpha",
-    description: "Example project notes and open questions",
-}];
-
-fn knowledge_side_project(id: &str) -> Option<KnowledgeSideProject> {
-    KNOWLEDGE_SIDE_PROJECTS
-        .iter()
-        .copied()
-        .find(|project| project.id == id)
+fn knowledge_source(id: &str, kind: &str) -> Option<&'static KnowledgeSource> {
+    knowledge_catalog()
+        .source(id)
+        .filter(|source| source.source_kind == kind)
 }
 
-const KNOWLEDGE_SCHEDULED_SOURCES: [KnowledgeScheduledSource; 3] = [
-    KnowledgeScheduledSource {
-        id: "github_ai_data_weekly",
-        title: "📚 GitHub AI & Data Weekly",
-        description: "AI、Data 與 GitHub 每週精選",
-    },
-    KnowledgeScheduledSource {
-        id: "world_stories",
-        title: "🌍 World Stories｜世界人物・王室・文化故事",
-        description: "世界人物、王室與文化故事",
-    },
-    KnowledgeScheduledSource {
-        id: "weekly_reading_digest",
-        title: "📚 週六精選文章｜Example User Reading List",
-        description: "每週六精選閱讀清單",
-    },
-];
+fn knowledge_side_project(id: &str) -> Option<&'static KnowledgeSource> {
+    knowledge_source(id, "side_project")
+}
 
-fn knowledge_scheduled_source(id: &str) -> Option<KnowledgeScheduledSource> {
-    KNOWLEDGE_SCHEDULED_SOURCES
+fn knowledge_scheduled_source(id: &str) -> Option<&'static KnowledgeSource> {
+    knowledge_source(id, "scheduled")
+}
+
+fn knowledge_reading_list() -> Option<&'static KnowledgeSource> {
+    knowledge_catalog()
+        .sources_by_kind("reading_list")
+        .into_iter()
+        .next()
+}
+
+fn knowledge_button_style(style: &str) -> ButtonStyle {
+    match style {
+        "primary" => ButtonStyle::Primary,
+        "success" => ButtonStyle::Success,
+        "danger" => ButtonStyle::Danger,
+        _ => ButtonStyle::Secondary,
+    }
+}
+
+fn knowledge_action_buttons(
+    source: &KnowledgeSource,
+    custom_id: impl Fn(&KnowledgeAction) -> String,
+) -> CreateActionRow {
+    CreateActionRow::Buttons(
+        source
+            .actions
+            .iter()
+            .take(5)
+            .map(|action| {
+                CreateButton::new(custom_id(action))
+                    .label(action.label.clone())
+                    .style(knowledge_button_style(&action.button_style))
+            })
+            .collect(),
+    )
+}
+
+fn knowledge_action_modal(
+    source: &KnowledgeSource,
+    action_id: &str,
+    custom_id: String,
+    fallback_title: &str,
+) -> Option<CreateModal> {
+    let action = source.action(action_id)?;
+    if action.inputs.is_empty() || action.inputs.len() > 5 {
+        return None;
+    }
+    let rows = action
+        .inputs
         .iter()
-        .copied()
-        .find(|source| source.id == id)
+        .map(|input| {
+            let style = if input.input_style == "paragraph" {
+                InputTextStyle::Paragraph
+            } else {
+                InputTextStyle::Short
+            };
+            let mut field = CreateInputText::new(
+                style,
+                input.label.clone(),
+                input.input_id.clone(),
+            )
+            .placeholder(input.placeholder.clone())
+            .max_length(input.max_length)
+            .required(input.required);
+            if input.required {
+                field = field.min_length(1);
+            }
+            CreateActionRow::InputText(field)
+        })
+        .collect();
+    Some(CreateModal::new(custom_id, fallback_title).components(rows))
+}
+
+fn knowledge_action_prompt(
+    source: &KnowledgeSource,
+    action_id: &str,
+    submitted: &[(&str, &str)],
+) -> Option<(String, String)> {
+    let action = source.action(action_id)?;
+    let submitted = submitted
+        .iter()
+        .map(|(name, value)| format!("- {name}: {value}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    Some((
+        action.title.clone(),
+        format!(
+            "使用 notion-knowledge Skill 執行以下操作。SQLite catalog 注入的 Structured Knowledge Adapter 是本次來源、欄位映射與允許操作的權威設定；先 fetch Notion schema 驗證，若 schema 漂移則停止並回報，不要猜測欄位。\noperation_id: {action_id}\n\n{}\n\n{}{}",
+            action.prompt_template,
+            source.adapter_context(),
+            if submitted.is_empty() {
+                String::new()
+            } else {
+                format!("\n\n使用者條件：\n{submitted}")
+            }
+        ),
+    ))
+}
+
+fn knowledge_modal_action_prompt(
+    source: &KnowledgeSource,
+    action_id: &str,
+    modal: &serenity::model::application::ModalInteraction,
+) -> Option<(String, String)> {
+    let action = source.action(action_id)?;
+    let submitted = action
+        .inputs
+        .iter()
+        .map(|input| {
+            let value = modal_input_value(modal, &input.input_id)
+                .map(str::trim)
+                .filter(|value| !value.is_empty());
+            if input.required && value.is_none() {
+                return None;
+            }
+            Some((
+                input.label.clone(),
+                value.unwrap_or("未提供").to_string(),
+            ))
+        })
+        .collect::<Option<Vec<_>>>()?;
+    let borrowed = submitted
+        .iter()
+        .map(|(name, value)| (name.as_str(), value.as_str()))
+        .collect::<Vec<_>>();
+    knowledge_action_prompt(source, action_id, &borrowed)
 }
 
 fn knowledge_scheduled_source_select() -> CreateActionRow {
-    let options = KNOWLEDGE_SCHEDULED_SOURCES
+    let options = knowledge_catalog()
+        .sources_by_kind("scheduled")
         .iter()
         .map(|source| {
-            CreateSelectMenuOption::new(source.title, source.id).description(source.description)
+            CreateSelectMenuOption::new(source.title.clone(), source.source_id.clone())
+                .description(source.description.clone())
         })
         .collect();
     CreateActionRow::SelectMenu(
@@ -971,105 +1065,81 @@ fn knowledge_scheduled_source_select() -> CreateActionRow {
 }
 
 fn knowledge_scheduled_source_message(
-    source: KnowledgeScheduledSource,
+    source: &KnowledgeSource,
 ) -> CreateInteractionResponseMessage {
     CreateInteractionResponseMessage::new()
         .embed(
             CreateEmbed::new()
-                .title(source.title)
+                .title(source.title.clone())
                 .description(
                     "選擇要執行的操作。搜尋會使用這個來源的原生欄位並以文章卡片回傳；待刪除清單可直接選擇要永久保留的項目。",
                 )
                 .colour(0x2F80ED),
         )
-        .components(vec![CreateActionRow::Buttons(vec![
-            CreateButton::new(format!("oab_knowledge:source_latest:{}", source.id))
-                .label("🆕 最新文章")
-                .style(ButtonStyle::Primary),
-            CreateButton::new(format!("oab_knowledge:source_search:{}", source.id))
-                .label("🔎 搜尋內容")
-                .style(ButtonStyle::Secondary),
-            CreateButton::new(format!("oab_knowledge:source_synthesis:{}", source.id))
-                .label("📊 跨期整理")
-                .style(ButtonStyle::Secondary),
-            CreateButton::new(format!("oab_knowledge:source_retention:{}", source.id))
-                .label("🗑️ 待刪除")
-                .style(ButtonStyle::Secondary),
-        ])])
+        .components(vec![knowledge_action_buttons(source, |action| {
+            format!(
+                "oab_knowledge:source_{}:{}",
+                action.action_id, source.source_id
+            )
+        })])
         .ephemeral(true)
 }
 
-fn knowledge_scheduled_source_search_modal(source: KnowledgeScheduledSource) -> CreateModal {
-    let text = |label, id, placeholder| {
-        CreateActionRow::InputText(
-            CreateInputText::new(InputTextStyle::Short, label, id)
-                .placeholder(placeholder)
-                .max_length(300)
-                .required(false),
-        )
-    };
-    let components = match source.id {
-        "world_stories" => vec![
-            text("標題包含", "title", "例如：日本、王室、文化資產"),
-            text("分類或國家", "native_filter", "例如：王室、Japan"),
-            text("精選／待深入研究", "state", "Featured、Read Later 或不限"),
-            text("故事類型", "secondary_filter", "News、History、Culture…"),
-            text("時間範圍", "range", "例如：最近 4 週、2026 年 8 月"),
-        ],
-        "weekly_reading_digest" => vec![
-            text("標題包含", "title", "例如：Agent reliability"),
-            text("最低推薦度", "native_filter", "例如：★★★★☆"),
-            text("主題", "secondary_filter", "例如：AI Agent、Data Platform"),
-            text("閱讀狀態", "state", "待讀、已讀、收藏、略過"),
-            text("時間範圍", "range", "例如：最近 4 週、2026 年 8 月"),
-        ],
-        _ => vec![
-            text("標題包含", "title", "例如：GitHub AI & Data Weekly"),
-            text("內容關鍵字", "native_filter", "例如：Context Database"),
-            text("週次或時間範圍", "range", "例如：最近 4 期、2026 年 8 月"),
-        ],
-    };
-    CreateModal::new(
-        format!("oab_knowledge_modal:source_search:{}", source.id),
+fn knowledge_scheduled_source_search_modal(source: &KnowledgeSource) -> CreateModal {
+    knowledge_action_modal(
+        source,
+        "search",
+        format!("oab_knowledge_modal:source_search:{}", source.source_id),
         "搜尋排程來源",
     )
-    .components(components)
+    .expect("scheduled search action has inputs")
 }
 
 fn knowledge_scheduled_source_prompt(
-    source: KnowledgeScheduledSource,
+    source: &KnowledgeSource,
     operation: &str,
 ) -> Option<(String, String)> {
-    let (title, instruction) = match operation {
-        "latest" => (
-            format!("{}｜最新文章", source.title),
-            "使用 notion-knowledge Skill 的 Scheduled Source Search 模式，唯讀列出最新 5 筆實際文章或週報。依來源原生日期或期別由新到舊排序；讀取 discord-cards.md 並依 search card contract 回覆。不要把資料庫首頁、View 或 Hub 當成文章，也不要修改 Notion。".to_string(),
-        ),
-        "synthesis" => (
-            format!("{}｜跨期整理", source.title),
-            "使用 notion-knowledge Skill 的 Synthesis 模式，唯讀比較最近 3 期的實際文章。整理重複趨勢、各期獨有主題與值得追蹤的變化，保留日期或期別並附上相關 Notion 連結。不要修改 Notion。".to_string(),
-        ),
-        "retention" => (
-            format!("{}｜待刪除", source.title),
-            "使用 notion-knowledge Skill 的 Retention Review 模式，唯讀查詢 Knowledge Retention Queue 中這個來源 Decision = Pending 的項目，依 Delete After 由近到遠列出最多 5 筆。讀取 discord-cards.md 並依 retention card contract 回覆；不要新增 Queue 項目，也不要修改或刪除來源。".to_string(),
-        ),
-        _ => return None,
-    };
-    Some((
-        title,
-        format!(
-            "{instruction}\n\n固定排程資料庫：{}\n只能操作這個已選定的來源，不要改查其他同名資料庫。",
-            source.title
-        ),
-    ))
+    knowledge_action_prompt(source, operation, &[])
+}
+
+fn knowledge_reading_list_message() -> CreateInteractionResponseMessage {
+    let source = knowledge_reading_list().expect("seeded Reading List source");
+    CreateInteractionResponseMessage::new()
+        .embed(
+            CreateEmbed::new()
+                .title(source.title.clone())
+                .description(
+                    "使用原生書籍欄位查詢待讀、閱讀中與已讀內容。快捷操作維持唯讀，不會變更閱讀狀態或評分。",
+                )
+                .colour(0xE67E22),
+        )
+        .components(vec![knowledge_action_buttons(source, |action| {
+            format!("oab_knowledge:reading_list_{}", action.action_id)
+        })])
+        .ephemeral(true)
+}
+
+fn knowledge_reading_list_search_modal() -> CreateModal {
+    knowledge_action_modal(
+        knowledge_reading_list().expect("seeded Reading List source"),
+        "search",
+        "oab_knowledge_modal:reading_list_search".to_string(),
+        "搜尋 Reading List",
+    )
+    .expect("Reading List search action has inputs")
+}
+
+fn knowledge_reading_list_prompt(operation: &str) -> Option<(String, String)> {
+    knowledge_action_prompt(knowledge_reading_list()?, operation, &[])
 }
 
 fn knowledge_side_project_select() -> CreateActionRow {
-    let options = KNOWLEDGE_SIDE_PROJECTS
+    let options = knowledge_catalog()
+        .sources_by_kind("side_project")
         .iter()
         .map(|project| {
-            CreateSelectMenuOption::new(project.title, project.id)
-                .description(project.description)
+            CreateSelectMenuOption::new(project.title.clone(), project.source_id.clone())
+                .description(project.description.clone())
         })
         .collect();
     CreateActionRow::SelectMenu(
@@ -1096,132 +1166,53 @@ fn knowledge_side_projects_message() -> CreateInteractionResponseMessage {
 }
 
 fn knowledge_side_project_message(
-    project: KnowledgeSideProject,
+    project: &KnowledgeSource,
 ) -> CreateInteractionResponseMessage {
+    let notion_project = project.config_string("notion_project").unwrap_or_default();
     CreateInteractionResponseMessage::new()
         .embed(
             CreateEmbed::new()
-                .title(project.title)
+                .title(project.title.clone())
                 .description(
                     "把還沒確定的內容保存為 Draft 備忘，不會自動當成正式規格或決策。查詢與整理維持唯讀。",
                 )
-                .field("Notion Project", inline_code(project.notion_project), false)
+                .field("Notion Project", inline_code(&notion_project), false)
                 .colour(0x57F287),
         )
-        .components(vec![CreateActionRow::Buttons(vec![
-            CreateButton::new(format!("oab_knowledge:project_note_new:{}", project.id))
-                .label("💡 記下想法")
-                .style(ButtonStyle::Primary),
-            CreateButton::new(format!("oab_knowledge:project_note_recent:{}", project.id))
-                .label("🗒️ 最近備忘")
-                .style(ButtonStyle::Secondary),
-            CreateButton::new(format!("oab_knowledge:project_note_search:{}", project.id))
-                .label("🔎 搜尋筆記")
-                .style(ButtonStyle::Secondary),
-            CreateButton::new(format!(
-                "oab_knowledge:project_note_synthesis:{}",
-                project.id
-            ))
-            .label("🧭 整理想法")
-            .style(ButtonStyle::Secondary),
-        ])])
+        .components(vec![knowledge_action_buttons(project, |action| {
+            format!(
+                "oab_knowledge:project_note_{}:{}",
+                action.action_id, project.source_id
+            )
+        })])
         .ephemeral(true)
 }
 
-fn knowledge_project_note_new_modal(project: KnowledgeSideProject) -> CreateModal {
-    CreateModal::new(
-        format!("oab_knowledge_modal:project_note_new:{}", project.id),
+fn knowledge_project_note_new_modal(project: &KnowledgeSource) -> CreateModal {
+    knowledge_action_modal(
+        project,
+        "new",
+        format!("oab_knowledge_modal:project_note_new:{}", project.source_id),
         "記下 Side Project 想法",
     )
-    .components(vec![
-        CreateActionRow::InputText(
-            CreateInputText::new(InputTextStyle::Short, "標題", "title")
-                .placeholder("例如：加入新的控制方式")
-                .min_length(1)
-                .max_length(120),
-        ),
-        CreateActionRow::InputText(
-            CreateInputText::new(InputTextStyle::Paragraph, "想法／備忘", "note")
-                .placeholder("描述目前想到的內容，不需要先整理完整")
-                .min_length(1)
-                .max_length(4000),
-        ),
-        CreateActionRow::InputText(
-            CreateInputText::new(InputTextStyle::Short, "類型（選填）", "kind")
-                .placeholder("Idea、Question、Todo 或 Reference")
-                .max_length(100)
-                .required(false),
-        ),
-        CreateActionRow::InputText(
-            CreateInputText::new(InputTextStyle::Paragraph, "下一步／待確認（選填）", "next_step")
-                .placeholder("例如：先測試 Web Bluetooth 延遲")
-                .max_length(1000)
-                .required(false),
-        ),
-        CreateActionRow::InputText(
-            CreateInputText::new(InputTextStyle::Short, "相關連結（選填）", "source_url")
-                .placeholder("文章、產品、GitHub 或 Notion URL")
-                .max_length(1000)
-                .required(false),
-        ),
-    ])
+    .expect("Side Project new action has inputs")
 }
 
-fn knowledge_project_note_search_modal(project: KnowledgeSideProject) -> CreateModal {
-    CreateModal::new(
-        format!("oab_knowledge_modal:project_note_search:{}", project.id),
+fn knowledge_project_note_search_modal(project: &KnowledgeSource) -> CreateModal {
+    knowledge_action_modal(
+        project,
+        "search",
+        format!("oab_knowledge_modal:project_note_search:{}", project.source_id),
         "搜尋 Side Project 備忘",
     )
-    .components(vec![
-        CreateActionRow::InputText(
-            CreateInputText::new(InputTextStyle::Short, "標題或內容關鍵字", "query")
-                .placeholder("例如：Bluetooth、供電、鏡頭")
-                .max_length(300)
-                .required(false),
-        ),
-        CreateActionRow::InputText(
-            CreateInputText::new(InputTextStyle::Short, "類型（選填）", "kind")
-                .placeholder("Idea、Question、Todo 或 Reference")
-                .max_length(100)
-                .required(false),
-        ),
-        CreateActionRow::InputText(
-            CreateInputText::new(InputTextStyle::Short, "狀態（選填）", "state")
-                .placeholder("Draft、Current 或 Archived")
-                .max_length(100)
-                .required(false),
-        ),
-        CreateActionRow::InputText(
-            CreateInputText::new(InputTextStyle::Short, "時間範圍（選填）", "range")
-                .placeholder("例如：最近 30 天、2026 年 8 月")
-                .max_length(200)
-                .required(false),
-        ),
-    ])
+    .expect("Side Project search action has inputs")
 }
 
 fn knowledge_side_project_prompt(
-    project: KnowledgeSideProject,
+    project: &KnowledgeSource,
     operation: &str,
 ) -> Option<(String, String)> {
-    let (title, instruction) = match operation {
-        "recent" => (
-            format!("{}｜最近備忘", project.title),
-            "使用 notion-knowledge Skill 的 Project Note Search 模式，唯讀查詢最近更新的 5 筆 Project Note。讀取 discord-cards.md 並依 project_notes card contract 回覆。不要修改 Notion。",
-        ),
-        "synthesis" => (
-            format!("{}｜整理目前想法", project.title),
-            "使用 notion-knowledge Skill 的 Project Note Synthesis 模式，唯讀整理目前的主要方向、待釐清問題與可能下一步。優先使用 Draft Project Note，每項結論附上相關 Notion 連結。不要把想法當成已採用規格，也不要修改 Notion。",
-        ),
-        _ => return None,
-    };
-    Some((
-        title,
-        format!(
-            "{instruction}\n\n固定 Side Project：{}\nNotion Project 欄位必須精確等於：{}\n只能查詢這個已選定的 Project。",
-            project.title, project.notion_project
-        ),
-    ))
+    knowledge_action_prompt(project, operation, &[])
 }
 
 fn knowledge_slash_command() -> CreateCommand {
@@ -1246,7 +1237,7 @@ fn knowledge_home_message() -> CreateInteractionResponseMessage {
             CreateEmbed::new()
                 .title("📚 知識整理小幫手")
                 .description(
-                    "快速收錄文章、查詢 Notion、整理 Side Project 筆記，或操作固定排程資料庫。每次操作會建立獨立 thread，方便持續追問。",
+                    "快速收錄文章、查詢 Notion、整理 Side Project 筆記、瀏覽書籍閱讀清單，或操作固定排程資料庫。每次操作會建立獨立 thread，方便持續追問。",
                 )
                 .colour(0x2F80ED)
                 .field(
@@ -1268,6 +1259,9 @@ fn knowledge_home_message() -> CreateInteractionResponseMessage {
                     .style(ButtonStyle::Secondary),
                 CreateButton::new("oab_knowledge:project")
                     .label("🧰 Side Project")
+                    .style(ButtonStyle::Secondary),
+                CreateButton::new("oab_knowledge:reading_list")
+                    .label("📕 閱讀清單")
                     .style(ButtonStyle::Secondary),
             ]),
             CreateActionRow::Buttons(vec![
@@ -5675,7 +5669,7 @@ impl Handler {
                 )
                 .await
             {
-                tracing::error!(%error, project = project.id, "failed to show Side Project actions");
+                tracing::error!(%error, project = project.source_id, "failed to show Side Project actions");
             }
             return;
         }
@@ -5699,7 +5693,19 @@ impl Handler {
                     knowledge_scheduled_source_message(source),
                 ),
             ).await {
-                tracing::error!(%error, source = source.id, "failed to show scheduled source actions");
+                tracing::error!(%error, source = source.source_id, "failed to show scheduled source actions");
+            }
+            return;
+        }
+        if action == "reading_list" {
+            if let Err(error) = comp
+                .create_response(
+                    &ctx.http,
+                    CreateInteractionResponse::Message(knowledge_reading_list_message()),
+                )
+                .await
+            {
+                tracing::error!(%error, "failed to show Reading List actions");
             }
             return;
         }
@@ -5776,13 +5782,13 @@ impl Handler {
                 )
                 .await
             {
-                tracing::error!(%error, project = project.id, "failed to acknowledge Project Note save");
+                tracing::error!(%error, project = project.source_id, "failed to acknowledge Project Note save");
                 return;
             }
             let prompt = format!(
                 "使用 notion-knowledge Skill 的 Project Note Capture 模式執行確認寫入。這次按鈕操作是使用者對緊接在這個按鈕上方、且仍未處理的單一 Project Note 預覽所做的明確寫入授權。先重新取得 Knowledge Library schema 並檢查同一 Project 的重複筆記；只有預覽內容與固定 Project 相符且沒有歧義時才新增。若找不到唯一的待確認預覽或預覽已取消／處理，停止寫入並要求重新建立預覽。寫入後 fetch 驗證，並依 project_notes card contract 回覆建立完成的 Notion 頁面。不要修改或取代既有正式規格。\n\n固定 Side Project：{}\nNotion Project 欄位必須精確等於：{}\nDiscord preview message ID：{}\nDiscord user ID：{}",
                 project.title,
-                project.notion_project,
+                project.config_string("notion_project").unwrap_or_default(),
                 comp.message.id,
                 comp.user.id.get(),
             );
@@ -5832,7 +5838,7 @@ impl Handler {
                 )
                 .await
             {
-                tracing::error!(%error, project = project.id, "failed to cancel Project Note preview");
+                tracing::error!(%error, project = project.source_id, "failed to cancel Project Note preview");
             }
             return;
         }
@@ -5865,7 +5871,7 @@ impl Handler {
                     .create_response(&ctx.http, CreateInteractionResponse::Modal(modal))
                     .await
                 {
-                    tracing::error!(%error, operation, project = project.id, "failed to open Project Note modal");
+                    tracing::error!(%error, operation, project = project.source_id, "failed to open Project Note modal");
                 }
                 return;
             }
@@ -5883,7 +5889,7 @@ impl Handler {
                 return;
             };
             if let Err(error) = comp.defer_ephemeral(&ctx.http).await {
-                tracing::error!(%error, operation, project = project.id, "failed to defer Side Project request");
+                tracing::error!(%error, operation, project = project.source_id, "failed to defer Side Project request");
                 return;
             }
             let result = self
@@ -5922,7 +5928,7 @@ impl Handler {
                         knowledge_scheduled_source_search_modal(source),
                     ),
                 ).await {
-                    tracing::error!(%error, source = source.id, "failed to open scheduled source search modal");
+                    tracing::error!(%error, source = source.source_id, "failed to open scheduled source search modal");
                 }
                 return;
             }
@@ -5938,7 +5944,7 @@ impl Handler {
                 return;
             };
             if let Err(error) = comp.defer_ephemeral(&ctx.http).await {
-                tracing::error!(%error, operation, source = source.id, "failed to defer scheduled source request");
+                tracing::error!(%error, operation, source = source.source_id, "failed to defer scheduled source request");
                 return;
             }
             let result = self
@@ -5947,6 +5953,48 @@ impl Handler {
             let content = result.map_or_else(
                 |error| format!("⚠️ 無法開始排程資料庫操作：{error}"),
                 |thread_id| format!("✅ 已在 <#{thread_id}> 開始處理 {}。", source.title),
+            );
+            let _ = comp
+                .edit_response(&ctx.http, EditInteractionResponse::new().content(content))
+                .await;
+            return;
+        }
+        if let Some(operation) = action.strip_prefix("reading_list_") {
+            if operation == "search" {
+                if let Err(error) = comp
+                    .create_response(
+                        &ctx.http,
+                        CreateInteractionResponse::Modal(knowledge_reading_list_search_modal()),
+                    )
+                    .await
+                {
+                    tracing::error!(%error, "failed to open Reading List search modal");
+                }
+                return;
+            }
+            let Some((title, prompt)) = knowledge_reading_list_prompt(operation) else {
+                let _ = comp
+                    .create_response(
+                        &ctx.http,
+                        CreateInteractionResponse::Message(
+                            CreateInteractionResponseMessage::new()
+                                .content("⚠️ 不支援這個 Reading List 操作。")
+                                .ephemeral(true),
+                        ),
+                    )
+                    .await;
+                return;
+            };
+            if let Err(error) = comp.defer_ephemeral(&ctx.http).await {
+                tracing::error!(%error, operation, "failed to defer Reading List request");
+                return;
+            }
+            let result = self
+                .submit_knowledge_prompt(ctx, scope, &comp.user, &title, prompt)
+                .await;
+            let content = result.map_or_else(
+                |error| format!("⚠️ 無法開始 Reading List 操作：{error}"),
+                |thread_id| format!("✅ 已在 <#{thread_id}> 開始查詢 Reading List。"),
             );
             let _ = comp
                 .edit_response(&ctx.http, EditInteractionResponse::new().content(content))
@@ -5983,7 +6031,7 @@ impl Handler {
                 CreateEmbed::new()
                     .title("❓ 知識整理小幫手使用方式")
                     .description(
-                        "**收錄文章**：先整理欄位與重複項目，確認後才寫入。\n**查詢知識**：唯讀搜尋 Notion 並附來源。\n**Side Project**：記下 Draft 想法、查看最近備忘、搜尋或唯讀整理目前方向；按下儲存備忘後才寫入。\n**最近收錄**：唯讀列出 Knowledge Library 最近 5 筆。\n**排程來源**：從下拉選單選擇固定來源，可查看最新文章、依原生欄位搜尋、跨期整理或查看待刪除清單。",
+                        "**收錄文章**：先整理欄位與重複項目，確認後才寫入。\n**查詢知識**：唯讀搜尋 Notion 並附來源。\n**Side Project**：記下 Draft 想法、查看最近備忘、搜尋或唯讀整理目前方向；按下儲存備忘後才寫入。\n**閱讀清單**：依書名、狀態、主題、作者、地區、期望或評分查詢書籍，快捷操作維持唯讀。\n**最近收錄**：唯讀列出 Knowledge Library 最近 5 筆。\n**排程來源**：從下拉選單選擇固定來源，可查看最新文章、依原生欄位搜尋、跨期整理或查看待刪除清單。",
                     )
                     .colour(0x2F80ED),
             ).ephemeral(true);
@@ -6045,64 +6093,17 @@ impl Handler {
             .filter(|value| !value.is_empty())
             .unwrap_or("未提供");
         let request = if let Some(source_id) = action.strip_prefix("source_search:") {
-            let source = knowledge_scheduled_source(source_id);
-            source.map(|source| {
-                (
-                    format!("{}｜搜尋內容", source.title),
-                    format!(
-                        "使用 notion-knowledge Skill 的 Scheduled Source Search 模式，依 scheduled-sources.md 使用指定來源的原生欄位做唯讀查詢。資料庫條件必須使用參數化 SQL；最低推薦度要轉成明確允許值，不能直接比較星號字串。讀取 discord-cards.md 並以 search card contract 回傳最多 5 筆。不要把資料庫首頁、View 或 Hub 當成文章，也不要修改 Notion。\n\n固定排程來源：{}\n只能操作這個已選定的來源，不要改查其他同名資料庫。\n\n標題包含：{}\n原生條件一：{}\n原生條件二：{}\n狀態條件：{}\n時間範圍：{}",
-                        source.title,
-                        optional("title"),
-                        optional("native_filter"),
-                        optional("secondary_filter"),
-                        optional("state"),
-                        optional("range"),
-                    ),
-                )
-            })
+            knowledge_scheduled_source(source_id)
+                .and_then(|source| knowledge_modal_action_prompt(source, "search", modal))
+        } else if action == "reading_list_search" {
+            knowledge_reading_list()
+                .and_then(|source| knowledge_modal_action_prompt(source, "search", modal))
         } else if let Some(project_id) = action.strip_prefix("project_note_new:") {
-            let project = knowledge_side_project(project_id);
-            let title = modal_input_value(modal, "title")
-                .map(str::trim)
-                .filter(|value| !value.is_empty());
-            let note = modal_input_value(modal, "note")
-                .map(str::trim)
-                .filter(|value| !value.is_empty());
-            project
-                .zip(title)
-                .zip(note)
-                .map(|((project, title), note)| {
-                    (
-                        format!("{}｜備忘預覽", project.title),
-                        format!(
-                            "使用 notion-knowledge Skill 的 Project Note Capture 模式處理以下內容。查詢 Knowledge Library schema 與同一 Project 的近似筆記，準備一筆 Content Type = Project Note、Lifecycle = Draft、Status = Inbox 的新增預覽。不要寫入 Notion。讀取 discord-cards.md，依 project_note_preview card contract 回覆且只能有一筆；卡片的確認按鈕才是後續寫入授權。類型只能正規化為 Idea、Question、Todo 或 Reference，未提供時使用 Idea。\n\n固定 Side Project：{}\nproject_id：{}\nNotion Project 欄位必須精確等於：{}\n標題：{}\n類型提示：{}\n下一步／待確認：{}\n相關連結：{}\n\n想法／備忘：\n{}",
-                            project.title,
-                            project.id,
-                            project.notion_project,
-                            title,
-                            optional("kind"),
-                            optional("next_step"),
-                            optional("source_url"),
-                            note,
-                        ),
-                    )
-                })
+            knowledge_side_project(project_id)
+                .and_then(|project| knowledge_modal_action_prompt(project, "new", modal))
         } else if let Some(project_id) = action.strip_prefix("project_note_search:") {
-            knowledge_side_project(project_id).map(|project| {
-                (
-                    format!("{}｜搜尋備忘", project.title),
-                    format!(
-                        "使用 notion-knowledge Skill 的 Project Note Search 模式，唯讀查詢 Knowledge Library 中 Content Type = Project Note 且 Project 精確相符的內容。讀取 discord-cards.md 並依 project_notes card contract 回傳最多 5 筆；依更新時間由新到舊排序。不要修改 Notion。\n\n固定 Side Project：{}\nproject_id：{}\nNotion Project 欄位必須精確等於：{}\n標題或內容關鍵字：{}\n類型：{}\nLifecycle：{}\n時間範圍：{}",
-                        project.title,
-                        project.id,
-                        project.notion_project,
-                        optional("query"),
-                        optional("kind"),
-                        optional("state"),
-                        optional("range"),
-                    ),
-                )
-            })
+            knowledge_side_project(project_id)
+                .and_then(|project| knowledge_modal_action_prompt(project, "search", modal))
         } else {
             match action {
             "capture" => modal_input_value(modal, "source")
@@ -10771,6 +10772,7 @@ mod tests {
         assert!(rendered.contains("oab_knowledge:capture"));
         assert!(rendered.contains("oab_knowledge:search"));
         assert!(rendered.contains("oab_knowledge:project"));
+        assert!(rendered.contains("oab_knowledge:reading_list"));
         assert!(rendered.contains("oab_knowledge:recent"));
         assert!(rendered.contains("oab_knowledge:help"));
         assert!(rendered.contains("oab_knowledge:scheduled_source"));
@@ -10823,9 +10825,35 @@ mod tests {
         let (_, retention) = knowledge_scheduled_source_prompt(source, "retention").unwrap();
         assert!(retention.contains("Knowledge Retention Queue"));
         assert!(retention.contains("不要新增 Queue 項目"));
-        assert!(retention.contains(source.title));
+        assert!(retention.contains(&source.title));
         assert!(knowledge_scheduled_source_prompt(source, "delete").is_none());
         assert!(knowledge_scheduled_source("unknown").is_none());
+    }
+
+    #[test]
+    fn reading_list_actions_use_the_native_schema_adapter() {
+        let rendered = serde_json::to_value(knowledge_reading_list_message())
+            .unwrap()
+            .to_string();
+        assert!(rendered.contains("oab_knowledge:reading_list_recommend"));
+        assert!(rendered.contains("oab_knowledge:reading_list_current"));
+        assert!(rendered.contains("oab_knowledge:reading_list_search"));
+        assert!(rendered.contains("oab_knowledge:reading_list_overview"));
+        assert!(rendered.contains("不會變更閱讀狀態或評分"));
+
+        let modal = serde_json::to_value(knowledge_reading_list_search_modal())
+            .unwrap()
+            .to_string();
+        assert!(modal.contains("oab_knowledge_modal:reading_list_search"));
+        assert!(modal.contains("author_origin"));
+        assert!(modal.contains("rating"));
+
+        let (_, recommend) = knowledge_reading_list_prompt("recommend").unwrap();
+        assert!(recommend.contains("Status = To Read"));
+        assert!(recommend.contains("Expect"));
+        assert!(recommend.contains(&knowledge_reading_list().unwrap().notion_url));
+        assert!(recommend.contains("Structured Knowledge Adapter"));
+        assert!(knowledge_reading_list_prompt("delete").is_none());
     }
 
     #[test]
@@ -10874,6 +10902,8 @@ mod tests {
             .to_string();
         assert!(picker.contains("oab_knowledge:side_project"));
         assert!(picker.contains("project_notes_alpha"));
+        assert!(picker.contains("project_notes_beta"));
+        assert!(picker.contains("Example Project Beta"));
 
         let project = knowledge_side_project("project_notes_alpha").unwrap();
         let actions = serde_json::to_value(knowledge_side_project_message(project))
@@ -10886,8 +10916,15 @@ mod tests {
         assert!(actions.contains("不會自動當成正式規格或決策"));
 
         let (_, recent) = knowledge_side_project_prompt(project, "recent").unwrap();
-        assert!(recent.contains("Project Note Search"));
+        assert!(recent.contains("operation_id: recent"));
+        assert!(recent.contains("Structured Knowledge Adapter"));
         assert!(recent.contains("Project Alpha"));
+
+        let publishing = knowledge_side_project("project_notes_beta").unwrap();
+        let (_, publishing_recent) =
+            knowledge_side_project_prompt(publishing, "recent").unwrap();
+        assert!(publishing_recent.contains("Project Beta"));
+        assert!(publishing_recent.contains("Example Project Beta"));
         assert!(knowledge_side_project_prompt(project, "delete").is_none());
         assert!(knowledge_side_project("unknown").is_none());
     }

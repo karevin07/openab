@@ -8,6 +8,7 @@ license = "MIT"
 tokio = { version = "1", features = ["full"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+rusqlite = { version = "0.32", features = ["bundled"], optional = true }
 toml = "0.8"
 toml_edit = "0.22"
 tracing = "0.1"
@@ -63,7 +64,7 @@ tokio = { version = "1", features = ["test-util"] }
 
 [features]
 default = ["discord", "slack", "secrets-aws", "agentcore", "config-s3"]
-discord = ["dep:serenity"]
+discord = ["dep:serenity", "dep:rusqlite"]
 slack = []
 secrets-aws = ["dep:aws-sdk-secretsmanager", "dep:aws-config"]
 config-s3 = ["dep:aws-sdk-s3", "dep:aws-config"]

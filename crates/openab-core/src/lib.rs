@@ -40,6 +40,8 @@ pub mod trust;
 #[cfg(feature = "discord")]
 pub mod discord;
 #[cfg(feature = "discord")]
+pub mod knowledge_catalog;
+#[cfg(feature = "discord")]
 pub mod discord_admin;
 #[cfg(feature = "discord")]
 pub mod discord_admin_ui;
