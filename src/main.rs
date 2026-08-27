@@ -591,6 +591,8 @@ async fn main() -> anyhow::Result<()> {
         .join(".openab");
     #[cfg(feature = "discord")]
     let control_db = openab_core::control_db::ControlDb::open(openab_state_dir.join("control.db"))?;
+    #[cfg(feature = "discord")]
+    discord::configure_control_ui_surfaces(control_db.load_ui_surfaces()?);
 
     let pool_inner = acp::SessionPool::new(
         cfg.agent,

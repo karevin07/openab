@@ -157,7 +157,7 @@ Set a one-shot delayed reminder that mentions users or roles in the channel afte
 - Maximum 10 mention targets per reminder (use a @role for larger groups)
 - `@everyone` and `@here` in messages are automatically neutralized (will not trigger mass mentions)
 - One-shot only (fires once, then removed)
-- Reminders persist across bot restarts (stored in `$HOME/.openab/reminders.json`)
+- Reminders persist across bot restarts (stored in `$HOME/.openab/control.db` when Discord support is enabled)
 
 **Examples:**
 ```

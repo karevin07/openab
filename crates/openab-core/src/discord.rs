@@ -9,6 +9,7 @@ use crate::config::{
     DiscordProjectActionConfig, DiscordProjectCommandConfig, DiscordProjectCommandRunner,
     SttConfig, PROJECT_COMMAND_RUN_CUSTOM_ID_PREFIX,
 };
+use crate::control_db::UiSurface;
 use crate::cron::{job_applies_to_project, next_run_unix, sticky_thread_id_for, CronToggleStore};
 // Only the client stays here; every admin card, modal and handler now lives in
 // `discord_admin_ui`, which owns the wire types it renders.
@@ -27,12 +28,12 @@ use crate::knowledge_catalog::{
     KnowledgeSource,
 };
 use crate::media;
+#[cfg(test)]
+use crate::project_command::ProjectCommandOutput;
 use crate::project_command::{
     list_workspace_books, project_command_argv_display, run_project_command,
     validate_workspace_book, BOOK_SELECT_MAX_OPTIONS,
 };
-#[cfg(test)]
-use crate::project_command::ProjectCommandOutput;
 use crate::project_registry::{ProjectAccessTarget, ProjectBinding, ProjectRegistry};
 use crate::remind::{self, ReminderStore};
 use crate::repository_command_queue::{
@@ -91,6 +92,7 @@ pub(crate) const SELECT_OPTION_TEXT_MAX: usize = 100;
 const WORKSPACE_LIST_LIMIT: usize = 25;
 
 static AGENT_PRESENTATION: OnceLock<AgentPresentationConfig> = OnceLock::new();
+static CONTROL_UI_SURFACES: OnceLock<HashMap<String, UiSurface>> = OnceLock::new();
 
 /// Configure the process-wide Discord product identity before the client starts.
 /// Each OpenAB process owns exactly one ACP backend.
@@ -100,6 +102,27 @@ pub fn configure_agent_presentation(presentation: AgentPresentationConfig) {
 
 fn agent_presentation() -> &'static AgentPresentationConfig {
     AGENT_PRESENTATION.get_or_init(AgentPresentationConfig::default)
+}
+
+/// Configure data-driven presentation for core Discord control surfaces.
+/// Custom IDs, permission checks, and executable behavior deliberately remain
+/// in trusted code; SQLite owns display text and static accent colors only.
+pub fn configure_control_ui_surfaces(surfaces: HashMap<String, UiSurface>) {
+    let _ = CONTROL_UI_SURFACES.set(surfaces);
+}
+
+fn control_ui_surface(surface_id: &str) -> UiSurface {
+    CONTROL_UI_SURFACES
+        .get()
+        .and_then(|surfaces| surfaces.get(surface_id))
+        .cloned()
+        .unwrap_or_else(|| UiSurface {
+            surface_id: surface_id.into(),
+            title: surface_id.replace('_', " "),
+            accent_color: 0x5865f2,
+            empty_text: "No entries.".into(),
+            enabled: true,
+        })
 }
 
 pub(crate) fn first_string_select(kind: &ComponentInteractionDataKind) -> Option<&str> {
@@ -470,6 +493,7 @@ fn offers_repository_commands(state: TaskState) -> bool {
 }
 
 fn task_status_embed(task: &TaskRecord) -> CreateEmbed {
+    let surface = control_ui_surface("task_status");
     let (icon, state, colour) = task_state_presentation(task.state);
     let mut embed = CreateEmbed::new()
         .title(format!("{icon} {}", task.title))
@@ -516,7 +540,8 @@ fn task_status_embed(task: &TaskRecord) -> CreateEmbed {
         );
     }
     embed.footer(CreateEmbedFooter::new(format!(
-        "Updated {} UTC",
+        "{} · Updated {} UTC",
+        surface.title,
         task.updated_at.format("%Y-%m-%d %H:%M")
     )))
 }
@@ -713,7 +738,7 @@ fn task_status_interaction_edit(
 
 fn project_recent_tasks(tasks: &[TaskRecord]) -> String {
     if tasks.is_empty() {
-        return "_尚無 task。點 **New task** 開始。_".to_string();
+        return format!("_{}_", control_ui_surface("project_home").empty_text);
     }
     tasks
         .iter()
@@ -731,6 +756,7 @@ fn project_recent_tasks(tasks: &[TaskRecord]) -> String {
 }
 
 fn project_info_embed(binding: &ProjectBinding) -> CreateEmbed {
+    let surface = control_ui_surface("project_home");
     CreateEmbed::new()
         .title(format!("📁 @{}", binding.workspace_alias))
         .description(
@@ -739,14 +765,17 @@ fn project_info_embed(binding: &ProjectBinding) -> CreateEmbed {
                 agent_presentation().name
             ),
         )
-        .colour(0x5865F2)
+        .colour(surface.accent_color)
         .field(
             "Workspace",
             inline_code(&format!("@{}", binding.workspace_alias)),
             true,
         )
         .field("Access", project_access_display(binding), false)
-        .footer(CreateEmbedFooter::new("Managed by OpenAB"))
+        .footer(CreateEmbedFooter::new(format!(
+            "{} · Managed by OpenAB",
+            surface.title
+        )))
 }
 
 const KNOWLEDGE_CARDS_PREFIX: &str = "OPENAB_KNOWLEDGE_CARDS_V1";
@@ -1966,6 +1995,7 @@ fn repository_command_queue_message(
     selected_id: Option<u64>,
     note: Option<&str>,
 ) -> CreateInteractionResponseMessage {
+    let surface = control_ui_surface("repository_queue");
     let waiting = jobs
         .iter()
         .filter(|job| job.state == RepositoryCommandState::Pending)
@@ -1994,9 +2024,9 @@ fn repository_command_queue_message(
         })
         .or_else(|| jobs.last());
     let mut embed = CreateEmbed::new()
-        .title("📋 Repository Command Queue")
+        .title(format!("📋 {}", surface.title))
         .description(description)
-        .colour(0x3498DB);
+        .colour(surface.accent_color);
     if let Some(job) = selected {
         let book = job
             .book_slug
@@ -2022,11 +2052,7 @@ fn repository_command_queue_message(
             false,
         );
     } else {
-        embed = embed.field(
-            "Queue is empty",
-            "Run a repository command to add it here.",
-            false,
-        );
+        embed = embed.field("Queue is empty", surface.empty_text, false);
     }
 
     let mut components = Vec::new();

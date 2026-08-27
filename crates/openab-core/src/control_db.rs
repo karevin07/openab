@@ -16,7 +16,16 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard};
 use tracing::info;
 
-const SCHEMA_VERSION: i64 = 2;
+const SCHEMA_VERSION: i64 = 3;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UiSurface {
+    pub surface_id: String,
+    pub title: String,
+    pub accent_color: u32,
+    pub empty_text: String,
+    pub enabled: bool,
+}
 
 #[derive(Clone)]
 pub struct ControlDb {
@@ -38,18 +47,16 @@ impl ControlDb {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
         }
-        let connection = Connection::open(&path)
+        let mut connection = Connection::open(&path)
             .with_context(|| format!("failed to open control database at {}", path.display()))?;
         set_private_permissions(&path)?;
         connection.busy_timeout(std::time::Duration::from_secs(5))?;
         connection.pragma_update(None, "foreign_keys", "ON")?;
         connection.pragma_update(None, "journal_mode", "WAL")?;
-        connection.execute_batch(SCHEMA_V1)?;
-        connection.execute(
-            "INSERT OR IGNORE INTO control_schema_migrations(version) VALUES (?1)",
-            [SCHEMA_VERSION],
-        )?;
-        seed_ui_catalog(&connection)?;
+        connection.pragma_update(None, "synchronous", "FULL")?;
+        connection.pragma_update(None, "wal_autocheckpoint", 1000)?;
+        apply_migrations(&mut connection)?;
+        verify_database(&connection)?;
         for suffix in ["-wal", "-shm"] {
             let mut sidecar = path.as_os_str().to_os_string();
             sidecar.push(suffix);
@@ -67,6 +74,36 @@ impl ControlDb {
 
     pub fn path(&self) -> &Path {
         &self.path
+    }
+
+    pub fn load_ui_surfaces(&self) -> anyhow::Result<HashMap<String, UiSurface>> {
+        let connection = self.lock();
+        let mut statement = connection.prepare(
+            "SELECT surface_id, title, accent_color, empty_text, enabled \
+             FROM ui_surfaces ORDER BY surface_id",
+        )?;
+        let rows = statement.query_map([], |row| {
+            let accent_color = row.get::<_, i64>(2)?;
+            let accent_color = u32::try_from(accent_color).map_err(|error| {
+                rusqlite::Error::FromSqlConversionFailure(
+                    2,
+                    rusqlite::types::Type::Integer,
+                    Box::new(error),
+                )
+            })?;
+            Ok(UiSurface {
+                surface_id: row.get(0)?,
+                title: row.get(1)?,
+                accent_color,
+                empty_text: row.get(3)?,
+                enabled: row.get(4)?,
+            })
+        })?;
+        Ok(rows
+            .collect::<Result<Vec<_>, _>>()?
+            .into_iter()
+            .map(|surface| (surface.surface_id.clone(), surface))
+            .collect())
     }
 
     pub fn load_or_import_projects(
@@ -669,40 +706,59 @@ fn read_payloads<T: DeserializeOwned>(
     Ok(values)
 }
 
-fn seed_ui_catalog(connection: &Connection) -> anyhow::Result<()> {
-    for (surface, title, accent, empty_text) in [
-        (
-            "project_home",
-            "Project Home",
-            0x5865f2_i64,
-            "目前沒有進行中的任務。",
-        ),
-        (
-            "task_status",
-            "Task Status",
-            0x57f287_i64,
-            "目前沒有排隊中的訊息。",
-        ),
-        (
-            "repository_queue",
-            "Repository Command Queue",
-            0xfee75c_i64,
-            "目前沒有排隊中的指令。",
-        ),
-    ] {
-        connection.execute(
-            "INSERT OR IGNORE INTO ui_surfaces(surface_id, title, accent_color, empty_text) VALUES (?1, ?2, ?3, ?4)",
-            params![surface, title, accent, empty_text],
+fn apply_migrations(connection: &mut Connection) -> anyhow::Result<()> {
+    connection.execute_batch(MIGRATION_BOOTSTRAP)?;
+    let newest = connection.query_row(
+        "SELECT COALESCE(MAX(version), 0) FROM control_schema_migrations",
+        [],
+        |row| row.get::<_, i64>(0),
+    )?;
+    if newest > SCHEMA_VERSION {
+        anyhow::bail!(
+            "control database schema {newest} is newer than supported version {SCHEMA_VERSION}"
+        );
+    }
+
+    for (version, sql) in [(1_i64, SCHEMA_V1), (2_i64, SCHEMA_V2), (3_i64, SCHEMA_V3)] {
+        let applied = connection
+            .query_row(
+                "SELECT 1 FROM control_schema_migrations WHERE version = ?1",
+                [version],
+                |_| Ok(()),
+            )
+            .optional()?
+            .is_some();
+        if applied {
+            continue;
+        }
+        let tx = connection.transaction()?;
+        tx.execute_batch(sql)
+            .with_context(|| format!("failed to apply control database migration {version}"))?;
+        tx.execute(
+            "INSERT INTO control_schema_migrations(version) VALUES (?1)",
+            [version],
         )?;
+        tx.commit()?;
     }
     Ok(())
 }
 
-const SCHEMA_V1: &str = r#"
+fn verify_database(connection: &Connection) -> anyhow::Result<()> {
+    let result = connection.query_row("PRAGMA quick_check", [], |row| row.get::<_, String>(0))?;
+    if result != "ok" {
+        anyhow::bail!("control database quick_check failed: {result}");
+    }
+    Ok(())
+}
+
+const MIGRATION_BOOTSTRAP: &str = r#"
 CREATE TABLE IF NOT EXISTS control_schema_migrations (
     version INTEGER PRIMARY KEY,
     applied_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
+"#;
+
+const SCHEMA_V1: &str = r#"
 CREATE TABLE IF NOT EXISTS legacy_imports (
     source TEXT PRIMARY KEY,
     legacy_path TEXT NOT NULL,
@@ -782,6 +838,9 @@ CREATE TABLE IF NOT EXISTS ui_actions (
     enabled INTEGER NOT NULL DEFAULT 1,
     PRIMARY KEY(surface_id, action_id)
 );
+"#;
+
+const SCHEMA_V2: &str = r#"
 CREATE TABLE IF NOT EXISTS session_records (
     thread_key TEXT PRIMARY KEY,
     session_id TEXT,
@@ -831,6 +890,13 @@ CREATE TABLE IF NOT EXISTS reminders (
     payload TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_reminders_fire_at ON reminders(fire_at);
+"#;
+
+const SCHEMA_V3: &str = r#"
+INSERT OR IGNORE INTO ui_surfaces(surface_id, title, accent_color, empty_text) VALUES
+    ('project_home', 'Project Home', 5793266, '目前沒有進行中的任務。'),
+    ('task_status', 'Task Status', 5763719, '目前沒有排隊中的訊息。'),
+    ('repository_queue', 'Repository Command Queue', 16705372, '目前沒有排隊中的指令。');
 "#;
 
 #[cfg(test)]
@@ -885,11 +951,77 @@ mod tests {
     fn seeds_cursor_ui_surfaces() {
         let dir = tempfile::tempdir().unwrap();
         let db = ControlDb::open(dir.path().join("control.db")).unwrap();
+        let surfaces = db.load_ui_surfaces().unwrap();
+        assert_eq!(surfaces.len(), 3);
+        assert_eq!(surfaces["project_home"].title, "Project Home");
+        assert!(surfaces["task_status"].enabled);
+    }
+
+    #[test]
+    fn fresh_database_applies_every_migration() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = ControlDb::open(dir.path().join("control.db")).unwrap();
         let connection = db.lock();
-        let count: i64 = connection
-            .query_row("SELECT COUNT(*) FROM ui_surfaces", [], |row| row.get(0))
+        let versions = connection
+            .prepare("SELECT version FROM control_schema_migrations ORDER BY version")
+            .unwrap()
+            .query_map([], |row| row.get::<_, i64>(0))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
             .unwrap();
-        assert_eq!(count, 3);
+        assert_eq!(versions, vec![1, 2, 3]);
+    }
+
+    #[test]
+    fn upgrades_existing_v1_without_losing_data() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("control.db");
+        {
+            let mut connection = Connection::open(&path).unwrap();
+            connection.execute_batch(MIGRATION_BOOTSTRAP).unwrap();
+            let tx = connection.transaction().unwrap();
+            tx.execute_batch(SCHEMA_V1).unwrap();
+            tx.execute(
+                "INSERT INTO control_schema_migrations(version) VALUES (1)",
+                [],
+            )
+            .unwrap();
+            tx.execute(
+                "INSERT INTO ui_surfaces(surface_id, title, accent_color, empty_text) \
+                 VALUES ('custom', 'Custom', 1, 'Empty')",
+                [],
+            )
+            .unwrap();
+            tx.commit().unwrap();
+        }
+
+        let db = ControlDb::open(path).unwrap();
+        let connection = db.lock();
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT COUNT(*) FROM control_schema_migrations",
+                    [],
+                    |row| row.get::<_, i64>(0)
+                )
+                .unwrap(),
+            3
+        );
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT title FROM ui_surfaces WHERE surface_id = 'custom'",
+                    [],
+                    |row| row.get::<_, String>(0)
+                )
+                .unwrap(),
+            "Custom"
+        );
+        connection
+            .query_row("SELECT COUNT(*) FROM session_records", [], |row| {
+                row.get::<_, i64>(0)
+            })
+            .unwrap();
     }
 
     #[test]

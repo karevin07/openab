@@ -58,7 +58,7 @@ thread_id = ""                               # optional: post to existing thread
 | `id` | sticky / Discord toggle | — | Stable job ID. Required for sticky threads and Project Home Schedules |
 
 Discord Project Home can pause/resume baseline jobs with an `id` via
-`$HOME/.openab/cron-toggles.json` without rewriting `config.toml`. Usercron stays
+`$HOME/.openab/control.db` without rewriting `config.toml`. Usercron stays
 off in deployments that must not let the agent write schedules.
 
 ## Cron Expression Format
