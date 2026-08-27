@@ -779,6 +779,12 @@ fn project_info_embed(binding: &ProjectBinding) -> CreateEmbed {
 }
 
 const KNOWLEDGE_CARDS_PREFIX: &str = "OPENAB_KNOWLEDGE_CARDS_V1";
+const KNOWLEDGE_CARD_TITLE_MAX: usize = 80;
+const KNOWLEDGE_CARD_META_MAX: usize = 120;
+const KNOWLEDGE_CARD_SUMMARY_MAX: usize = 160;
+const KNOWLEDGE_CARD_NEXT_STEP_MAX: usize = 160;
+const KNOWLEDGE_CARD_URL_MAX: usize = 200;
+const KNOWLEDGE_EMBED_DESCRIPTION_MAX: usize = 4096;
 
 #[derive(Debug, Deserialize)]
 struct KnowledgeCardEnvelope {
@@ -820,6 +826,21 @@ fn truncate_chars(value: &str, max: usize) -> String {
     format!("{}…", shortened.trim_end())
 }
 
+fn normalize_knowledge_meta(meta: &str) -> String {
+    meta.split(['｜', '|'])
+        .map(str::trim)
+        .filter(|part| !part.is_empty())
+        .collect::<Vec<_>>()
+        .join(" · ")
+}
+
+fn escape_markdown_link_text(value: &str) -> String {
+    value
+        .replace('\\', "\\\\")
+        .replace('[', "\\[")
+        .replace(']', "\\]")
+}
+
 fn compact_notion_page_id(value: &str) -> Option<String> {
     let compact = value.replace('-', "");
     (compact.len() == 32 && compact.chars().all(|ch| ch.is_ascii_hexdigit()))
@@ -834,7 +855,8 @@ fn parse_knowledge_card_envelope(content: &str) -> Option<KnowledgeCardEnvelope>
     let mut lines = content.lines();
     lines.find(|line| line.trim() == KNOWLEDGE_CARDS_PREFIX)?;
     let payload = lines.collect::<Vec<_>>().join("\n");
-    let payload = payload.trim_start();
+    let payload = payload.trim_start().trim_start_matches("```json").trim_start();
+    let payload = payload.trim_start_matches("```").trim_start();
     let mut stream =
         serde_json::Deserializer::from_str(payload).into_iter::<KnowledgeCardEnvelope>();
     let envelope = stream.next()?.ok()?;
@@ -845,8 +867,15 @@ fn parse_knowledge_card_envelope(content: &str) -> Option<KnowledgeCardEnvelope>
     Some(envelope)
 }
 
-fn knowledge_cards_message(content: &str) -> Option<CreateMessage> {
-    let catalog = knowledge_catalog();
+/// True when `content` is a fully validated knowledge-cards payload that should
+/// be delivered to Discord unsplit so the marker/JSON are not broken apart.
+pub fn knowledge_cards_payload_is_valid(content: &str) -> bool {
+    parse_and_validate_knowledge_cards(content).is_some()
+}
+
+fn parse_and_validate_knowledge_cards(
+    content: &str,
+) -> Option<(KnowledgeCardEnvelope, Option<&'static KnowledgeSource>)> {
     let envelope = parse_knowledge_card_envelope(content)?;
     if envelope.items.is_empty() || envelope.items.len() > 5 {
         return None;
@@ -868,29 +897,110 @@ fn knowledge_cards_message(content: &str) -> Option<CreateMessage> {
         return None;
     }
 
-    let mut embeds = Vec::with_capacity(envelope.items.len());
-    let mut keep_options = Vec::new();
     for item in &envelope.items {
         let requires_url = envelope.kind != "project_note_preview";
-        if (requires_url && !item.url.starts_with("https://app.notion.com/"))
+        let url = item.url.trim();
+        if (requires_url
+            && (!url.starts_with("https://app.notion.com/")
+                || url.len() > KNOWLEDGE_CARD_URL_MAX
+                || url.contains(')')))
             || item.title.trim().is_empty()
         {
             return None;
-        }
-        let mut description = String::new();
-        if !item.meta.trim().is_empty() {
-            description.push_str(&format!("**{}**", truncate_chars(item.meta.trim(), 160)));
-        }
-        if !item.summary.trim().is_empty() {
-            if !description.is_empty() {
-                description.push_str("\n\n");
-            }
-            description.push_str(&truncate_chars(item.summary.trim(), 280));
         }
         if envelope.kind == "retention" {
             if item.delete_after.trim().is_empty() || !knowledge_source_is_known(&item.source_id) {
                 return None;
             }
+            compact_notion_page_id(&item.target_page_id)?;
+            compact_notion_page_id(&item.queue_page_id)?;
+        }
+    }
+
+    Some((envelope, project))
+}
+
+fn knowledge_item_body(item: &KnowledgeCardItem) -> String {
+    let mut body = String::new();
+    let meta = normalize_knowledge_meta(item.meta.trim());
+    if !meta.is_empty() {
+        body.push_str(&truncate_chars(&meta, KNOWLEDGE_CARD_META_MAX));
+    }
+    if !item.summary.trim().is_empty() {
+        if !body.is_empty() {
+            body.push('\n');
+        }
+        body.push_str(&truncate_chars(
+            item.summary.trim(),
+            KNOWLEDGE_CARD_SUMMARY_MAX,
+        ));
+    }
+    if !item.next_step.trim().is_empty() {
+        if !body.is_empty() {
+            body.push('\n');
+        }
+        body.push_str(&format!(
+            "**下一步**：{}",
+            truncate_chars(item.next_step.trim(), KNOWLEDGE_CARD_NEXT_STEP_MAX)
+        ));
+    }
+    body
+}
+
+fn ranked_knowledge_list_embed(kind: &str, items: &[KnowledgeCardItem]) -> Option<CreateEmbed> {
+    let mut description = String::new();
+    for (index, item) in items.iter().enumerate() {
+        if index > 0 {
+            description.push_str("\n\n");
+        }
+        let title = escape_markdown_link_text(&truncate_chars(
+            item.title.trim(),
+            KNOWLEDGE_CARD_TITLE_MAX,
+        ));
+        let url = item.url.trim();
+        description.push_str(&format!("**{}.** [{}]({})", index + 1, title, url));
+        let body = knowledge_item_body(item);
+        if !body.is_empty() {
+            description.push('\n');
+            description.push_str(&body);
+        }
+    }
+    if description.chars().count() > KNOWLEDGE_EMBED_DESCRIPTION_MAX {
+        description = truncate_chars(&description, KNOWLEDGE_EMBED_DESCRIPTION_MAX);
+    }
+    let colour = match kind {
+        "project_notes" => 0x57F287,
+        _ => 0x2F80ED,
+    };
+    Some(
+        CreateEmbed::new()
+            .description(description)
+            .colour(colour)
+            .footer(CreateEmbedFooter::new(format!(
+                "Knowledge · {} 筆",
+                items.len()
+            ))),
+    )
+}
+
+fn knowledge_cards_message(content: &str) -> Option<CreateMessage> {
+    let catalog = knowledge_catalog();
+    let (envelope, project) = parse_and_validate_knowledge_cards(content)?;
+
+    let mut message = CreateMessage::new().content(truncate_chars(envelope.heading.trim(), 240));
+
+    if envelope.kind == "search" || envelope.kind == "project_notes" {
+        return Some(message.embeds(vec![ranked_knowledge_list_embed(
+            &envelope.kind,
+            &envelope.items,
+        )?]));
+    }
+
+    let mut embeds = Vec::with_capacity(envelope.items.len());
+    let mut keep_options = Vec::new();
+    for item in &envelope.items {
+        let mut description = knowledge_item_body(item);
+        if envelope.kind == "retention" {
             let target_page_id = compact_notion_page_id(&item.target_page_id)?;
             let queue_page_id = compact_notion_page_id(&item.queue_page_id)?;
             if !description.is_empty() {
@@ -911,33 +1021,22 @@ fn knowledge_cards_message(content: &str) -> Option<CreateMessage> {
                 .description(option_description),
             );
         }
-        if !item.next_step.trim().is_empty() {
-            if !description.is_empty() {
-                description.push_str("\n\n");
-            }
-            description.push_str(&format!(
-                "**下一步**：{}",
-                truncate_chars(item.next_step.trim(), 220)
-            ));
-        }
         let colour = match envelope.kind.as_str() {
             "retention" => 0xE67E22,
-            "project_notes" | "project_note_preview" => 0x57F287,
+            "project_note_preview" => 0x57F287,
             _ => 0x2F80ED,
         };
         let mut embed = CreateEmbed::new()
-            .title(truncate_chars(item.title.trim(), 120))
+            .title(truncate_chars(item.title.trim(), KNOWLEDGE_CARD_TITLE_MAX))
             .description(description)
             .colour(colour);
-        if requires_url {
+        if envelope.kind != "project_note_preview" {
             embed = embed.url(item.url.trim());
         }
         embeds.push(embed);
     }
 
-    let mut message = CreateMessage::new()
-        .content(truncate_chars(envelope.heading.trim(), 240))
-        .embeds(embeds);
+    message = message.embeds(embeds);
     if envelope.kind == "retention" {
         let keep_action = catalog.global_action("retention_keep")?;
         message = message.components(vec![CreateActionRow::SelectMenu(
@@ -2969,6 +3068,10 @@ impl ChatAdapter for DiscordAdapter {
 
     fn message_limit(&self) -> usize {
         2000
+    }
+
+    fn prefers_unsplit_delivery(&self, content: &str) -> bool {
+        knowledge_cards_payload_is_valid(content)
     }
 
     async fn send_message(
@@ -11642,9 +11745,12 @@ mod tests {
         let rendered = serde_json::to_value(knowledge_cards_message(payload).unwrap())
             .unwrap()
             .to_string();
-        assert!(rendered.contains("Agent reliability"));
+        assert!(rendered.contains("找到 1 篇"));
+        assert!(rendered.contains("[Agent reliability](https://www.notion.so/example-retention-queue)"));
         assert!(rendered.contains("Production reliability notes"));
+        assert!(rendered.contains("Knowledge · 1 筆"));
         assert!(!rendered.contains("retention_keep"));
+        assert!(knowledge_cards_payload_is_valid(payload));
         assert_eq!(truncate_chars("abcdef", 4), "abc…");
         assert_eq!(truncate_chars("abc", 4), "abc");
         assert_eq!(truncate_chars("abc", 0), "");
@@ -11666,11 +11772,49 @@ mod tests {
             .to_string();
         assert!(rendered.contains("待讀推薦 Top 5"));
         assert!(rendered.contains("範例商業書 A"));
-        assert!(rendered.contains("Example Author A"));
+        assert!(rendered.contains("Example Author A · 科普 · History · Expect 7"));
         assert!(!rendered.contains("Loaded skill"));
         assert!(!rendered.contains("OPENAB_KNOWLEDGE_CARDS_V1"));
+        assert!(knowledge_cards_payload_is_valid(payload));
 
         assert!(knowledge_cards_message(&format!("{payload}\n多餘未驗證內容")).is_none());
+        assert!(!knowledge_cards_payload_is_valid(&format!("{payload}\n多餘未驗證內容")));
+    }
+
+    #[test]
+    fn knowledge_search_top5_renders_single_ranked_embed() {
+        let payload = concat!(
+            "✅ `notion_notion-query-data-sources`\n\n",
+            "```\n",
+            "OPENAB_KNOWLEDGE_CARDS_V1\n",
+            r#"{"kind":"search","heading":"📕 待讀推薦 Top 5（Expect 7，共 12 本待讀）","items":[{"title":"範例商業書 A","url":"https://app.notion.com/example-book-a","meta":"Example Author A｜科普｜History｜歐美｜Expect 7","summary":"用於驗證第一張推薦卡片的範例摘要。"},{"title":"範例商業書 B","url":"https://app.notion.com/example-book-b","meta":"Example Author A｜科普｜History｜歐美｜Expect 7","summary":"用於驗證第二張推薦卡片的範例摘要。"},{"title":"範例商業書 C","url":"https://app.notion.com/example-book-c","meta":"Example Author C｜科普｜History｜歐美｜Expect 7","summary":"用於驗證第三張推薦卡片的範例摘要。"},{"title":"範例商業書 D","url":"https://app.notion.com/example-book-d","meta":"Example Author D｜科普｜Economic, Sociology, Psychology｜歐美｜Expect 7","summary":"用於驗證第四張推薦卡片的範例摘要。"},{"title":"範例商業書 E","url":"https://app.notion.com/example-book-e","meta":"Example Author E｜科普｜Economic｜歐美｜Expect 7","summary":"用於驗證第五張推薦卡片的範例摘要。"}]}"#,
+            "\n```",
+        );
+        assert!(knowledge_cards_payload_is_valid(payload));
+        let message = knowledge_cards_message(payload).unwrap();
+        let rendered = serde_json::to_value(&message).unwrap().to_string();
+        assert!(rendered.contains("待讀推薦 Top 5"));
+        assert!(rendered.contains("**1.** ["));
+        assert!(rendered.contains("**5.** ["));
+        assert!(rendered.contains("Knowledge · 5 筆"));
+        assert!(rendered.contains("Example Author A · 科普 · History · 歐美 · Expect 7"));
+        assert!(!rendered.contains("OPENAB_KNOWLEDGE_CARDS_V1"));
+        // One ranked embed, not one embed per item.
+        let embeds = rendered.matches("\"description\"").count();
+        assert_eq!(embeds, 1);
+        assert!(!knowledge_cards_payload_is_valid(&format!(
+            "OPENAB_KNOWLEDGE_CARDS_V1\n{}",
+            r#"{"kind":"search","heading":"bad","items":[{"title":"x","url":"https://www.notion.so/example-retention-queue)","meta":"","summary":""}]}"#
+        )));
+        // Unsplit delivery must keep the contract intact even past Discord's text limit.
+        let padded = format!("{payload}\n{}", "x".repeat(2500));
+        assert!(!knowledge_cards_payload_is_valid(&padded));
+        let chunks = crate::format::split_message(payload, 200);
+        assert!(chunks.len() > 1);
+        assert!(chunks
+            .iter()
+            .all(|chunk| !knowledge_cards_payload_is_valid(chunk)));
+        assert!(knowledge_cards_payload_is_valid(payload));
     }
 
     #[test]
@@ -11709,12 +11853,18 @@ mod tests {
 
         let notes = concat!(
             "OPENAB_KNOWLEDGE_CARDS_V1\n",
-            r#"{"kind":"project_notes","heading":"最近備忘","project_id":"project_notes_alpha","items":[{"title":"新的控制方式","url":"https://www.notion.so/example-retention-queue","meta":"Idea · Draft","summary":"控制方向"}]}"#,
+            r#"{"kind":"project_notes","heading":"最近備忘","project_id":"project_notes_alpha","items":[{"title":"新的控制方式","url":"https://www.notion.so/example-retention-queue","meta":"Idea · Draft","summary":"控制方向"},{"title":"電池量測","url":"https://app.notion.com/p/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","meta":"Todo · Draft","summary":"量測電壓"}]}"#,
         );
         let rendered = serde_json::to_value(knowledge_cards_message(notes).unwrap())
             .unwrap()
             .to_string();
-        assert!(rendered.contains("https://www.notion.so/example-retention-queue"));
+        assert!(rendered.contains(
+            "[新的控制方式](https://www.notion.so/example-retention-queue)"
+        ));
+        assert!(rendered.contains("**1.** ["));
+        assert!(rendered.contains("**2.** ["));
+        assert!(rendered.contains("Knowledge · 2 筆"));
+        assert_eq!(rendered.matches("\"description\"").count(), 1);
         assert!(!rendered.contains("project_note_save"));
 
         assert!(knowledge_cards_message(

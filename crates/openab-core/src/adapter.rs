@@ -501,6 +501,13 @@ pub trait ChatAdapter: Send + Sync + 'static {
     /// for Discord; Slack uses its Block Kit `markdown` block cap).
     fn message_limit(&self) -> usize;
 
+    /// When true, the router delivers `content` as a single message instead of
+    /// splitting on `message_limit`. Used for structured Discord payloads (e.g.
+    /// knowledge cards) whose marker/JSON must stay intact for rich rendering.
+    fn prefers_unsplit_delivery(&self, _content: &str) -> bool {
+        false
+    }
+
     /// Send a new message, returns a reference to the sent message.
     async fn send_message(&self, channel: &ChannelRef, content: &str) -> Result<MessageRef>;
 
@@ -1420,7 +1427,9 @@ impl AdapterRouter {
                     };
 
                     let final_content = markdown::convert_tables(&final_content, table_mode);
-                    let chunks = if adapter.platform() == "discord" {
+                    let chunks = if adapter.prefers_unsplit_delivery(&final_content) {
+                        vec![final_content.clone()]
+                    } else if adapter.platform() == "discord" {
                         let mentions = extract_mentions(&final_content);
                         let mention_reserve = mention_footer_len(&mentions);
                         let chunks = format::split_message(
@@ -1571,16 +1580,32 @@ impl AdapterRouter {
                                     }
                                 }
                             } else if let Some(first) = chunks.first() {
-                                // If the placeholder edit fails (e.g. Feishu's
-                                // 20-edits-per-message cap was hit during
-                                // cosmetic streaming and the gateway reports
-                                // edit_cap_reached), fall back to deleting the
-                                // half-edited placeholder and sending the first
-                                // chunk as a fresh message so the user sees the
-                                // complete reply without overlap. If delete
-                                // fails the placeholder simply remains — same
-                                // UX as pre-recovery, not a hard failure.
-                                if let Err(e) = adapter.edit_message(&msg, first).await {
+                                // Knowledge cards (and other prefers_unsplit payloads)
+                                // need embeds/components that content-only
+                                // edit_message cannot express. Replace the
+                                // streaming placeholder with a fresh rich send.
+                                if adapter.prefers_unsplit_delivery(first) {
+                                    match adapter.send_message(&thread_channel, first).await {
+                                        Ok(_) => {
+                                            if let Err(de) = adapter.delete_message(&msg).await {
+                                                tracing::warn!(error = ?de, platform = %thread_channel.platform, message_id = %msg.message_id, "delete placeholder after rich send failed; placeholder may remain");
+                                            }
+                                        }
+                                        Err(e) => {
+                                            tracing::warn!(error = ?e, platform = %thread_channel.platform, message_id = %msg.message_id, "rich unsplit send failed");
+                                            delivery_failed = true;
+                                        }
+                                    }
+                                } else if let Err(e) = adapter.edit_message(&msg, first).await {
+                                    // If the placeholder edit fails (e.g. Feishu's
+                                    // 20-edits-per-message cap was hit during
+                                    // cosmetic streaming and the gateway reports
+                                    // edit_cap_reached), fall back to deleting the
+                                    // half-edited placeholder and sending the first
+                                    // chunk as a fresh message so the user sees the
+                                    // complete reply without overlap. If delete
+                                    // fails the placeholder simply remains — same
+                                    // UX as pre-recovery, not a hard failure.
                                     tracing::warn!(error = ?e, platform = %thread_channel.platform, message_id = %msg.message_id, "final streaming edit failed; deleting placeholder and sending fresh");
                                     if let Err(de) = adapter.delete_message(&msg).await {
                                         tracing::warn!(error = ?de, platform = %thread_channel.platform, message_id = %msg.message_id, "delete placeholder failed; user will see overlap");
