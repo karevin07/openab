@@ -1,3 +1,7 @@
+#[cfg(feature = "acp")]
+mod acp_tunnel;
+#[cfg(feature = "acp")]
+mod acp_tunnel_source;
 mod ctl;
 #[cfg(any(
     feature = "telegram",
@@ -10,10 +14,6 @@ mod ctl;
     feature = "lineworks",
 ))]
 mod unified_adapter;
-#[cfg(feature = "acp")]
-mod acp_tunnel;
-#[cfg(feature = "acp")]
-mod acp_tunnel_source;
 use openab_core::acp;
 use openab_core::adapter::{self, AdapterRouter, WorkspaceRouting};
 use openab_core::bot_turns;
@@ -513,8 +513,8 @@ async fn main() -> anyhow::Result<()> {
     #[cfg(feature = "acp")]
     let acp_tunnel_registry = openab_gateway::adapters::acp_server::new_tunnel_registry();
     #[cfg(feature = "acp")]
-    let acp_tunnel: Arc<dyn openab_core::acp_mcp::AcpMcpTunnel> = Arc::new(
-        acp_tunnel::RootAcpTunnel::new(
+    let acp_tunnel: Arc<dyn openab_core::acp_mcp::AcpMcpTunnel> =
+        Arc::new(acp_tunnel::RootAcpTunnel::new(
             acp_tunnel_registry.clone(),
             // Browser control requires `[mcp]`, so the absent case is unreachable in practice;
             // fall back through the SAME function serde uses rather than repeating the literal.
@@ -529,8 +529,7 @@ async fn main() -> anyhow::Result<()> {
                 openab_gateway::adapters::acp_server::warn_if_tunnel_timeout_is_ineffective(t);
                 t
             },
-        ),
-    );
+        ));
 
     // OAB MCP Facade (`[mcp]` in config.toml — OAB MCP Adapter ADR §6.2):
     // serve the loopback Streamable HTTP MCP server in-process so any coding
@@ -571,15 +570,13 @@ async fn main() -> anyhow::Result<()> {
         // be skipped in bridge mode; with the bridge gone there is no mode in which the facade
         // runs without it.
         #[cfg(feature = "acp")]
-        let sources: Vec<Arc<dyn openab_mcp::mcp::sources::CapabilitySource>> =
-            vec![Arc::new(acp_tunnel_source::AcpTunnelSource::new(
-                acp_tunnel.clone(),
-            ))];
+        let sources: Vec<Arc<dyn openab_mcp::mcp::sources::CapabilitySource>> = vec![Arc::new(
+            acp_tunnel_source::AcpTunnelSource::new(acp_tunnel.clone()),
+        )];
         #[cfg(not(feature = "acp"))]
         let sources: Vec<Arc<dyn openab_mcp::mcp::sources::CapabilitySource>> = Vec::new();
         tokio::spawn(async move {
-            if let Err(e) =
-                openab_mcp::mcp::facade::serve_http_with(&listen, sources, tokens).await
+            if let Err(e) = openab_mcp::mcp::facade::serve_http_with(&listen, sources, tokens).await
             {
                 tracing::error!(error = %format!("{e:#}"), listen, "OAB MCP facade exited");
                 std::process::exit(1);
@@ -607,7 +604,10 @@ async fn main() -> anyhow::Result<()> {
         facade_serving.then(|| {
             format!(
                 "http://{}/mcp",
-                cfg.mcp.as_ref().map(|m| m.listen.as_str()).unwrap_or("127.0.0.1:8848")
+                cfg.mcp
+                    .as_ref()
+                    .map(|m| m.listen.as_str())
+                    .unwrap_or("127.0.0.1:8848")
             )
         }),
     );
@@ -1017,22 +1017,21 @@ async fn main() -> anyhow::Result<()> {
 
     // Initialize filestore (for uploading file attachments to S3/R2).
     #[cfg(feature = "filestore")]
-    let filestore: Option<Arc<openab_core::filestore::Filestore>> = if let Some(ref fs_cfg) =
-        cfg.filestore
-    {
-        info!(
-            bucket = %fs_cfg.bucket,
-            region = %fs_cfg.region,
-            prefix = %fs_cfg.prefix,
-            presigned_ttl = fs_cfg.presigned_ttl,
-            "filestore enabled"
-        );
-        Some(Arc::new(
-            openab_core::filestore::Filestore::new(fs_cfg).await,
-        ))
-    } else {
-        None
-    };
+    let filestore: Option<Arc<openab_core::filestore::Filestore>> =
+        if let Some(ref fs_cfg) = cfg.filestore {
+            info!(
+                bucket = %fs_cfg.bucket,
+                region = %fs_cfg.region,
+                prefix = %fs_cfg.prefix,
+                presigned_ttl = fs_cfg.presigned_ttl,
+                "filestore enabled"
+            );
+            Some(Arc::new(
+                openab_core::filestore::Filestore::new(fs_cfg).await,
+            ))
+        } else {
+            None
+        };
 
     #[cfg(feature = "slack")]
     let shared_slack_adapter: Option<Arc<slack::SlackAdapter>> = cfg.slack.as_ref().map(|s| {
@@ -1098,13 +1097,7 @@ async fn main() -> anyhow::Result<()> {
         configured_platforms.push("telegram");
     }
     #[cfg(feature = "googlechat")]
-    if cfg
-        .googlechat
-        .clone()
-        .unwrap_or_default()
-        .resolve()
-        .enabled
-    {
+    if cfg.googlechat.clone().unwrap_or_default().resolve().enabled {
         configured_platforms.push("googlechat");
     }
     #[cfg(feature = "lineworks")]
@@ -1219,15 +1212,15 @@ async fn main() -> anyhow::Result<()> {
         #[cfg(feature = "filestore")]
         let gw_filestore = filestore.clone();
         Some(tokio::spawn(async move {
-            if let Err(e) =
-                gateway::run_gateway_adapter(
-                    params,
-                    shutdown_rx,
-                    gw_dispatcher,
-                    gw_router,
-                    #[cfg(feature = "filestore")]
-                    gw_filestore,
-                ).await
+            if let Err(e) = gateway::run_gateway_adapter(
+                params,
+                shutdown_rx,
+                gw_dispatcher,
+                gw_router,
+                #[cfg(feature = "filestore")]
+                gw_filestore,
+            )
+            .await
             {
                 error!("gateway adapter error: {e}");
             }
@@ -1306,7 +1299,6 @@ async fn main() -> anyhow::Result<()> {
                     },
                 ));
             }
-
 
             // First-class `[telegram]` config overrides env-derived values
             // (config-authoritative + ${} expansion + TELEGRAM_* env fallback).
@@ -1505,7 +1497,10 @@ async fn main() -> anyhow::Result<()> {
                         f.config.api_base(),
                         idle_ms,
                     ));
-                    info!(idle_ms, "unified: feishu card-streaming idle reaper started");
+                    info!(
+                        idle_ms,
+                        "unified: feishu card-streaming idle reaper started"
+                    );
                 }
                 if f.config.connection_mode == feishu::ConnectionMode::Websocket {
                     let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
@@ -1647,19 +1642,22 @@ async fn main() -> anyhow::Result<()> {
 
             info!(addr = %listen_addr, "unified webhook server starting");
 
-            (Some(tokio::spawn(async move {
-                let listener = match tokio::net::TcpListener::bind(&listen_addr).await {
-                    Ok(l) => l,
-                    Err(e) => {
-                        error!(addr = %listen_addr, error = %e, "unified webhook server bind failed");
-                        return;
+            (
+                Some(tokio::spawn(async move {
+                    let listener = match tokio::net::TcpListener::bind(&listen_addr).await {
+                        Ok(l) => l,
+                        Err(e) => {
+                            error!(addr = %listen_addr, error = %e, "unified webhook server bind failed");
+                            return;
+                        }
+                    };
+                    info!(addr = %listen_addr, "unified webhook server listening");
+                    if let Err(e) = axum::serve(listener, app).await {
+                        error!(error = %e, "unified webhook server error");
                     }
-                };
-                info!(addr = %listen_addr, "unified webhook server listening");
-                if let Err(e) = axum::serve(listener, app).await {
-                    error!(error = %e, "unified webhook server error");
-                }
-            })), Some(cron_unified_adapter))
+                })),
+                Some(cron_unified_adapter),
+            )
         } else {
             (None, None)
         }
@@ -1736,7 +1734,13 @@ async fn main() -> anyhow::Result<()> {
                 binding_router.channel_id_for_workspace_alias(platform, alias)
             })),
             resolve_action_prompt: Some(Arc::new(move |alias, action_id| {
-                config::resolve_project_action_prompt(&project_actions, alias, action_id)
+                let prompt =
+                    config::resolve_project_action_prompt(&project_actions, alias, action_id);
+                #[cfg(feature = "discord")]
+                let prompt = prompt.or_else(|| {
+                    openab_core::knowledge_catalog::knowledge_catalog().global_prompt(action_id)
+                });
+                prompt
             })),
             session: Some(pool.clone() as Arc<dyn cron::CronSessionView>),
             sticky_store_path: Some(cron_sticky_path.clone()),
@@ -1864,18 +1868,21 @@ async fn main() -> anyhow::Result<()> {
                 );
             }
         }
-        let reconciled_tasks =
-            match task_registry.reconcile_restored_queues(&restored_queue_counts) {
-                Ok(changed) if !changed.is_empty() => {
-                    info!(tasks = changed.len(), "reconciled Discord task queue metadata");
-                    changed
-                }
-                Ok(_) => Vec::new(),
-                Err(error) => {
-                    warn!(%error, "failed to reconcile restored Discord queue metadata");
-                    Vec::new()
-                }
-            };
+        let reconciled_tasks = match task_registry.reconcile_restored_queues(&restored_queue_counts)
+        {
+            Ok(changed) if !changed.is_empty() => {
+                info!(
+                    tasks = changed.len(),
+                    "reconciled Discord task queue metadata"
+                );
+                changed
+            }
+            Ok(_) => Vec::new(),
+            Err(error) => {
+                warn!(%error, "failed to reconcile restored Discord queue metadata");
+                Vec::new()
+            }
+        };
         let recovery_adapter = Arc::new(discord::DiscordAdapter::with_task_ui(
             Arc::new(serenity::http::Http::new(&discord_cfg.bot_token)),
             task_registry.clone(),
@@ -1889,7 +1896,10 @@ async fn main() -> anyhow::Result<()> {
         let recovery_adapter: Arc<dyn adapter::ChatAdapter> = recovery_adapter;
         let restored_messages = discord_dispatcher.restore_persisted(recovery_adapter);
         if restored_messages > 0 {
-            info!(restored_messages, "restored persistent Discord dispatch queue");
+            info!(
+                restored_messages,
+                "restored persistent Discord dispatch queue"
+            );
         }
         dispatchers.lock().unwrap().push(discord_dispatcher.clone());
 
@@ -1900,6 +1910,16 @@ async fn main() -> anyhow::Result<()> {
             .join(".openab")
             .join("reminders.json");
         let reminder_store = remind::ReminderStore::load(reminder_path);
+
+        let repository_command_queue_path = std::env::var("HOME")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_default()
+            .join(".openab")
+            .join("repository-command-queue.json");
+        let repository_command_queue =
+            openab_core::repository_command_queue::RepositoryCommandQueue::load(
+                repository_command_queue_path,
+            );
 
         // Construct ambient dispatcher if enabled and channels configured.
         let ambient_dispatcher = if cfg.ambient.enabled && !cfg.ambient.discord.channels.is_empty()
@@ -1951,7 +1971,7 @@ async fn main() -> anyhow::Result<()> {
             task_registry,
             project_actions: discord_cfg.project_actions,
             project_commands: discord_cfg.project_commands,
-            project_command_runs: tokio::sync::Mutex::new(std::collections::HashSet::new()),
+            repository_command_queue,
             cron_jobs: cfg.cron.jobs.clone(),
             cron_toggles: cron_toggles.clone(),
             cron_run_now: has_cron_work.then_some(cron_run_now_tx),
@@ -2250,13 +2270,10 @@ allowed_users = ["u1"]
         assert_ne!(trust.decide("c2", false, "u1"), Decision::Allow);
 
         // Empty lists → allow-all (matching the old inline filter default).
-        let gw_open = config::parse_config_str(
-            "[gateway]\nurl = \"ws://gw:8080/ws\"\n",
-            "test",
-        )
-        .unwrap()
-        .gateway
-        .unwrap();
+        let gw_open = config::parse_config_str("[gateway]\nurl = \"ws://gw:8080/ws\"\n", "test")
+            .unwrap()
+            .gateway
+            .unwrap();
         let trust_open = gateway_section_trust(&gw_open);
         assert_eq!(trust_open.decide("any", false, "anyone"), Decision::Allow);
     }

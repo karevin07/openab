@@ -6,36 +6,44 @@ use crate::adapter::{
 use crate::bot_turns::{BotTurnTracker, TurnAction, TurnSeverity, BOT_TURN_LIMIT_WARNING_PREFIX};
 use crate::config::{
     resolve_project_action, AgentPresentationConfig, AllowBots, AllowUsers, CronJobConfig,
-    DiscordProjectActionConfig, DiscordProjectCommandConfig, DiscordProjectCommandRunner, SttConfig,
-    PROJECT_COMMAND_RUN_CUSTOM_ID_PREFIX,
+    DiscordProjectActionConfig, DiscordProjectCommandConfig, DiscordProjectCommandRunner,
+    SttConfig, PROJECT_COMMAND_RUN_CUSTOM_ID_PREFIX,
 };
-use crate::cron::{
-    job_applies_to_project, next_run_unix, sticky_thread_id_for, CronToggleStore,
-};
+use crate::cron::{job_applies_to_project, next_run_unix, sticky_thread_id_for, CronToggleStore};
 // Only the client stays here; every admin card, modal and handler now lives in
 // `discord_admin_ui`, which owns the wire types it renders.
 use crate::discord_admin::DiscordAdminClient;
 // Help and the session-control card both render the Session Manager; the card
 // itself and the handoff-state rule live with the rest of that flow.
+use crate::directives::resolve_workspace;
 use crate::discord_session_ui::{
     all_sessions_edit, reconciled_handoff_task_state, session_manager_edit,
 };
 use crate::dispatch::DispatchTarget;
-use crate::directives::resolve_workspace;
 use crate::format;
+use crate::git_push_broker::GitPushBrokerClient;
+use crate::knowledge_catalog::{
+    knowledge_catalog, KnowledgeAction, KnowledgeActionInput, KnowledgeGlobalAction,
+    KnowledgeSource,
+};
 use crate::media;
 use crate::project_command::{
     list_workspace_books, project_command_argv_display, run_project_command,
-    validate_workspace_book, ProjectCommandOutput, BOOK_SELECT_MAX_OPTIONS,
+    validate_workspace_book, BOOK_SELECT_MAX_OPTIONS,
 };
-use crate::git_push_broker::GitPushBrokerClient;
-use crate::knowledge_catalog::{knowledge_catalog, KnowledgeAction, KnowledgeSource};
+#[cfg(test)]
+use crate::project_command::ProjectCommandOutput;
 use crate::project_registry::{ProjectAccessTarget, ProjectBinding, ProjectRegistry};
 use crate::remind::{self, ReminderStore};
+use crate::repository_command_queue::{
+    cancelled_result, RepositoryCommandJob, RepositoryCommandQueue, RepositoryCommandResult,
+    RepositoryCommandState,
+};
 use crate::task_registry::{TaskRecord, TaskRegistry, TaskState};
 use crate::trust::l3_gate_applies;
 use crate::workspace_attachment::prepare_workspace_pngs;
 use async_trait::async_trait;
+use serde::Deserialize;
 use serenity::builder::{
     CreateActionRow, CreateAttachment, CreateAutocompleteResponse, CreateButton, CreateChannel,
     CreateCommand, CreateCommandOption, CreateEmbed, CreateEmbedFooter, CreateInputText,
@@ -56,7 +64,6 @@ use serenity::model::gateway::Ready;
 use serenity::model::id::{ChannelId, MessageId, UserId};
 use serenity::model::permissions::Permissions;
 use serenity::prelude::*;
-use serde::Deserialize;
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::LazyLock;
@@ -104,7 +111,9 @@ pub(crate) fn first_string_select(kind: &ComponentInteractionDataKind) -> Option
 
 pub(crate) fn first_role_select(kind: &ComponentInteractionDataKind) -> Option<u64> {
     match kind {
-        ComponentInteractionDataKind::RoleSelect { values } => values.first().map(|role| role.get()),
+        ComponentInteractionDataKind::RoleSelect { values } => {
+            values.first().map(|role| role.get())
+        }
         _ => None,
     }
 }
@@ -466,7 +475,7 @@ fn task_status_embed(task: &TaskRecord) -> CreateEmbed {
         .title(format!("{icon} {}", task.title))
         .description(match task.state {
             TaskState::Queued => "需求已排入 queue，OpenAB 會依序處理。",
-            TaskState::Running => "Cursor agent 正在處理目前的需求。",
+            TaskState::Running => "Agent 正在處理目前的需求。",
             TaskState::Ready => {
                 "本輪已完成。可自由輸入需求、套用 Quick Action，或執行 repository command；都留在目前 thread。"
             }
@@ -657,9 +666,10 @@ fn queue_enqueued_notice(task: &TaskRecord) -> CreateMessage {
         .embed(
             CreateEmbed::new()
                 .title("📥 新需求已加入 Queue")
-                .description(
-                    "Cursor 正在處理其他需求。這則需求會依序執行，可從下方開啟 Queue Manager 查看、編輯或移除。",
-                )
+                .description(format!(
+                    "{} 正在處理其他需求。這則需求會依序執行，可從下方開啟 Queue Manager 查看、編輯或移除。",
+                    agent_presentation().name
+                ))
                 .colour(0xF1C40F)
                 .field(
                     "等待中",
@@ -791,12 +801,24 @@ fn knowledge_source_is_known(source_id: &str) -> bool {
     knowledge_scheduled_source(source_id).is_some()
 }
 
-fn knowledge_cards_message(content: &str) -> Option<CreateMessage> {
-    let (prefix, payload) = content.trim().split_once('\n')?;
-    if prefix.trim() != KNOWLEDGE_CARDS_PREFIX {
+fn parse_knowledge_card_envelope(content: &str) -> Option<KnowledgeCardEnvelope> {
+    let mut lines = content.lines();
+    lines.find(|line| line.trim() == KNOWLEDGE_CARDS_PREFIX)?;
+    let payload = lines.collect::<Vec<_>>().join("\n");
+    let payload = payload.trim_start();
+    let mut stream =
+        serde_json::Deserializer::from_str(payload).into_iter::<KnowledgeCardEnvelope>();
+    let envelope = stream.next()?.ok()?;
+    let trailing = payload.get(stream.byte_offset()..)?.trim();
+    if !trailing.is_empty() && trailing != "```" {
         return None;
     }
-    let envelope: KnowledgeCardEnvelope = serde_json::from_str(payload.trim()).ok()?;
+    Some(envelope)
+}
+
+fn knowledge_cards_message(content: &str) -> Option<CreateMessage> {
+    let catalog = knowledge_catalog();
+    let envelope = parse_knowledge_card_envelope(content)?;
     if envelope.items.is_empty() || envelope.items.len() > 5 {
         return None;
     }
@@ -845,13 +867,19 @@ fn knowledge_cards_message(content: &str) -> Option<CreateMessage> {
             if !description.is_empty() {
                 description.push_str("\n\n");
             }
-            description.push_str(&format!("預定清理：`{}`", truncate_chars(item.delete_after.trim(), 32)));
+            description.push_str(&format!(
+                "預定清理：`{}`",
+                truncate_chars(item.delete_after.trim(), 32)
+            ));
+            let keep_action = catalog.global_action("retention_keep")?;
+            let option_prefix = keep_action.config_string("option_prefix")?;
+            let option_description = keep_action.config_string("option_description")?;
             keep_options.push(
                 CreateSelectMenuOption::new(
-                    truncate_chars(&format!("保留｜{}", item.title.trim()), 100),
+                    truncate_chars(&format!("{option_prefix}{}", item.title.trim()), 100),
                     format!("{}|{}|{}", item.source_id, target_page_id, queue_page_id),
                 )
-                .description("取消這筆待刪除項目"),
+                .description(option_description),
             );
         }
         if !item.next_step.trim().is_empty() {
@@ -869,9 +897,9 @@ fn knowledge_cards_message(content: &str) -> Option<CreateMessage> {
             _ => 0x2F80ED,
         };
         let mut embed = CreateEmbed::new()
-                .title(truncate_chars(item.title.trim(), 120))
-                .description(description)
-                .colour(colour);
+            .title(truncate_chars(item.title.trim(), 120))
+            .description(description)
+            .colour(colour);
         if requires_url {
             embed = embed.url(item.url.trim());
         }
@@ -882,26 +910,33 @@ fn knowledge_cards_message(content: &str) -> Option<CreateMessage> {
         .content(truncate_chars(envelope.heading.trim(), 240))
         .embeds(embeds);
     if envelope.kind == "retention" {
-        message = message.components(vec![CreateActionRow::SelectMenu(CreateSelectMenu::new(
-            "oab_knowledge:retention_keep",
-            CreateSelectMenuKind::String { options: keep_options },
-        )
-        .placeholder("選擇要永久保留的文章"))]);
+        let keep_action = catalog.global_action("retention_keep")?;
+        message = message.components(vec![CreateActionRow::SelectMenu(
+            CreateSelectMenu::new(
+                format!("oab_knowledge:{}", keep_action.action_id),
+                CreateSelectMenuKind::String {
+                    options: keep_options,
+                },
+            )
+            .placeholder(keep_action.config_string("select_placeholder")?),
+        )]);
     } else if envelope.kind == "project_note_preview" {
         let project = project.expect("project note kinds validate a project");
+        let save_action = catalog.global_action("project_note_save")?;
+        let cancel_action = catalog.global_action("project_note_cancel")?;
         message = message.components(vec![CreateActionRow::Buttons(vec![
             CreateButton::new(format!(
-                "oab_knowledge:project_note_save:{}",
-                project.source_id
+                "oab_knowledge:{}:{}",
+                save_action.action_id, project.source_id
             ))
-                .label("✅ 儲存備忘")
-                .style(ButtonStyle::Success),
+            .label(save_action.label.clone())
+            .style(knowledge_button_style(&save_action.button_style)),
             CreateButton::new(format!(
-                "oab_knowledge:project_note_cancel:{}",
-                project.source_id
+                "oab_knowledge:{}:{}",
+                cancel_action.action_id, project.source_id
             ))
-                .label("取消")
-                .style(ButtonStyle::Secondary),
+            .label(cancel_action.label.clone())
+            .style(knowledge_button_style(&cancel_action.button_style)),
         ])]);
     }
     Some(message)
@@ -955,40 +990,115 @@ fn knowledge_action_buttons(
     )
 }
 
+fn knowledge_global_buttons(actions: &[&KnowledgeGlobalAction]) -> CreateActionRow {
+    CreateActionRow::Buttons(
+        actions
+            .iter()
+            .take(5)
+            .map(|action| {
+                CreateButton::new(format!("oab_knowledge:{}", action.action_id))
+                    .label(action.label.clone())
+                    .style(knowledge_button_style(&action.button_style))
+            })
+            .collect(),
+    )
+}
+
 fn knowledge_action_modal(
     source: &KnowledgeSource,
     action_id: &str,
     custom_id: String,
-    fallback_title: &str,
 ) -> Option<CreateModal> {
     let action = source.action(action_id)?;
-    if action.inputs.is_empty() || action.inputs.len() > 5 {
+    Some(
+        CreateModal::new(custom_id, action.title.clone())
+            .components(knowledge_input_rows(&action.inputs)?),
+    )
+}
+
+fn knowledge_input_rows(inputs: &[KnowledgeActionInput]) -> Option<Vec<CreateActionRow>> {
+    if inputs.is_empty() || inputs.len() > 5 {
         return None;
     }
-    let rows = action
+    Some(
+        inputs
+            .iter()
+            .map(|input| {
+                let style = if input.input_style == "paragraph" {
+                    InputTextStyle::Paragraph
+                } else {
+                    InputTextStyle::Short
+                };
+                let mut field =
+                    CreateInputText::new(style, input.label.clone(), input.input_id.clone())
+                        .placeholder(input.placeholder.clone())
+                        .max_length(input.max_length)
+                        .required(input.required);
+                if input.required {
+                    field = field.min_length(1);
+                }
+                CreateActionRow::InputText(field)
+            })
+            .collect(),
+    )
+}
+
+fn knowledge_global_modal(action_id: &str) -> Option<CreateModal> {
+    let action = knowledge_catalog().global_action(action_id)?;
+    Some(
+        CreateModal::new(
+            format!("oab_knowledge_modal:{action_id}"),
+            action.title.clone(),
+        )
+        .components(knowledge_input_rows(&action.inputs)?),
+    )
+}
+
+fn knowledge_global_prompt(
+    action_id: &str,
+    submitted: &[(&str, &str)],
+    source: Option<&KnowledgeSource>,
+) -> Option<(String, String)> {
+    let action = knowledge_catalog().global_action(action_id)?;
+    let submitted = submitted
+        .iter()
+        .map(|(name, value)| format!("- {name}: {value}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let mut prompt = knowledge_catalog().global_prompt(action_id)?;
+    if let Some(source) = source {
+        prompt.push_str("\n\n");
+        prompt.push_str(&source.adapter_context());
+    }
+    if !submitted.is_empty() {
+        prompt.push_str(&format!("\n\n執行上下文：\n{submitted}"));
+    }
+    Some((action.title.clone(), prompt))
+}
+
+fn knowledge_global_modal_prompt(
+    action_id: &str,
+    modal: &serenity::model::application::ModalInteraction,
+) -> Option<(String, String)> {
+    let action = knowledge_catalog().global_action(action_id)?;
+    let submitted = action
         .inputs
         .iter()
         .map(|input| {
-            let style = if input.input_style == "paragraph" {
-                InputTextStyle::Paragraph
-            } else {
-                InputTextStyle::Short
-            };
-            let mut field = CreateInputText::new(
-                style,
-                input.label.clone(),
-                input.input_id.clone(),
-            )
-            .placeholder(input.placeholder.clone())
-            .max_length(input.max_length)
-            .required(input.required);
-            if input.required {
-                field = field.min_length(1);
+            let value = modal_input_value(modal, &input.input_id)
+                .map(str::trim)
+                .filter(|value| !value.is_empty());
+            if input.required && value.is_none() {
+                return None;
             }
-            CreateActionRow::InputText(field)
+            Some((input.label.clone(), value.unwrap_or("未提供").to_string()))
         })
-        .collect();
-    Some(CreateModal::new(custom_id, fallback_title).components(rows))
+        .collect::<Option<Vec<_>>>()?;
+    let borrowed = submitted
+        .iter()
+        .map(|(name, value)| (name.as_str(), value.as_str()))
+        .collect::<Vec<_>>();
+    knowledge_global_prompt(action_id, &borrowed, None)
 }
 
 fn knowledge_action_prompt(
@@ -1033,10 +1143,7 @@ fn knowledge_modal_action_prompt(
             if input.required && value.is_none() {
                 return None;
             }
-            Some((
-                input.label.clone(),
-                value.unwrap_or("未提供").to_string(),
-            ))
+            Some((input.label.clone(), value.unwrap_or("未提供").to_string()))
         })
         .collect::<Option<Vec<_>>>()?;
     let borrowed = submitted
@@ -1047,6 +1154,9 @@ fn knowledge_modal_action_prompt(
 }
 
 fn knowledge_scheduled_source_select() -> CreateActionRow {
+    let view = knowledge_catalog()
+        .view("scheduled_source")
+        .expect("seeded scheduled source view");
     let options = knowledge_catalog()
         .sources_by_kind("scheduled")
         .iter()
@@ -1060,21 +1170,22 @@ fn knowledge_scheduled_source_select() -> CreateActionRow {
             "oab_knowledge:scheduled_source",
             CreateSelectMenuKind::String { options },
         )
-        .placeholder("選擇排程資料庫"),
+        .placeholder(view.select_placeholder.clone()),
     )
 }
 
 fn knowledge_scheduled_source_message(
     source: &KnowledgeSource,
 ) -> CreateInteractionResponseMessage {
+    let view = knowledge_catalog()
+        .view("scheduled_source")
+        .expect("seeded scheduled source view");
     CreateInteractionResponseMessage::new()
         .embed(
             CreateEmbed::new()
                 .title(source.title.clone())
-                .description(
-                    "選擇要執行的操作。搜尋會使用這個來源的原生欄位並以文章卡片回傳；待刪除清單可直接選擇要永久保留的項目。",
-                )
-                .colour(0x2F80ED),
+                .description(view.description.clone())
+                .colour(view.colour),
         )
         .components(vec![knowledge_action_buttons(source, |action| {
             format!(
@@ -1090,7 +1201,6 @@ fn knowledge_scheduled_source_search_modal(source: &KnowledgeSource) -> CreateMo
         source,
         "search",
         format!("oab_knowledge_modal:source_search:{}", source.source_id),
-        "搜尋排程來源",
     )
     .expect("scheduled search action has inputs")
 }
@@ -1104,14 +1214,15 @@ fn knowledge_scheduled_source_prompt(
 
 fn knowledge_reading_list_message() -> CreateInteractionResponseMessage {
     let source = knowledge_reading_list().expect("seeded Reading List source");
+    let view = knowledge_catalog()
+        .view("reading_list")
+        .expect("seeded Reading List view");
     CreateInteractionResponseMessage::new()
         .embed(
             CreateEmbed::new()
                 .title(source.title.clone())
-                .description(
-                    "使用原生書籍欄位查詢待讀、閱讀中與已讀內容。快捷操作維持唯讀，不會變更閱讀狀態或評分。",
-                )
-                .colour(0xE67E22),
+                .description(view.description.clone())
+                .colour(view.colour),
         )
         .components(vec![knowledge_action_buttons(source, |action| {
             format!("oab_knowledge:reading_list_{}", action.action_id)
@@ -1124,7 +1235,6 @@ fn knowledge_reading_list_search_modal() -> CreateModal {
         knowledge_reading_list().expect("seeded Reading List source"),
         "search",
         "oab_knowledge_modal:reading_list_search".to_string(),
-        "搜尋 Reading List",
     )
     .expect("Reading List search action has inputs")
 }
@@ -1134,6 +1244,9 @@ fn knowledge_reading_list_prompt(operation: &str) -> Option<(String, String)> {
 }
 
 fn knowledge_side_project_select() -> CreateActionRow {
+    let view = knowledge_catalog()
+        .view("side_projects")
+        .expect("seeded Side Projects view");
     let options = knowledge_catalog()
         .sources_by_kind("side_project")
         .iter()
@@ -1147,37 +1260,41 @@ fn knowledge_side_project_select() -> CreateActionRow {
             "oab_knowledge:side_project",
             CreateSelectMenuKind::String { options },
         )
-        .placeholder("選擇 Side Project"),
+        .placeholder(view.select_placeholder.clone()),
     )
 }
 
 fn knowledge_side_projects_message() -> CreateInteractionResponseMessage {
+    let view = knowledge_catalog()
+        .view("side_projects")
+        .expect("seeded Side Projects view");
     CreateInteractionResponseMessage::new()
         .embed(
             CreateEmbed::new()
-                .title("🧰 Side Projects")
-                .description(
-                    "記錄還沒落地的想法、備忘、問題與待研究方向。先選擇專案；未確認的內容不會寫入 Notion。",
-                )
-                .colour(0x57F287),
+                .title(view.title.clone())
+                .description(view.description.clone())
+                .colour(view.colour),
         )
         .components(vec![knowledge_side_project_select()])
         .ephemeral(true)
 }
 
-fn knowledge_side_project_message(
-    project: &KnowledgeSource,
-) -> CreateInteractionResponseMessage {
+fn knowledge_side_project_message(project: &KnowledgeSource) -> CreateInteractionResponseMessage {
     let notion_project = project.config_string("notion_project").unwrap_or_default();
+    let view = knowledge_catalog()
+        .view("side_project")
+        .expect("seeded Side Project view");
     CreateInteractionResponseMessage::new()
         .embed(
             CreateEmbed::new()
                 .title(project.title.clone())
-                .description(
-                    "把還沒確定的內容保存為 Draft 備忘，不會自動當成正式規格或決策。查詢與整理維持唯讀。",
+                .description(view.description.clone())
+                .field(
+                    view.field_label.clone(),
+                    inline_code(&notion_project),
+                    false,
                 )
-                .field("Notion Project", inline_code(&notion_project), false)
-                .colour(0x57F287),
+                .colour(view.colour),
         )
         .components(vec![knowledge_action_buttons(project, |action| {
             format!(
@@ -1193,7 +1310,6 @@ fn knowledge_project_note_new_modal(project: &KnowledgeSource) -> CreateModal {
         project,
         "new",
         format!("oab_knowledge_modal:project_note_new:{}", project.source_id),
-        "記下 Side Project 想法",
     )
     .expect("Side Project new action has inputs")
 }
@@ -1202,8 +1318,10 @@ fn knowledge_project_note_search_modal(project: &KnowledgeSource) -> CreateModal
     knowledge_action_modal(
         project,
         "search",
-        format!("oab_knowledge_modal:project_note_search:{}", project.source_id),
-        "搜尋 Side Project 備忘",
+        format!(
+            "oab_knowledge_modal:project_note_search:{}",
+            project.source_id
+        ),
     )
     .expect("Side Project search action has inputs")
 }
@@ -1216,8 +1334,11 @@ fn knowledge_side_project_prompt(
 }
 
 fn knowledge_slash_command() -> CreateCommand {
-    CreateCommand::new("knowledge")
-        .description("Open the knowledge capture and Notion search home card")
+    let description = knowledge_catalog()
+        .view("home")
+        .and_then(|view| view.config_string("command_description"))
+        .expect("seeded Knowledge command description");
+    CreateCommand::new("knowledge").description(description)
 }
 
 fn apply_knowledge_command_profile(
@@ -1232,96 +1353,55 @@ fn apply_knowledge_command_profile(
 }
 
 fn knowledge_home_message() -> CreateInteractionResponseMessage {
+    let catalog = knowledge_catalog();
+    let view = catalog.view("home").expect("seeded Knowledge Home view");
+    let actions = catalog.global_actions_for("home");
+    let mut rows = actions
+        .iter()
+        .map(|action| action.row_number)
+        .collect::<Vec<_>>();
+    rows.sort_unstable();
+    rows.dedup();
+    let mut components = rows
+        .into_iter()
+        .map(|row| {
+            knowledge_global_buttons(
+                &actions
+                    .iter()
+                    .copied()
+                    .filter(|action| action.row_number == row)
+                    .collect::<Vec<_>>(),
+            )
+        })
+        .collect::<Vec<_>>();
+    components.push(knowledge_scheduled_source_select());
+    let mut embed = CreateEmbed::new()
+        .title(view.title.clone())
+        .description(view.description.clone())
+        .colour(view.colour);
+    if !view.field_label.is_empty() {
+        embed = embed.field(view.field_label.clone(), view.field_value.clone(), false);
+    }
+    if !view.footer.is_empty() {
+        embed = embed.footer(CreateEmbedFooter::new(view.footer.clone()));
+    }
     CreateInteractionResponseMessage::new()
-        .embed(
-            CreateEmbed::new()
-                .title("📚 知識整理小幫手")
-                .description(
-                    "快速收錄文章、查詢 Notion、整理 Side Project 筆記、瀏覽書籍閱讀清單，或操作固定排程資料庫。每次操作會建立獨立 thread，方便持續追問。",
-                )
-                .colour(0x2F80ED)
-                .field(
-                    "安全規則",
-                    "查詢預設唯讀；收錄與專案更新會先提供預覽，取得確認後才寫入 Notion。",
-                    false,
-                )
-                .footer(CreateEmbedFooter::new(
-                    "也可以直接 @知識整理小幫手 描述需求",
-                )),
-        )
-        .components(vec![
-            CreateActionRow::Buttons(vec![
-                CreateButton::new("oab_knowledge:capture")
-                    .label("➕ 收錄文章")
-                    .style(ButtonStyle::Primary),
-                CreateButton::new("oab_knowledge:search")
-                    .label("🔎 查詢知識")
-                    .style(ButtonStyle::Secondary),
-                CreateButton::new("oab_knowledge:project")
-                    .label("🧰 Side Project")
-                    .style(ButtonStyle::Secondary),
-                CreateButton::new("oab_knowledge:reading_list")
-                    .label("📕 閱讀清單")
-                    .style(ButtonStyle::Secondary),
-            ]),
-            CreateActionRow::Buttons(vec![
-                CreateButton::new("oab_knowledge:recent")
-                    .label("🕘 最近收錄")
-                    .style(ButtonStyle::Secondary),
-                CreateButton::new("oab_knowledge:help")
-                    .label("❓ 使用說明")
-                    .style(ButtonStyle::Secondary),
-            ]),
-            knowledge_scheduled_source_select(),
-        ])
+        .embed(embed)
+        .components(components)
 }
 
 fn knowledge_capture_modal() -> CreateModal {
-    CreateModal::new("oab_knowledge_modal:capture", "收錄文章").components(vec![
-        CreateActionRow::InputText(
-            CreateInputText::new(InputTextStyle::Paragraph, "網址或內容", "source")
-                .placeholder("貼上文章網址、Notion 頁面連結或要整理的文字")
-                .min_length(1)
-                .max_length(4000),
-        ),
-        CreateActionRow::InputText(
-            CreateInputText::new(InputTextStyle::Paragraph, "收藏原因（選填）", "note")
-                .placeholder("為什麼想收藏？希望保留哪些重點？")
-                .max_length(1000)
-                .required(false),
-        ),
-        CreateActionRow::InputText(
-            CreateInputText::new(InputTextStyle::Short, "分類提示（選填）", "classification")
-                .placeholder("例如：AI、新聞、Guide、Project 名稱")
-                .max_length(200)
-                .required(false),
-        ),
-    ])
+    knowledge_global_modal("capture").expect("seeded capture workflow")
 }
 
 fn knowledge_search_modal() -> CreateModal {
-    CreateModal::new("oab_knowledge_modal:search", "查詢知識").components(vec![
-        CreateActionRow::InputText(
-            CreateInputText::new(InputTextStyle::Paragraph, "想查詢的問題", "question")
-                .placeholder("例如：Project Alpha 目前採用哪個控制方案？")
-                .min_length(1)
-                .max_length(4000),
-        ),
-        CreateActionRow::InputText(
-            CreateInputText::new(InputTextStyle::Short, "範圍（選填）", "scope")
-                .placeholder("Project、主題、時間範圍或文章類型")
-                .max_length(300)
-                .required(false),
-        ),
-    ])
+    knowledge_global_modal("search").expect("seeded search workflow")
 }
 
 fn project_welcome_components(tasks: &[TaskRecord]) -> Vec<CreateActionRow> {
-    let mut primary = vec![
-        CreateButton::new("oab_project:new")
-            .label("▶ New task")
-            .style(ButtonStyle::Primary),
-    ];
+    let mut primary = vec![CreateButton::new("oab_project:new")
+        .label("▶ New task")
+        .style(ButtonStyle::Primary)];
     if agent_presentation().local_publish_enabled {
         primary.push(
             CreateButton::new("oab_project:attach")
@@ -1620,7 +1700,11 @@ fn task_actions_message(
         ));
     if actions.is_empty() {
         return CreateInteractionResponseMessage::new()
-            .embed(embed.field("尚未設定", "這個 repository 尚未設定 Quick actions。", false))
+            .embed(embed.field(
+                "尚未設定",
+                "這個 repository 尚未設定 Quick actions。",
+                false,
+            ))
             .ephemeral(true);
     }
     let options = actions
@@ -1722,9 +1806,8 @@ fn project_command_display_with_book(
     book_slug: Option<&str>,
 ) -> String {
     truncate_for_discord(
-        &project_command_argv_display(command, book_slug).unwrap_or_else(|_| {
-            project_command_display(command)
-        }),
+        &project_command_argv_display(command, book_slug)
+            .unwrap_or_else(|_| project_command_display(command)),
         400,
     )
 }
@@ -1786,6 +1869,7 @@ fn project_command_book_picker_message(
 fn project_commands_message(
     binding: &ProjectBinding,
     commands: &[&DiscordProjectCommandConfig],
+    queued: usize,
 ) -> CreateInteractionResponseMessage {
     let mut embed = CreateEmbed::new()
         .title(format!(
@@ -1808,6 +1892,11 @@ fn project_commands_message(
                 "請由管理者在 `[[discord.project_commands]]` 加入這個 workspace 的固定指令。",
                 false,
             ))
+            .components(vec![CreateActionRow::Buttons(vec![CreateButton::new(
+                "oab_repo_queue:open",
+            )
+            .label(format!("Command Queue ({queued})"))
+            .style(ButtonStyle::Secondary)])])
             .ephemeral(true);
     }
 
@@ -1838,7 +1927,178 @@ fn project_commands_message(
     .placeholder(placeholder);
     CreateInteractionResponseMessage::new()
         .embed(embed)
-        .components(vec![CreateActionRow::SelectMenu(select)])
+        .components(vec![
+            CreateActionRow::SelectMenu(select),
+            CreateActionRow::Buttons(vec![CreateButton::new("oab_repo_queue:open")
+                .label(format!("Command Queue ({queued})"))
+                .style(ButtonStyle::Secondary)]),
+        ])
+        .ephemeral(true)
+}
+
+fn repository_command_state_label(state: RepositoryCommandState) -> &'static str {
+    match state {
+        RepositoryCommandState::Pending => "⏳ Waiting",
+        RepositoryCommandState::Running => "🔄 Running",
+        RepositoryCommandState::Completed => "✅ Completed",
+        RepositoryCommandState::Failed => "❌ Failed",
+        RepositoryCommandState::Cancelled => "⏹ Cancelled",
+    }
+}
+
+fn repository_command_label(
+    job: &RepositoryCommandJob,
+    commands: &[&DiscordProjectCommandConfig],
+) -> String {
+    commands
+        .iter()
+        .find(|command| command.id == job.command_id)
+        .map(|command| command.label.trim())
+        .filter(|label| !label.is_empty())
+        .unwrap_or(&job.command_id)
+        .to_string()
+}
+
+fn repository_command_queue_message(
+    binding: &ProjectBinding,
+    jobs: &[RepositoryCommandJob],
+    commands: &[&DiscordProjectCommandConfig],
+    selected_id: Option<u64>,
+    note: Option<&str>,
+) -> CreateInteractionResponseMessage {
+    let waiting = jobs
+        .iter()
+        .filter(|job| job.state == RepositoryCommandState::Pending)
+        .count();
+    let running = jobs
+        .iter()
+        .filter(|job| job.state == RepositoryCommandState::Running)
+        .count();
+    let mut description = format!(
+        "Repository: {}\n同一 repository 依序執行；不同 repositories 可並行。只執行管理者 allowlist 內的固定指令。\n\n**Running:** {running} · **Waiting:** {waiting}",
+        inline_code(&format!("@{}", binding.workspace_alias))
+    );
+    if let Some(note) = note.filter(|note| !note.is_empty()) {
+        description.push_str("\n\n");
+        description.push_str(note);
+    }
+    let selected = selected_id
+        .and_then(|id| jobs.iter().find(|job| job.id == id))
+        .or_else(|| {
+            jobs.iter()
+                .find(|job| job.state == RepositoryCommandState::Running)
+        })
+        .or_else(|| {
+            jobs.iter()
+                .find(|job| job.state == RepositoryCommandState::Pending)
+        })
+        .or_else(|| jobs.last());
+    let mut embed = CreateEmbed::new()
+        .title("📋 Repository Command Queue")
+        .description(description)
+        .colour(0x3498DB);
+    if let Some(job) = selected {
+        let book = job
+            .book_slug
+            .as_deref()
+            .map(|slug| format!(" · book `{slug}`"))
+            .unwrap_or_default();
+        let recovered = if job.recovered_from_active {
+            "\nRecovered after restart; command will be revalidated before execution."
+        } else {
+            ""
+        };
+        embed = embed.field(
+            format!("Selected · #{}", job.id),
+            format!(
+                "{} · **{}**{}\nRequested by <@{}> · <t:{}:R>{}",
+                repository_command_state_label(job.state),
+                suppress_mentions(&repository_command_label(job, commands)),
+                book,
+                job.requested_by,
+                job.created_at.timestamp(),
+                recovered,
+            ),
+            false,
+        );
+    } else {
+        embed = embed.field(
+            "Queue is empty",
+            "Run a repository command to add it here.",
+            false,
+        );
+    }
+
+    let mut components = Vec::new();
+    if !jobs.is_empty() {
+        let options = jobs
+            .iter()
+            .rev()
+            .take(SELECT_MENU_PAGE_SIZE)
+            .map(|job| {
+                let label = format!(
+                    "{} · #{} · {}",
+                    repository_command_state_label(job.state),
+                    job.id,
+                    repository_command_label(job, commands)
+                );
+                let description = format!("Requested <t:{}:R>", job.created_at.timestamp());
+                CreateSelectMenuOption::new(
+                    truncate_for_discord(&label, SELECT_OPTION_TEXT_MAX),
+                    job.id.to_string(),
+                )
+                .description(truncate_for_discord(&description, SELECT_OPTION_TEXT_MAX))
+                .default_selection(selected.is_some_and(|selected| selected.id == job.id))
+            })
+            .collect();
+        components.push(CreateActionRow::SelectMenu(
+            CreateSelectMenu::new(
+                "oab_repo_queue:select",
+                CreateSelectMenuKind::String { options },
+            )
+            .placeholder("Select a command"),
+        ));
+    }
+    let mut buttons = vec![CreateButton::new("oab_repo_queue:refresh")
+        .label("Refresh")
+        .style(ButtonStyle::Secondary)];
+    if let Some(job) = selected {
+        match job.state {
+            RepositoryCommandState::Pending => {
+                buttons.push(
+                    CreateButton::new(format!("oab_repo_queue:next:{}", job.id))
+                        .label("Move next")
+                        .style(ButtonStyle::Primary),
+                );
+                buttons.push(
+                    CreateButton::new(format!("oab_repo_queue:remove:{}", job.id))
+                        .label("Remove")
+                        .style(ButtonStyle::Danger),
+                );
+            }
+            RepositoryCommandState::Running => buttons.push(
+                CreateButton::new(format!("oab_repo_queue:cancel:{}", job.id))
+                    .label("Stop")
+                    .style(ButtonStyle::Danger),
+            ),
+            RepositoryCommandState::Completed
+            | RepositoryCommandState::Failed
+            | RepositoryCommandState::Cancelled => buttons.push(
+                CreateButton::new(format!("oab_repo_queue:result:{}", job.id))
+                    .label("View result")
+                    .style(ButtonStyle::Primary),
+            ),
+        }
+    }
+    buttons.push(
+        CreateButton::new("oab_project:commands")
+            .label("Back to Commands")
+            .style(ButtonStyle::Secondary),
+    );
+    components.push(CreateActionRow::Buttons(buttons));
+    CreateInteractionResponseMessage::new()
+        .embed(embed)
+        .components(components)
         .ephemeral(true)
 }
 
@@ -1859,8 +2119,10 @@ fn project_command_confirmation_message(
         None => format!("{PROJECT_COMMAND_RUN_CUSTOM_ID_PREFIX}{}", command.id),
     };
     let mut embed = CreateEmbed::new()
-        .title("⚠️ Confirm repository command")
-        .description("這個固定指令被標記為需要確認。確認後會直接在 repository 執行。")
+        .title("⚠️ Queue repository command")
+        .description(
+            "這個固定指令被標記為需要確認。確認後會加入 repository 的 FIFO queue，輪到時才執行。",
+        )
         .colour(0xE67E22)
         .field(
             "Repository",
@@ -1875,10 +2137,14 @@ fn project_command_confirmation_message(
         .field("Execution", execution, false)
         .field(
             "Cursor session",
-            "Unchanged · command output is shown only in this ephemeral card",
+            "Unchanged · completion is posted here; output stays in the ephemeral Queue card",
             false,
         )
-        .field("Timeout", format!("{} seconds", command.timeout_seconds), true);
+        .field(
+            "Timeout",
+            format!("{} seconds", command.timeout_seconds),
+            true,
+        );
     if let Some(slug) = book_slug {
         embed = embed.field("Book", inline_code(slug), true);
     }
@@ -1886,8 +2152,8 @@ fn project_command_confirmation_message(
         .embed(embed)
         .components(vec![CreateActionRow::Buttons(vec![
             CreateButton::new(run_custom_id)
-                .label("Run command")
-                .style(ButtonStyle::Danger),
+                .label("Add to queue")
+                .style(ButtonStyle::Primary),
             CreateButton::new("oab_project_command:cancel")
                 .label("Cancel")
                 .style(ButtonStyle::Secondary),
@@ -1895,6 +2161,7 @@ fn project_command_confirmation_message(
         .ephemeral(true)
 }
 
+#[cfg(test)]
 fn project_command_result_content(
     binding: &ProjectBinding,
     command: &DiscordProjectCommandConfig,
@@ -1942,12 +2209,57 @@ fn project_command_result_content(
     format!("{prefix}{captured}{suffix}")
 }
 
+fn repository_command_result_content(
+    binding: &ProjectBinding,
+    job: &RepositoryCommandJob,
+    commands: &[&DiscordProjectCommandConfig],
+) -> String {
+    let result = job.result.as_ref();
+    let mut captured = String::new();
+    if let Some(result) = result {
+        if let Some(error) = result.error.as_deref() {
+            captured.push_str("[error]\n");
+            captured.push_str(error);
+        }
+        if !result.stdout.trim().is_empty() {
+            if !captured.is_empty() {
+                captured.push('\n');
+            }
+            captured.push_str("[stdout]\n");
+            captured.push_str(result.stdout.trim_end());
+        }
+        if !result.stderr.trim().is_empty() {
+            if !captured.is_empty() {
+                captured.push('\n');
+            }
+            captured.push_str("[stderr]\n");
+            captured.push_str(result.stderr.trim_end());
+        }
+        if result.truncated {
+            captured.push_str("\n… output truncated by OpenAB");
+        }
+    }
+    if captured.is_empty() {
+        captured.push_str("(no output)");
+    }
+    let captured = suppress_mentions(&strip_ansi_codes(&captured)).replace("```", "''' ");
+    let duration = result.map_or(0.0, |result| result.elapsed_ms as f64 / 1000.0);
+    format!(
+        "{} · job `#{}`\nRepository: {}\nCommand: **{}**\nDuration: {:.2}s\n```text\n{}\n```",
+        repository_command_state_label(job.state),
+        job.id,
+        inline_code(&format!("@{}", binding.workspace_alias)),
+        suppress_mentions(&repository_command_label(job, commands)),
+        duration,
+        truncate_for_discord(&captured, 1200),
+    )
+}
+
 fn project_task_modal(title: Option<&str>, prompt: Option<&str>) -> CreateModal {
-    let mut title_input =
-        CreateInputText::new(InputTextStyle::Short, "Task title", "title")
-            .placeholder("Fix login redirect")
-            .max_length(100)
-            .required(false);
+    let mut title_input = CreateInputText::new(InputTextStyle::Short, "Task title", "title")
+        .placeholder("Fix login redirect")
+        .max_length(100)
+        .required(false);
     if let Some(title) = title.filter(|value| !value.trim().is_empty()) {
         title_input = title_input.value(truncate_for_discord(title.trim(), 100));
     }
@@ -2118,7 +2430,7 @@ fn help_action_center(
         );
     }
     let mut components = Vec::new();
-        if let Some(task) = task {
+    if let Some(task) = task {
         let (_, state, _) = task_state_presentation(task.state);
         let guidance = match task.state {
             TaskState::Ready if agent_presentation().local_handoff_enabled => {
@@ -2175,11 +2487,9 @@ fn help_action_center(
             components.push(CreateActionRow::Buttons(task_buttons));
         }
     }
-    let mut help_buttons = vec![
-        CreateButton::new("oab_help:discord")
-            .label("📱 Start on Discord")
-            .style(ButtonStyle::Primary),
-    ];
+    let mut help_buttons = vec![CreateButton::new("oab_help:discord")
+        .label("📱 Start on Discord")
+        .style(ButtonStyle::Primary)];
     if agent_presentation().local_handoff_enabled {
         help_buttons.push(
             CreateButton::new("oab_help:cursor")
@@ -2422,23 +2732,18 @@ fn task_prompt_modal(action: &str, initial_prompt: Option<&str>) -> CreateModal 
 }
 
 fn task_action_modal(action: &DiscordProjectActionConfig) -> CreateModal {
-    let title = truncate_for_discord(
-        &format!("Quick action · {}", action.label.trim()),
-        45,
-    );
-    CreateModal::new("oab_task_prompt:action", title).components(vec![
-        CreateActionRow::InputText(
-            CreateInputText::new(
-                InputTextStyle::Paragraph,
-                "Review before sending to this session",
-                "prompt",
-            )
-            .placeholder("Adjust this repository action before continuing")
-            .value(truncate_for_discord(action.prompt.trim(), 4000))
-            .min_length(1)
-            .max_length(4000),
-        ),
-    ])
+    let title = truncate_for_discord(&format!("Quick action · {}", action.label.trim()), 45);
+    CreateModal::new("oab_task_prompt:action", title).components(vec![CreateActionRow::InputText(
+        CreateInputText::new(
+            InputTextStyle::Paragraph,
+            "Review before sending to this session",
+            "prompt",
+        )
+        .placeholder("Adjust this repository action before continuing")
+        .value(truncate_for_discord(action.prompt.trim(), 4000))
+        .min_length(1)
+        .max_length(4000),
+    )])
 }
 
 pub(crate) fn modal_input_value<'a>(
@@ -2647,7 +2952,9 @@ impl ChatAdapter for DiscordAdapter {
     ) -> anyhow::Result<MessageRef> {
         let ch_id: u64 = Self::resolve_channel(channel).parse()?;
         let msg = if let Some(builder) = knowledge_cards_message(content) {
-            ChannelId::new(ch_id).send_message(&self.http, builder).await?
+            ChannelId::new(ch_id)
+                .send_message(&self.http, builder)
+                .await?
         } else {
             ChannelId::new(ch_id).say(&self.http, content).await?
         };
@@ -2903,8 +3210,8 @@ pub struct Handler {
     pub project_actions: Vec<DiscordProjectActionConfig>,
     /// Trusted, per-workspace executable shortcuts rendered in Project Home.
     pub project_commands: Vec<DiscordProjectCommandConfig>,
-    /// Prevent duplicate clicks from running the same command concurrently.
-    pub project_command_runs: tokio::sync::Mutex<HashSet<String>>,
+    /// Durable, typed FIFO queue for allowlisted repository commands.
+    pub repository_command_queue: RepositoryCommandQueue,
     /// Baseline cron jobs from config.toml (Discord Schedules UI).
     pub cron_jobs: Vec<CronJobConfig>,
     /// Discord overlay for cron `enabled` (persisted outside config.toml).
@@ -3227,7 +3534,11 @@ impl Handler {
                     thread_parent_id: if has_thread_metadata { parent } else { None },
                     is_dm: false,
                     is_structural_thread: has_thread_metadata,
-                    structural_parent_id: if has_thread_metadata { parent_u64 } else { None },
+                    structural_parent_id: if has_thread_metadata {
+                        parent_u64
+                    } else {
+                        None
+                    },
                 }
             }
             Ok(serenity::model::channel::Channel::Private(_)) => {
@@ -3687,7 +3998,10 @@ impl EventHandler for Handler {
 
         // Bot messages in ambient contexts are handled above and never reach
         // here unless they @mention this bot.
-        if !self.admits_bot_message(&ctx, &msg, bot_id, is_mentioned).await {
+        if !self
+            .admits_bot_message(&ctx, &msg, bot_id, is_mentioned)
+            .await
+        {
             return;
         }
 
@@ -3820,9 +4134,7 @@ impl EventHandler for Handler {
             extra_blocks,
             echo_entries,
             failed_image_files,
-        } = self
-            .collect_attachment_blocks(&msg, &adapter)
-            .await;
+        } = self.collect_attachment_blocks(&msg, &adapter).await;
 
         tracing::debug!(
             num_extra_blocks = extra_blocks.len(),
@@ -4321,13 +4633,11 @@ impl EventHandler for Handler {
             CreateCommand::new("cancel-all")
                 .description("Cancel current operation and drop all buffered messages"),
             CreateCommand::new("reset").description("Reset the conversation session"),
-            CreateCommand::new("help").description(
-                if agent_presentation().local_handoff_enabled {
-                    "Show the Discord and Cursor handoff quick guide"
-                } else {
-                    "Show the Discord development quick guide"
-                },
-            ),
+            CreateCommand::new("help").description(if agent_presentation().local_handoff_enabled {
+                "Show the Discord and Cursor handoff quick guide"
+            } else {
+                "Show the Discord development quick guide"
+            }),
             CreateCommand::new("workspace")
                 .description("Inspect workspace routing for this channel or session")
                 .add_option(CreateCommandOption::new(
@@ -4483,10 +4793,8 @@ impl EventHandler for Handler {
                     "Export all messages (up to 5000). Default is last 100.",
                 )),
         ];
-        let commands = apply_knowledge_command_profile(
-            commands,
-            agent_presentation().knowledge_ui_enabled,
-        );
+        let commands =
+            apply_knowledge_command_profile(commands, agent_presentation().knowledge_ui_enabled);
 
         // Register global commands only. Registering the same commands per-guild
         // makes Discord show duplicate slash commands in guild command pickers.
@@ -4512,6 +4820,12 @@ impl EventHandler for Handler {
 
         self.reconcile_project_channels(&ctx).await;
 
+        // Running jobs are restored as Waiting during load. Resume one FIFO
+        // worker per repository only after Discord and project routing are ready.
+        for workspace_alias in self.repository_command_queue.pending_aliases() {
+            self.ensure_repository_command_worker(&ctx, &workspace_alias);
+        }
+
         // Re-schedule any pending reminders that survived a restart.
         let pending = self.reminder_store.pending().await;
         if !pending.is_empty() {
@@ -4532,17 +4846,18 @@ impl EventHandler for Handler {
     async fn interaction_create(&self, ctx: Context, interaction: Interaction) {
         match interaction {
             Interaction::Command(cmd)
-                if agent_presentation().knowledge_ui_enabled
-                    && cmd.data.name != "knowledge" =>
+                if agent_presentation().knowledge_ui_enabled && cmd.data.name != "knowledge" =>
             {
-                let _ = cmd.create_response(
-                    &ctx.http,
-                    CreateInteractionResponse::Message(
-                        CreateInteractionResponseMessage::new()
-                            .content("⚠️ 這個小幫手的功能都集中在 `/knowledge`。")
-                            .ephemeral(true),
-                    ),
-                ).await;
+                let _ = cmd
+                    .create_response(
+                        &ctx.http,
+                        CreateInteractionResponse::Message(
+                            CreateInteractionResponseMessage::new()
+                                .content("⚠️ 這個小幫手的功能都集中在 `/knowledge`。")
+                                .ephemeral(true),
+                        ),
+                    )
+                    .await;
             }
             Interaction::Autocomplete(cmd) if cmd.data.name == "project" => {
                 self.handle_project_autocomplete(&ctx, &cmd).await;
@@ -4632,6 +4947,10 @@ impl EventHandler for Handler {
             Interaction::Component(comp) if comp.data.custom_id == "oab_project_commands" => {
                 self.handle_project_command_select(&ctx, &comp).await;
             }
+            Interaction::Component(comp) if comp.data.custom_id.starts_with("oab_repo_queue:") => {
+                self.handle_repository_command_queue_control(&ctx, &comp)
+                    .await;
+            }
             Interaction::Component(comp)
                 if comp.data.custom_id.starts_with("oab_project_command:") =>
             {
@@ -4660,9 +4979,7 @@ impl EventHandler for Handler {
             Interaction::Modal(modal) if modal.data.custom_id == "oab_admin_category_create" => {
                 self.handle_admin_category_modal(&ctx, &modal).await;
             }
-            Interaction::Modal(modal)
-                if modal.data.custom_id.starts_with("oab_admin_rename:") =>
-            {
+            Interaction::Modal(modal) if modal.data.custom_id.starts_with("oab_admin_rename:") => {
                 self.handle_admin_rename_modal(&ctx, &modal).await;
             }
             Interaction::Modal(modal)
@@ -4711,9 +5028,7 @@ fn project_actions_for_workspace<'a>(
         .collect::<HashSet<_>>();
     actions
         .iter()
-        .filter(|action| {
-            action.workspace_alias == "*" && !local_ids.contains(action.id.as_str())
-        })
+        .filter(|action| action.workspace_alias == "*" && !local_ids.contains(action.id.as_str()))
         .chain(
             actions
                 .iter()
@@ -5513,21 +5828,38 @@ impl Handler {
         cmd: &serenity::model::application::CommandInteraction,
     ) {
         if !agent_presentation().knowledge_ui_enabled {
-            let _ = cmd.create_response(&ctx.http, CreateInteractionResponse::Message(
-                CreateInteractionResponseMessage::new().content("⚠️ Knowledge UI is disabled for this agent.").ephemeral(true),
-            )).await;
+            let _ = cmd
+                .create_response(
+                    &ctx.http,
+                    CreateInteractionResponse::Message(
+                        CreateInteractionResponseMessage::new()
+                            .content("⚠️ Knowledge UI is disabled for this agent.")
+                            .ephemeral(true),
+                    ),
+                )
+                .await;
             return;
         }
         if let Err(message) = self.resolve_command_scope(ctx, cmd).await {
-            let _ = cmd.create_response(&ctx.http, CreateInteractionResponse::Message(
-                CreateInteractionResponseMessage::new().content(message).ephemeral(true),
-            )).await;
+            let _ = cmd
+                .create_response(
+                    &ctx.http,
+                    CreateInteractionResponse::Message(
+                        CreateInteractionResponseMessage::new()
+                            .content(message)
+                            .ephemeral(true),
+                    ),
+                )
+                .await;
             return;
         }
-        if let Err(error) = cmd.create_response(
-            &ctx.http,
-            CreateInteractionResponse::Message(knowledge_home_message()),
-        ).await {
+        if let Err(error) = cmd
+            .create_response(
+                &ctx.http,
+                CreateInteractionResponse::Message(knowledge_home_message()),
+            )
+            .await
+        {
             tracing::error!(%error, "failed to show Knowledge Home");
         }
     }
@@ -5541,26 +5873,45 @@ impl Handler {
         prompt: String,
     ) -> Result<u64, String> {
         let title = truncate_for_discord(title.trim(), 100);
-        let parent_id = scope.channel_ref.parent_id.as_deref()
+        let parent_id = scope
+            .channel_ref
+            .parent_id
+            .as_deref()
             .and_then(|value| value.parse::<u64>().ok());
         let (target_id, target_parent_id) = if parent_id.is_some() {
-            (scope.channel_ref.channel_id.parse::<u64>()
-                .map_err(|_| "The current Discord thread ID is invalid.".to_string())?, parent_id)
+            (
+                scope
+                    .channel_ref
+                    .channel_id
+                    .parse::<u64>()
+                    .map_err(|_| "The current Discord thread ID is invalid.".to_string())?,
+                parent_id,
+            )
         } else {
-            let channel_id = scope.channel_ref.channel_id.parse::<u64>()
+            let channel_id = scope
+                .channel_ref
+                .channel_id
+                .parse::<u64>()
                 .map_err(|_| "The current Discord channel ID is invalid.".to_string())?;
-            let starter = ChannelId::new(channel_id).send_message(
-                &ctx.http,
-                CreateMessage::new().content(format!(
-                    "📚 **{}**\nStarted by <@{}> via Knowledge Home",
-                    suppress_mentions(&title.replace(['*', '`'], "")), user.id,
-                )),
-            ).await.map_err(|error| format!("Could not create knowledge request: {error}"))?;
-            let thread = match ChannelId::new(channel_id).create_thread_from_message(
-                &ctx.http,
-                starter.id,
-                CreateThread::new(&title).auto_archive_duration(AutoArchiveDuration::OneDay),
-            ).await {
+            let starter = ChannelId::new(channel_id)
+                .send_message(
+                    &ctx.http,
+                    CreateMessage::new().content(format!(
+                        "📚 **{}**\nStarted by <@{}> via Knowledge Home",
+                        suppress_mentions(&title.replace(['*', '`'], "")),
+                        user.id,
+                    )),
+                )
+                .await
+                .map_err(|error| format!("Could not create knowledge request: {error}"))?;
+            let thread = match ChannelId::new(channel_id)
+                .create_thread_from_message(
+                    &ctx.http,
+                    starter.id,
+                    CreateThread::new(&title).auto_archive_duration(AutoArchiveDuration::OneDay),
+                )
+                .await
+            {
                 Ok(thread) => thread,
                 Err(error) => {
                     let _ = starter.delete(&ctx.http).await;
@@ -5571,12 +5922,14 @@ impl Handler {
         };
 
         let preview = suppress_mentions(&truncate_for_discord(&prompt, 1800));
-        let trigger = ChannelId::new(target_id).send_message(
-            &ctx.http,
-            CreateMessage::new().content(format!(
-                "👤 **Request from <@{}>**\n{}", user.id, preview,
-            )),
-        ).await.map_err(|error| format!("Could not post knowledge request: {error}"))?;
+        let trigger = ChannelId::new(target_id)
+            .send_message(
+                &ctx.http,
+                CreateMessage::new()
+                    .content(format!("👤 **Request from <@{}>**\n{}", user.id, preview,)),
+            )
+            .await
+            .map_err(|error| format!("Could not post knowledge request: {error}"))?;
         let channel_ref = ChannelRef {
             platform: "discord".into(),
             channel_id: target_id.to_string(),
@@ -5590,9 +5943,15 @@ impl Handler {
         };
         let display_name = user.global_name.as_deref().unwrap_or(&user.name);
         let sender = build_sender_context(
-            &user.id.to_string(), &user.name, display_name, &target_id.to_string(),
-            channel_ref.parent_id.as_deref(), false, &chrono::Utc::now().to_rfc3339(),
-            &trigger.id.to_string(), &ctx.cache.current_user().id.to_string(),
+            &user.id.to_string(),
+            &user.name,
+            display_name,
+            &target_id.to_string(),
+            channel_ref.parent_id.as_deref(),
+            false,
+            &chrono::Utc::now().to_rfc3339(),
+            &trigger.id.to_string(),
+            &ctx.cache.current_user().id.to_string(),
         );
         let dispatcher = self.dispatcher.clone();
         let adapter = self.discord_adapter(ctx);
@@ -5609,14 +5968,17 @@ impl Handler {
                 other_bot_present: false,
                 recipient: None,
             };
-            if let Err(error) = dispatcher.submit(
-                thread_key, channel_ref.clone(), adapter.clone(), request,
-            ).await {
+            if let Err(error) = dispatcher
+                .submit(thread_key, channel_ref.clone(), adapter.clone(), request)
+                .await
+            {
                 tracing::error!(%error, channel_id = %channel_ref.channel_id, "knowledge request dispatch failed");
-                let _ = adapter.send_message(
-                    &channel_ref,
-                    &format!("⚠️ Knowledge request could not be started: {error}"),
-                ).await;
+                let _ = adapter
+                    .send_message(
+                        &channel_ref,
+                        &format!("⚠️ Knowledge request could not be started: {error}"),
+                    )
+                    .await;
             }
         });
         Ok(target_id)
@@ -5628,23 +5990,42 @@ impl Handler {
         comp: &serenity::model::application::ComponentInteraction,
     ) {
         if !agent_presentation().knowledge_ui_enabled {
-            let _ = comp.create_response(&ctx.http, CreateInteractionResponse::Message(
-                CreateInteractionResponseMessage::new().content("⚠️ Knowledge UI is disabled for this agent.").ephemeral(true),
-            )).await;
+            let _ = comp
+                .create_response(
+                    &ctx.http,
+                    CreateInteractionResponse::Message(
+                        CreateInteractionResponseMessage::new()
+                            .content("⚠️ Knowledge UI is disabled for this agent.")
+                            .ephemeral(true),
+                    ),
+                )
+                .await;
             return;
         }
-        let scope = match self.resolve_session_scope(
-            ctx, comp.user.id.get(), comp.user.bot, comp.channel_id,
-        ).await {
+        let scope = match self
+            .resolve_session_scope(ctx, comp.user.id.get(), comp.user.bot, comp.channel_id)
+            .await
+        {
             Ok(scope) => scope,
             Err(message) => {
-                let _ = comp.create_response(&ctx.http, CreateInteractionResponse::Message(
-                    CreateInteractionResponseMessage::new().content(message).ephemeral(true),
-                )).await;
+                let _ = comp
+                    .create_response(
+                        &ctx.http,
+                        CreateInteractionResponse::Message(
+                            CreateInteractionResponseMessage::new()
+                                .content(message)
+                                .ephemeral(true),
+                        ),
+                    )
+                    .await;
                 return;
             }
         };
-        let action = comp.data.custom_id.strip_prefix("oab_knowledge:").unwrap_or("");
+        let action = comp
+            .data
+            .custom_id
+            .strip_prefix("oab_knowledge:")
+            .unwrap_or("");
         if action == "side_project" {
             let selected = first_string_select(&comp.data.kind).and_then(knowledge_side_project);
             let Some(project) = selected else {
@@ -5653,9 +6034,7 @@ impl Handler {
                         &ctx.http,
                         CreateInteractionResponse::Message(
                             CreateInteractionResponseMessage::new()
-                                .content(
-                                    "⚠️ 這個 Side Project 已失效，請重新執行 `/knowledge`。",
-                                )
+                                .content("⚠️ 這個 Side Project 已失效，請重新執行 `/knowledge`。")
                                 .ephemeral(true),
                         ),
                     )
@@ -5674,25 +6053,28 @@ impl Handler {
             return;
         }
         if action == "scheduled_source" {
-            let selected = first_string_select(&comp.data.kind)
-                .and_then(knowledge_scheduled_source);
+            let selected =
+                first_string_select(&comp.data.kind).and_then(knowledge_scheduled_source);
             let Some(source) = selected else {
-                let _ = comp.create_response(
-                    &ctx.http,
-                    CreateInteractionResponse::Message(
-                        CreateInteractionResponseMessage::new()
-                            .content("⚠️ 這個排程資料庫已失效，請重新執行 `/knowledge`。")
-                            .ephemeral(true),
-                    ),
-                ).await;
+                let _ = comp
+                    .create_response(
+                        &ctx.http,
+                        CreateInteractionResponse::Message(
+                            CreateInteractionResponseMessage::new()
+                                .content("⚠️ 這個排程資料庫已失效，請重新執行 `/knowledge`。")
+                                .ephemeral(true),
+                        ),
+                    )
+                    .await;
                 return;
             };
-            if let Err(error) = comp.create_response(
-                &ctx.http,
-                CreateInteractionResponse::Message(
-                    knowledge_scheduled_source_message(source),
-                ),
-            ).await {
+            if let Err(error) = comp
+                .create_response(
+                    &ctx.http,
+                    CreateInteractionResponse::Message(knowledge_scheduled_source_message(source)),
+                )
+                .await
+            {
                 tracing::error!(%error, source = source.source_id, "failed to show scheduled source actions");
             }
             return;
@@ -5721,14 +6103,16 @@ impl Handler {
                 Some((source_id.to_string(), target_page_id, queue_page_id))
             });
             let Some((source_id, target_page_id, queue_page_id)) = selected else {
-                let _ = comp.create_response(
-                    &ctx.http,
-                    CreateInteractionResponse::Message(
-                        CreateInteractionResponseMessage::new()
-                            .content("⚠️ 這筆待刪除操作已失效，請重新查詢待刪除清單。")
-                            .ephemeral(true),
-                    ),
-                ).await;
+                let _ = comp
+                    .create_response(
+                        &ctx.http,
+                        CreateInteractionResponse::Message(
+                            CreateInteractionResponseMessage::new()
+                                .content("⚠️ 這筆待刪除操作已失效，請重新查詢待刪除清單。")
+                                .ephemeral(true),
+                        ),
+                    )
+                    .await;
                 return;
             };
             if let Err(error) = comp.defer_ephemeral(&ctx.http).await {
@@ -5736,16 +6120,30 @@ impl Handler {
                 return;
             }
             let source = knowledge_scheduled_source(&source_id).expect("validated source");
-            let prompt = format!(
-                "使用 notion-knowledge Skill 的 Retention Review 模式執行 Retention Keep。這次 Discord 選單操作是使用者對下列單一 Queue 項目的明確保留授權。先依 retention.md fetch 並核對 Queue row、target 與 source；只有 Decision 為 Pending 或 Trash Due 且所有 ID 相符時，才把 Queue Decision 設為 Keep、Confirmed By 設為 Discord user ID、Processed At 設為今天。不要修改來源頁面。寫入後重新 fetch 驗證。\n\nsource_id: {source_id}\ntarget_page_id: {target_page_id}\nqueue_page_id: {queue_page_id}\nDiscord user ID: {}",
-                comp.user.id.get()
-            );
+            let user_id = comp.user.id.get().to_string();
+            let submitted = [
+                ("source_id", source_id.as_str()),
+                ("target_page_id", target_page_id.as_str()),
+                ("queue_page_id", queue_page_id.as_str()),
+                ("Discord user ID", user_id.as_str()),
+            ];
+            let Some((action_title, prompt)) =
+                knowledge_global_prompt("retention_keep", &submitted, Some(source))
+            else {
+                let _ = comp
+                    .edit_response(
+                        &ctx.http,
+                        EditInteractionResponse::new().content("⚠️ 保留工作流設定已失效。"),
+                    )
+                    .await;
+                return;
+            };
             let result = self
                 .submit_knowledge_prompt(
                     ctx,
                     scope,
                     &comp.user,
-                    &format!("{}｜永久保留", source.title),
+                    &format!("{}｜{action_title}", source.title),
                     prompt,
                 )
                 .await;
@@ -5785,19 +6183,32 @@ impl Handler {
                 tracing::error!(%error, project = project.source_id, "failed to acknowledge Project Note save");
                 return;
             }
-            let prompt = format!(
-                "使用 notion-knowledge Skill 的 Project Note Capture 模式執行確認寫入。這次按鈕操作是使用者對緊接在這個按鈕上方、且仍未處理的單一 Project Note 預覽所做的明確寫入授權。先重新取得 Knowledge Library schema 並檢查同一 Project 的重複筆記；只有預覽內容與固定 Project 相符且沒有歧義時才新增。若找不到唯一的待確認預覽或預覽已取消／處理，停止寫入並要求重新建立預覽。寫入後 fetch 驗證，並依 project_notes card contract 回覆建立完成的 Notion 頁面。不要修改或取代既有正式規格。\n\n固定 Side Project：{}\nNotion Project 欄位必須精確等於：{}\nDiscord preview message ID：{}\nDiscord user ID：{}",
-                project.title,
-                project.config_string("notion_project").unwrap_or_default(),
-                comp.message.id,
-                comp.user.id.get(),
-            );
+            let notion_project = project.config_string("notion_project").unwrap_or_default();
+            let preview_message_id = comp.message.id.to_string();
+            let user_id = comp.user.id.get().to_string();
+            let submitted = [
+                ("固定 Side Project", project.title.as_str()),
+                ("Notion Project", notion_project.as_str()),
+                ("Discord preview message ID", preview_message_id.as_str()),
+                ("Discord user ID", user_id.as_str()),
+            ];
+            let Some((action_title, prompt)) =
+                knowledge_global_prompt("project_note_save", &submitted, Some(project))
+            else {
+                let _ = comp
+                    .edit_response(
+                        &ctx.http,
+                        EditInteractionResponse::new().content("⚠️ 備忘寫入工作流設定已失效。"),
+                    )
+                    .await;
+                return;
+            };
             if let Err(error) = self
                 .submit_knowledge_prompt(
                     ctx,
                     scope,
                     &comp.user,
-                    &format!("{}｜儲存備忘", project.title),
+                    &format!("{}｜{action_title}", project.title),
                     prompt,
                 )
                 .await
@@ -5826,14 +6237,16 @@ impl Handler {
                     .await;
                 return;
             };
+            let content = knowledge_catalog()
+                .global_action("project_note_cancel")
+                .and_then(|action| action.config_string("message_template"))
+                .map(|template| template.replace("{source_title}", &project.title))
+                .unwrap_or_else(|| project.title.clone());
             if let Err(error) = comp
                 .create_response(
                     &ctx.http,
                     CreateInteractionResponse::UpdateMessage(
-                        CreateInteractionResponseMessage::new().content(format!(
-                            "取消 {} 備忘，未寫入 Notion。",
-                            project.title
-                        )),
+                        CreateInteractionResponseMessage::new().content(content),
                     ),
                 )
                 .await
@@ -5843,9 +6256,11 @@ impl Handler {
             return;
         }
         if let Some(project_action) = action.strip_prefix("project_note_") {
-            let selected = project_action.split_once(':').and_then(|(operation, project_id)| {
-                knowledge_side_project(project_id).map(|project| (operation, project))
-            });
+            let selected = project_action
+                .split_once(':')
+                .and_then(|(operation, project_id)| {
+                    knowledge_side_project(project_id).map(|project| (operation, project))
+                });
             let Some((operation, project)) = selected else {
                 let _ = comp
                     .create_response(
@@ -5911,36 +6326,43 @@ impl Handler {
                     knowledge_scheduled_source(source_id).map(|source| (operation, source))
                 });
             let Some((operation, source)) = selected else {
-                let _ = comp.create_response(
-                    &ctx.http,
-                    CreateInteractionResponse::Message(
-                        CreateInteractionResponseMessage::new()
-                            .content("⚠️ 這個排程資料庫操作已失效，請重新執行 `/knowledge`。")
-                            .ephemeral(true),
-                    ),
-                ).await;
+                let _ = comp
+                    .create_response(
+                        &ctx.http,
+                        CreateInteractionResponse::Message(
+                            CreateInteractionResponseMessage::new()
+                                .content("⚠️ 這個排程資料庫操作已失效，請重新執行 `/knowledge`。")
+                                .ephemeral(true),
+                        ),
+                    )
+                    .await;
                 return;
             };
             if operation == "search" {
-                if let Err(error) = comp.create_response(
-                    &ctx.http,
-                    CreateInteractionResponse::Modal(
-                        knowledge_scheduled_source_search_modal(source),
-                    ),
-                ).await {
+                if let Err(error) = comp
+                    .create_response(
+                        &ctx.http,
+                        CreateInteractionResponse::Modal(knowledge_scheduled_source_search_modal(
+                            source,
+                        )),
+                    )
+                    .await
+                {
                     tracing::error!(%error, source = source.source_id, "failed to open scheduled source search modal");
                 }
                 return;
             }
             let Some((title, prompt)) = knowledge_scheduled_source_prompt(source, operation) else {
-                let _ = comp.create_response(
-                    &ctx.http,
-                    CreateInteractionResponse::Message(
-                        CreateInteractionResponseMessage::new()
-                            .content("⚠️ 不支援這個排程資料庫操作，請重新執行 `/knowledge`。")
-                            .ephemeral(true),
-                    ),
-                ).await;
+                let _ = comp
+                    .create_response(
+                        &ctx.http,
+                        CreateInteractionResponse::Message(
+                            CreateInteractionResponseMessage::new()
+                                .content("⚠️ 不支援這個排程資料庫操作，請重新執行 `/knowledge`。")
+                                .ephemeral(true),
+                        ),
+                    )
+                    .await;
                 return;
             };
             if let Err(error) = comp.defer_ephemeral(&ctx.http).await {
@@ -6007,9 +6429,10 @@ impl Handler {
             _ => None,
         };
         if let Some(modal) = modal {
-            if let Err(error) = comp.create_response(
-                &ctx.http, CreateInteractionResponse::Modal(modal),
-            ).await {
+            if let Err(error) = comp
+                .create_response(&ctx.http, CreateInteractionResponse::Modal(modal))
+                .await
+            {
                 tracing::error!(%error, action, "failed to open Knowledge Home modal");
             }
             return;
@@ -6027,17 +6450,18 @@ impl Handler {
             return;
         }
         if action == "help" {
-            let message = CreateInteractionResponseMessage::new().embed(
-                CreateEmbed::new()
-                    .title("❓ 知識整理小幫手使用方式")
-                    .description(
-                        "**收錄文章**：先整理欄位與重複項目，確認後才寫入。\n**查詢知識**：唯讀搜尋 Notion 並附來源。\n**Side Project**：記下 Draft 想法、查看最近備忘、搜尋或唯讀整理目前方向；按下儲存備忘後才寫入。\n**閱讀清單**：依書名、狀態、主題、作者、地區、期望或評分查詢書籍，快捷操作維持唯讀。\n**最近收錄**：唯讀列出 Knowledge Library 最近 5 筆。\n**排程來源**：從下拉選單選擇固定來源，可查看最新文章、依原生欄位搜尋、跨期整理或查看待刪除清單。",
-                    )
-                    .colour(0x2F80ED),
-            ).ephemeral(true);
-            let _ = comp.create_response(
-                &ctx.http, CreateInteractionResponse::Message(message),
-            ).await;
+            let view = knowledge_catalog().view("help").expect("seeded help view");
+            let message = CreateInteractionResponseMessage::new()
+                .embed(
+                    CreateEmbed::new()
+                        .title(view.title.clone())
+                        .description(view.description.clone())
+                        .colour(view.colour),
+                )
+                .ephemeral(true);
+            let _ = comp
+                .create_response(&ctx.http, CreateInteractionResponse::Message(message))
+                .await;
             return;
         }
         if action == "recent" {
@@ -6045,24 +6469,31 @@ impl Handler {
                 tracing::error!(%error, "failed to defer recent knowledge request");
                 return;
             }
-            let prompt = "使用 notion-knowledge Skill 的 Search 模式，唯讀查詢 Knowledge Library 最近收錄的 5 筆內容。依建立或更新時間由新到舊列出標題、Content Type、Project（若有）、Status、Lifecycle 與 Notion 連結。不要修改 Notion。".to_string();
-            let result = self.submit_knowledge_prompt(
-                ctx, scope, &comp.user, "最近收錄", prompt,
-            ).await;
+            let Some((title, prompt)) = knowledge_global_prompt("recent", &[], None) else {
+                return;
+            };
+            let result = self
+                .submit_knowledge_prompt(ctx, scope, &comp.user, &title, prompt)
+                .await;
             let content = result.map_or_else(
                 |error| format!("⚠️ 無法開始查詢：{error}"),
                 |thread_id| format!("✅ 已在 <#{thread_id}> 查詢最近收錄。"),
             );
-            let _ = comp.edit_response(
-                &ctx.http, EditInteractionResponse::new().content(content),
-            ).await;
+            let _ = comp
+                .edit_response(&ctx.http, EditInteractionResponse::new().content(content))
+                .await;
             return;
         }
-        let _ = comp.create_response(&ctx.http, CreateInteractionResponse::Message(
-            CreateInteractionResponseMessage::new()
-                .content("⚠️ 這個知識整理操作已失效，請重新執行 `/knowledge`。")
-                .ephemeral(true),
-        )).await;
+        let _ = comp
+            .create_response(
+                &ctx.http,
+                CreateInteractionResponse::Message(
+                    CreateInteractionResponseMessage::new()
+                        .content("⚠️ 這個知識整理操作已失效，請重新執行 `/knowledge`。")
+                        .ephemeral(true),
+                ),
+            )
+            .await;
     }
 
     async fn handle_knowledge_modal(
@@ -6071,27 +6502,42 @@ impl Handler {
         modal: &serenity::model::application::ModalInteraction,
     ) {
         if !agent_presentation().knowledge_ui_enabled {
-            let _ = modal.create_response(&ctx.http, CreateInteractionResponse::Message(
-                CreateInteractionResponseMessage::new().content("⚠️ Knowledge UI is disabled for this agent.").ephemeral(true),
-            )).await;
+            let _ = modal
+                .create_response(
+                    &ctx.http,
+                    CreateInteractionResponse::Message(
+                        CreateInteractionResponseMessage::new()
+                            .content("⚠️ Knowledge UI is disabled for this agent.")
+                            .ephemeral(true),
+                    ),
+                )
+                .await;
             return;
         }
-        let scope = match self.resolve_session_scope(
-            ctx, modal.user.id.get(), modal.user.bot, modal.channel_id,
-        ).await {
+        let scope = match self
+            .resolve_session_scope(ctx, modal.user.id.get(), modal.user.bot, modal.channel_id)
+            .await
+        {
             Ok(scope) => scope,
             Err(message) => {
-                let _ = modal.create_response(&ctx.http, CreateInteractionResponse::Message(
-                    CreateInteractionResponseMessage::new().content(message).ephemeral(true),
-                )).await;
+                let _ = modal
+                    .create_response(
+                        &ctx.http,
+                        CreateInteractionResponse::Message(
+                            CreateInteractionResponseMessage::new()
+                                .content(message)
+                                .ephemeral(true),
+                        ),
+                    )
+                    .await;
                 return;
             }
         };
-        let action = modal.data.custom_id.strip_prefix("oab_knowledge_modal:").unwrap_or("");
-        let optional = |id| modal_input_value(modal, id)
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-            .unwrap_or("未提供");
+        let action = modal
+            .data
+            .custom_id
+            .strip_prefix("oab_knowledge_modal:")
+            .unwrap_or("");
         let request = if let Some(source_id) = action.strip_prefix("source_search:") {
             knowledge_scheduled_source(source_id)
                 .and_then(|source| knowledge_modal_action_prompt(source, "search", modal))
@@ -6105,48 +6551,35 @@ impl Handler {
             knowledge_side_project(project_id)
                 .and_then(|project| knowledge_modal_action_prompt(project, "search", modal))
         } else {
-            match action {
-            "capture" => modal_input_value(modal, "source")
-                .map(str::trim).filter(|value| !value.is_empty()).map(|source| (
-                    "收錄文章".to_string(),
-                    format!(
-                        "使用 notion-knowledge Skill 的 Capture 模式處理以下資料。先讀取來源、檢查 Knowledge Library 重複項目並產生收錄預覽；不要直接寫入 Notion，等待我在 thread 明確確認。\n\n來源或內容：\n{source}\n\n收藏原因：{}\n分類提示：{}",
-                        optional("note"), optional("classification"),
-                    ),
-                )),
-            "search" => modal_input_value(modal, "question")
-                .map(str::trim).filter(|value| !value.is_empty()).map(|question| (
-                    "查詢知識".to_string(),
-                    format!(
-                        "使用 notion-knowledge Skill 的 Search／Synthesis 模式，唯讀查詢 Notion 並附上相關頁面連結。不要修改 Notion。\n\n問題：\n{question}\n\n查詢範圍：{}",
-                        optional("scope"),
-                    ),
-                )),
-            _ => None,
-            }
+            knowledge_global_modal_prompt(action, modal)
         };
         let Some((title, prompt)) = request else {
-            let _ = modal.create_response(&ctx.http, CreateInteractionResponse::Message(
-                CreateInteractionResponseMessage::new()
-                    .content("⚠️ 必填內容不可為空，請重新操作 Knowledge Home。")
-                    .ephemeral(true),
-            )).await;
+            let _ = modal
+                .create_response(
+                    &ctx.http,
+                    CreateInteractionResponse::Message(
+                        CreateInteractionResponseMessage::new()
+                            .content("⚠️ 必填內容不可為空，請重新操作 Knowledge Home。")
+                            .ephemeral(true),
+                    ),
+                )
+                .await;
             return;
         };
         if let Err(error) = modal.defer_ephemeral(&ctx.http).await {
             tracing::error!(%error, action, "failed to defer Knowledge Home modal");
             return;
         }
-        let result = self.submit_knowledge_prompt(
-            ctx, scope, &modal.user, &title, prompt,
-        ).await;
+        let result = self
+            .submit_knowledge_prompt(ctx, scope, &modal.user, &title, prompt)
+            .await;
         let content = result.map_or_else(
             |error| format!("⚠️ 無法開始知識整理：{error}"),
             |thread_id| format!("✅ 已在 <#{thread_id}> 開始處理。"),
         );
-        let _ = modal.edit_response(
-            &ctx.http, EditInteractionResponse::new().content(content),
-        ).await;
+        let _ = modal
+            .edit_response(&ctx.http, EditInteractionResponse::new().content(content))
+            .await;
     }
 
     async fn handle_project_command(
@@ -7116,7 +7549,8 @@ impl Handler {
             }
         }
         if archive_after_close {
-            let archive_note = match archive_discord_thread(&ctx.http, comp.channel_id.get()).await {
+            let archive_note = match archive_discord_thread(&ctx.http, comp.channel_id.get()).await
+            {
                 Ok(()) => "Discord thread archived.".to_string(),
                 Err(error) => {
                     tracing::warn!(%error, thread_id = comp.channel_id.get(), "session closed but thread archive failed");
@@ -7139,10 +7573,7 @@ impl Handler {
                 note,
             ),
         };
-        if let Err(error) = comp
-            .edit_response(&ctx.http, message)
-            .await
-        {
+        if let Err(error) = comp.edit_response(&ctx.http, message).await {
             tracing::error!(%error, action, "failed to update session control");
         }
     }
@@ -7503,11 +7934,7 @@ impl Handler {
             return;
         };
 
-        let rest = comp
-            .data
-            .custom_id
-            .strip_prefix("oab_cron:")
-            .unwrap_or("");
+        let rest = comp.data.custom_id.strip_prefix("oab_cron:").unwrap_or("");
         let (action, job_id) = rest
             .split_once(':')
             .map(|(action, id)| (action, id.trim()))
@@ -7527,7 +7954,10 @@ impl Handler {
             return;
         }
 
-        let Some(job) = self.cron_jobs.iter().find(|job| job.sticky_key() == Some(job_id))
+        let Some(job) = self
+            .cron_jobs
+            .iter()
+            .find(|job| job.sticky_key() == Some(job_id))
         else {
             let response = CreateInteractionResponse::Message(
                 CreateInteractionResponseMessage::new()
@@ -7537,8 +7967,11 @@ impl Handler {
             let _ = comp.create_response(&ctx.http, response).await;
             return;
         };
-        if !job_applies_to_project(job, &binding.workspace_alias, &binding.channel_id.to_string())
-        {
+        if !job_applies_to_project(
+            job,
+            &binding.workspace_alias,
+            &binding.channel_id.to_string(),
+        ) {
             let response = CreateInteractionResponse::Message(
                 CreateInteractionResponseMessage::new()
                     .content("⚠️ That schedule belongs to another project.")
@@ -7682,9 +8115,8 @@ impl Handler {
         }
         if action == "actions" {
             let actions = self.project_actions_for(&binding.workspace_alias);
-            let response = CreateInteractionResponse::Message(project_actions_message(
-                &binding, &actions,
-            ));
+            let response =
+                CreateInteractionResponse::Message(project_actions_message(&binding, &actions));
             if let Err(error) = comp.create_response(&ctx.http, response).await {
                 tracing::error!(%error, "failed to open repository quick actions");
             }
@@ -7692,8 +8124,11 @@ impl Handler {
         }
         if action == "commands" {
             let commands = self.project_commands_for(&binding.workspace_alias);
+            let queued = self
+                .repository_command_queue
+                .active_count_for_project(&binding.workspace_alias, binding.channel_id);
             let response = CreateInteractionResponse::Message(project_commands_message(
-                &binding, &commands,
+                &binding, &commands, queued,
             ));
             if let Err(error) = comp.create_response(&ctx.http, response).await {
                 tracing::error!(%error, "failed to open repository commands");
@@ -7824,8 +8259,8 @@ impl Handler {
             }
             _ => None,
         };
-        let selected = selected_id
-            .and_then(|id| self.project_action_for(&binding.workspace_alias, id));
+        let selected =
+            selected_id.and_then(|id| self.project_action_for(&binding.workspace_alias, id));
         let Some(action) = selected else {
             let actions = self.project_actions_for(&binding.workspace_alias);
             let message = self
@@ -7894,114 +8329,178 @@ impl Handler {
             return;
         }
 
-        let run_key = format!(
-            "{}:{}:{}",
+        let (job, position) = match self.repository_command_queue.enqueue(
+            &binding.workspace_alias,
             binding.channel_id,
-            command.id,
-            book_slug.as_deref().unwrap_or("-")
-        );
-        let inserted = {
-            let mut running = self.project_command_runs.lock().await;
-            running.insert(run_key.clone())
-        };
-        if !inserted {
-            let _ = comp
-                .edit_response(
-                    &ctx.http,
-                    EditInteractionResponse::new()
-                        .content("⏳ This repository command is already running.")
-                        .embeds(Vec::new())
-                        .components(Vec::new()),
-                )
-                .await;
-            return;
-        }
-
-        let result = match command.runner {
-            DiscordProjectCommandRunner::GitPushBroker => {
-                tracing::info!(
-                    workspace_alias = %binding.workspace_alias,
-                    command_id = %command.id,
-                    user_id = %comp.user.id,
-                    "brokered repository command started"
-                );
-                match &self.git_push_broker {
-                    Some(client) => client.push(&binding.workspace_alias).await,
-                    None => Err(anyhow::anyhow!("Git push broker is not configured")),
-                }
-            }
-            DiscordProjectCommandRunner::Local => {
-                let aliases = self.router.workspace_aliases_map();
-                let workspace = resolve_workspace(
-                    &format!("@{}", binding.workspace_alias),
-                    &aliases,
-                    &self.router.bot_home_path(),
-                    &self.router.workspace_root_path(),
-                )
-                .map_err(anyhow::Error::msg);
-                match workspace {
-                    Ok(workspace) => {
-                        tracing::info!(
-                            workspace_alias = %binding.workspace_alias,
-                            command_id = %command.id,
-                            book_slug = book_slug.as_deref().unwrap_or(""),
-                            user_id = %comp.user.id,
-                            "repository command started"
-                        );
-                        run_project_command(&command, &workspace, book_slug.as_deref()).await
-                    }
-                    Err(error) => Err(error),
-                }
-            }
-        };
-        {
-            let mut running = self.project_command_runs.lock().await;
-            running.remove(&run_key);
-        }
-
-        let mut display_command = command.clone();
-        if let Ok(args) =
-            crate::project_command::resolve_project_command_args(&command, book_slug.as_deref())
-        {
-            display_command.args = args;
-            display_command.book_select = false;
-        }
-        let content = match result {
-            Ok(output) => {
-                tracing::info!(
-                    workspace_alias = %binding.workspace_alias,
-                    command_id = %command.id,
-                    exit_code = ?output.exit_code,
-                    timed_out = output.timed_out,
-                    "repository command finished"
-                );
-                project_command_result_content(&binding, &display_command, &output)
-            }
+            comp.user.id.get(),
+            &command.id,
+            book_slug,
+        ) {
+            Ok(value) => value,
             Err(error) => {
-                tracing::warn!(
-                    workspace_alias = %binding.workspace_alias,
-                    command_id = %command.id,
-                    %error,
-                    "repository command failed to start"
-                );
-                format!(
-                    "⚠️ Could not run repository command: {}",
-                    suppress_mentions(&truncate_for_discord(&error.to_string(), 1500))
-                )
+                let _ = comp
+                    .edit_response(
+                        &ctx.http,
+                        EditInteractionResponse::new()
+                            .content(format!(
+                                "⚠️ Could not queue repository command: {}",
+                                suppress_mentions(&truncate_for_discord(&error.to_string(), 1000))
+                            ))
+                            .embeds(Vec::new())
+                            .components(Vec::new()),
+                    )
+                    .await;
+                return;
             }
         };
+        tracing::info!(
+            job_id = job.id,
+            workspace_alias = %binding.workspace_alias,
+            command_id = %command.id,
+            user_id = %comp.user.id,
+            position,
+            "repository command queued"
+        );
+        self.ensure_repository_command_worker(ctx, &binding.workspace_alias);
+        let content = format!(
+            "✅ Queued **{}** as `#{}` · position **{}**.\nThe command will be revalidated against the current allowlist before it runs.",
+            suppress_mentions(command.label.trim()),
+            job.id,
+            position,
+        );
         if let Err(error) = comp
             .edit_response(
                 &ctx.http,
                 EditInteractionResponse::new()
                     .content(content)
                     .embeds(Vec::new())
-                    .components(Vec::new()),
+                    .components(vec![CreateActionRow::Buttons(vec![CreateButton::new(
+                        "oab_repo_queue:open",
+                    )
+                    .label("Open Command Queue")
+                    .style(ButtonStyle::Primary)])]),
             )
             .await
         {
             tracing::error!(%error, command_id = %command.id, "failed to show repository command result");
         }
+    }
+
+    fn ensure_repository_command_worker(&self, ctx: &Context, workspace_alias: &str) {
+        if !self.repository_command_queue.start_worker(workspace_alias) {
+            return;
+        }
+        let alias = workspace_alias.to_string();
+        let queue = self.repository_command_queue.clone();
+        let router = self.router.clone();
+        let commands = self.project_commands.clone();
+        let git_push_broker = self.git_push_broker.clone();
+        let http = ctx.http.clone();
+        tokio::spawn(async move {
+            loop {
+                let job = match queue.claim_next_or_stop(&alias) {
+                    Ok(Some(job)) => job,
+                    Ok(None) => break,
+                    Err(error) => {
+                        tracing::error!(%error, workspace_alias = %alias, "failed to claim repository command");
+                        break;
+                    }
+                };
+                let (cancel_tx, cancel_rx) = tokio::sync::oneshot::channel();
+                queue.register_cancellation(job.id, cancel_tx).await;
+                let command = project_commands_for_workspace(&commands, &alias)
+                    .into_iter()
+                    .find(|command| command.id == job.command_id)
+                    .cloned();
+                let execution = async {
+                    let command = command.ok_or_else(|| {
+                        anyhow::anyhow!("command is no longer present in the current allowlist")
+                    })?;
+                    match command.runner {
+                        DiscordProjectCommandRunner::GitPushBroker => match &git_push_broker {
+                            Some(client) => client.push(&alias).await,
+                            None => Err(anyhow::anyhow!("Git push broker is not configured")),
+                        },
+                        DiscordProjectCommandRunner::Local => {
+                            let aliases = router.workspace_aliases_map();
+                            let workspace = resolve_workspace(
+                                &format!("@{alias}"),
+                                &aliases,
+                                &router.bot_home_path(),
+                                &router.workspace_root_path(),
+                            )
+                            .map_err(anyhow::Error::msg)?;
+                            run_project_command(&command, &workspace, job.book_slug.as_deref())
+                                .await
+                        }
+                    }
+                };
+                let (state, result) = tokio::select! {
+                    _ = cancel_rx => (RepositoryCommandState::Cancelled, cancelled_result()),
+                    output = execution => match output {
+                        Ok(output) => {
+                            let state = if !output.timed_out && output.exit_code == Some(0) {
+                                RepositoryCommandState::Completed
+                            } else {
+                                RepositoryCommandState::Failed
+                            };
+                            (state, RepositoryCommandResult {
+                                exit_code: output.exit_code,
+                                timed_out: output.timed_out,
+                                stdout: output.stdout,
+                                stderr: output.stderr,
+                                truncated: output.truncated,
+                                elapsed_ms: output.elapsed.as_millis().min(u128::from(u64::MAX)) as u64,
+                                error: None,
+                            })
+                        }
+                        Err(error) => (RepositoryCommandState::Failed, RepositoryCommandResult {
+                            exit_code: None,
+                            timed_out: false,
+                            stdout: String::new(),
+                            stderr: String::new(),
+                            truncated: false,
+                            elapsed_ms: 0,
+                            error: Some(error.to_string()),
+                        }),
+                    }
+                };
+                queue.clear_cancellation(job.id).await;
+                match queue.finish(job.id, state, result) {
+                    Ok(finished) => {
+                        tracing::info!(
+                            job_id = finished.id,
+                            workspace_alias = %finished.workspace_alias,
+                            command_id = %finished.command_id,
+                            state = ?finished.state,
+                            "repository command finished"
+                        );
+                        let notification = CreateMessage::new()
+                            .content(format!(
+                                "<@{}> {} repository command `#{}` · **{}**",
+                                finished.requested_by,
+                                repository_command_state_label(finished.state),
+                                finished.id,
+                                suppress_mentions(&finished.command_id),
+                            ))
+                            .components(vec![CreateActionRow::Buttons(vec![CreateButton::new(
+                                "oab_repo_queue:open",
+                            )
+                            .label("View queue / result")
+                            .style(ButtonStyle::Secondary)])]);
+                        if let Err(error) = ChannelId::new(finished.project_channel_id)
+                            .send_message(&http, notification)
+                            .await
+                        {
+                            tracing::warn!(%error, job_id = finished.id, "failed to post repository command completion");
+                        }
+                    }
+                    Err(error) => {
+                        tracing::error!(%error, job_id = job.id, "failed to persist repository command result")
+                    }
+                }
+            }
+        });
     }
 
     async fn handle_project_command_select(
@@ -8041,13 +8540,18 @@ impl Handler {
             ComponentInteractionDataKind::StringSelect { values } => values.first(),
             _ => None,
         };
-        let selected = selected_id
-            .and_then(|id| self.project_command_for(&binding.workspace_alias, id));
+        let selected =
+            selected_id.and_then(|id| self.project_command_for(&binding.workspace_alias, id));
         let Some(command) = selected.cloned() else {
             let commands = self.project_commands_for(&binding.workspace_alias);
             let response = CreateInteractionResponse::Message(
-                project_commands_message(&binding, &commands)
-                    .content("⚠️ 這個 command 已移除，清單已重新整理。"),
+                project_commands_message(
+                    &binding,
+                    &commands,
+                    self.repository_command_queue
+                        .active_count_for_project(&binding.workspace_alias, binding.channel_id),
+                )
+                .content("⚠️ 這個 command 已移除，清單已重新整理。"),
             );
             let _ = comp.create_response(&ctx.http, response).await;
             return;
@@ -8169,9 +8673,7 @@ impl Handler {
 
         if let Some(command_id) = action.strip_prefix("pick:") {
             let selected_book = match &comp.data.kind {
-                ComponentInteractionDataKind::StringSelect { values } => {
-                    values.first().cloned()
-                }
+                ComponentInteractionDataKind::StringSelect { values } => values.first().cloned(),
                 _ => None,
             };
             let Some(book_slug) = selected_book else {
@@ -8309,6 +8811,178 @@ impl Handler {
         }
         self.execute_project_command_interaction(ctx, comp, binding, command, book_slug)
             .await;
+    }
+
+    async fn handle_repository_command_queue_control(
+        &self,
+        ctx: &Context,
+        comp: &serenity::model::application::ComponentInteraction,
+    ) {
+        if comp.user.bot
+            || is_denied_user(
+                false,
+                self.allow_all_users,
+                &self.allowed_users,
+                comp.user.id.get(),
+            )
+        {
+            let _ = comp
+                .create_response(
+                    &ctx.http,
+                    CreateInteractionResponse::Message(
+                        CreateInteractionResponseMessage::new()
+                            .content("🚫 你沒有查看 repository command queue 的權限。")
+                            .ephemeral(true),
+                    ),
+                )
+                .await;
+            return;
+        }
+        let binding = match self.project_binding_for_channel(ctx, comp.channel_id).await {
+            Ok((binding, _)) => binding,
+            Err(message) => {
+                let _ = comp
+                    .create_response(
+                        &ctx.http,
+                        CreateInteractionResponse::Message(
+                            CreateInteractionResponseMessage::new()
+                                .content(format!("⚠️ {message}"))
+                                .ephemeral(true),
+                        ),
+                    )
+                    .await;
+                return;
+            }
+        };
+        let action = comp
+            .data
+            .custom_id
+            .strip_prefix("oab_repo_queue:")
+            .unwrap_or("");
+        let selected_from_menu = match &comp.data.kind {
+            ComponentInteractionDataKind::StringSelect { values } if action == "select" => {
+                values.first().and_then(|value| value.parse::<u64>().ok())
+            }
+            _ => None,
+        };
+        let parsed = action
+            .split_once(':')
+            .and_then(|(_, id)| id.parse::<u64>().ok());
+        let selected_id = selected_from_menu.or(parsed);
+        let commands = self.project_commands_for(&binding.workspace_alias);
+
+        if let Some(id) = selected_id {
+            let Some(job) = self.repository_command_queue.job(id).filter(|job| {
+                job.workspace_alias == binding.workspace_alias
+                    && job.project_channel_id == binding.channel_id
+            }) else {
+                let jobs = self
+                    .repository_command_queue
+                    .jobs_for(&binding.workspace_alias)
+                    .into_iter()
+                    .filter(|job| job.project_channel_id == binding.channel_id)
+                    .collect::<Vec<_>>();
+                let response =
+                    CreateInteractionResponse::UpdateMessage(repository_command_queue_message(
+                        &binding,
+                        &jobs,
+                        &commands,
+                        None,
+                        Some("⚠️ This queue item is no longer available."),
+                    ));
+                let _ = comp.create_response(&ctx.http, response).await;
+                return;
+            };
+            let permissions = comp.member.as_ref().and_then(|member| member.permissions);
+            let elevated = permissions.is_some_and(|permissions| {
+                permissions.contains(Permissions::ADMINISTRATOR)
+                    || permissions.contains(Permissions::MANAGE_CHANNELS)
+            });
+            let can_manage = elevated
+                || binding.created_by == comp.user.id.get()
+                || job.requested_by == comp.user.id.get();
+            if matches!(
+                action.split_once(':').map(|(name, _)| name),
+                Some("next" | "remove" | "cancel")
+            ) && !can_manage
+            {
+                let _ = comp
+                    .create_response(
+                        &ctx.http,
+                        CreateInteractionResponse::Message(
+                            CreateInteractionResponseMessage::new()
+                                .content("🚫 Only the requester, project owner, or a channel manager can change this queue item.")
+                                .ephemeral(true),
+                        ),
+                    )
+                    .await;
+                return;
+            }
+            if action.starts_with("result:") {
+                let response = CreateInteractionResponse::Message(
+                    CreateInteractionResponseMessage::new()
+                        .content(repository_command_result_content(&binding, &job, &commands))
+                        .components(vec![CreateActionRow::Buttons(vec![CreateButton::new(
+                            "oab_repo_queue:open",
+                        )
+                        .label("Back to Command Queue")
+                        .style(ButtonStyle::Secondary)])])
+                        .ephemeral(true),
+                );
+                let _ = comp.create_response(&ctx.http, response).await;
+                return;
+            }
+        }
+
+        let mut note = None;
+        if let Some(id) = parsed {
+            let operation = if action.starts_with("next:") {
+                self.repository_command_queue
+                    .move_next(id)
+                    .map(|_| "↥ Moved the command to the front of the waiting queue.")
+            } else if action.starts_with("remove:") {
+                self.repository_command_queue
+                    .remove_pending(id)
+                    .map(|_| "🗑 Removed the waiting command.")
+            } else if action.starts_with("cancel:") {
+                self.repository_command_queue
+                    .cancel(id)
+                    .await
+                    .map(|_| "⏹ Stop requested. The worker will continue with the next command.")
+            } else {
+                Ok("")
+            };
+            note = Some(match operation {
+                Ok(message) => message.to_string(),
+                Err(error) => format!(
+                    "⚠️ {}",
+                    suppress_mentions(&truncate_for_discord(&error.to_string(), 500))
+                ),
+            });
+        }
+        let jobs = self
+            .repository_command_queue
+            .jobs_for(&binding.workspace_alias)
+            .into_iter()
+            .filter(|job| job.project_channel_id == binding.channel_id)
+            .collect::<Vec<_>>();
+        let selected = if action == "select" {
+            selected_from_menu
+        } else if action == "open" || action == "refresh" {
+            None
+        } else {
+            parsed.filter(|id| jobs.iter().any(|job| job.id == *id))
+        };
+        let message =
+            repository_command_queue_message(&binding, &jobs, &commands, selected, note.as_deref());
+        let response = if action == "open" {
+            CreateInteractionResponse::Message(message)
+        } else {
+            CreateInteractionResponse::UpdateMessage(message)
+        };
+        if let Err(error) = comp.create_response(&ctx.http, response).await {
+            tracing::error!(%error, "failed to update repository command queue");
+        }
     }
 
     async fn handle_project_attach_modal(
@@ -10492,22 +11166,22 @@ fn truncate_to_utf16_budget(body: &str, prefix: &str, suffix: &str, limit: usize
 
 #[cfg(test)]
 mod tests {
-    use crate::dispatch::{ActiveMessage, PendingMessage};
+    use super::*;
+    use crate::bot_turns::{TurnResult, BOT_TURN_LIMIT_WARNING_PREFIX, HARD_BOT_TURN_LIMIT};
     use crate::discord_admin::{AdminInventory, CleanupCandidates};
-    use crate::discord_session_ui::{
-        all_sessions_message, reconciled_handoff_task_state, session_manager_message,
-        ManagedSessionEntry,
+    use crate::discord_admin_ui::{
+        admin_channel_category_card, admin_channel_modal, admin_cleanup_card,
+        admin_navigation_buttons,
     };
     use crate::discord_queue_ui::{
         queue_clear_confirmation_card, queue_edit_modal, queue_item_allowed,
         queue_manage_all_allowed, queue_manager_card, queue_replace_modal,
     };
-    use crate::discord_admin_ui::{
-        admin_channel_category_card, admin_channel_modal, admin_cleanup_card,
-        admin_navigation_buttons,
+    use crate::discord_session_ui::{
+        all_sessions_message, reconciled_handoff_task_state, session_manager_message,
+        ManagedSessionEntry,
     };
-    use super::*;
-    use crate::bot_turns::{TurnResult, BOT_TURN_LIMIT_WARNING_PREFIX, HARD_BOT_TURN_LIMIT};
+    use crate::dispatch::{ActiveMessage, PendingMessage};
 
     // --- truncate_for_discord (select menu option 100-char cap) ---
 
@@ -10858,12 +11532,16 @@ mod tests {
 
     #[test]
     fn knowledge_modals_collect_the_expected_fields() {
-        let capture = serde_json::to_value(knowledge_capture_modal()).unwrap().to_string();
+        let capture = serde_json::to_value(knowledge_capture_modal())
+            .unwrap()
+            .to_string();
         assert!(capture.contains("oab_knowledge_modal:capture"));
         assert!(capture.contains("source"));
         assert!(capture.contains("classification"));
 
-        let search = serde_json::to_value(knowledge_search_modal()).unwrap().to_string();
+        let search = serde_json::to_value(knowledge_search_modal())
+            .unwrap()
+            .to_string();
         assert!(search.contains("oab_knowledge_modal:search"));
         assert!(search.contains("question"));
         assert!(search.contains("scope"));
@@ -10879,8 +11557,9 @@ mod tests {
         let project_search = serde_json::to_value(knowledge_project_note_search_modal(project))
             .unwrap()
             .to_string();
-        assert!(project_search
-            .contains("oab_knowledge_modal:project_note_search:project_notes_alpha"));
+        assert!(
+            project_search.contains("oab_knowledge_modal:project_note_search:project_notes_alpha")
+        );
         assert!(project_search.contains("query"));
         assert!(project_search.contains("state"));
 
@@ -10921,8 +11600,7 @@ mod tests {
         assert!(recent.contains("Project Alpha"));
 
         let publishing = knowledge_side_project("project_notes_beta").unwrap();
-        let (_, publishing_recent) =
-            knowledge_side_project_prompt(publishing, "recent").unwrap();
+        let (_, publishing_recent) = knowledge_side_project_prompt(publishing, "recent").unwrap();
         assert!(publishing_recent.contains("Project Beta"));
         assert!(publishing_recent.contains("Example Project Beta"));
         assert!(knowledge_side_project_prompt(project, "delete").is_none());
@@ -10947,6 +11625,29 @@ mod tests {
     }
 
     #[test]
+    fn knowledge_search_cards_accept_tool_summary_and_markdown_fence() {
+        let payload = concat!(
+            "✅ `Loaded skill: notion-knowledge`\n",
+            "✅ `notion_notion-fetch`\n\n",
+            "Schema 驗證通過，無漂移。\n",
+            "```\n",
+            "OPENAB_KNOWLEDGE_CARDS_V1\n",
+            r#"{"kind":"search","heading":"📕 待讀推薦 Top 5","items":[{"title":"範例商業書 A","url":"https://app.notion.com/example-book-a","meta":"Example Author A｜科普｜History｜Expect 7","summary":"以漫畫呈現歷史探索。"}]}"#,
+            "\n```",
+        );
+        let rendered = serde_json::to_value(knowledge_cards_message(payload).unwrap())
+            .unwrap()
+            .to_string();
+        assert!(rendered.contains("待讀推薦 Top 5"));
+        assert!(rendered.contains("範例商業書 A"));
+        assert!(rendered.contains("Example Author A"));
+        assert!(!rendered.contains("Loaded skill"));
+        assert!(!rendered.contains("OPENAB_KNOWLEDGE_CARDS_V1"));
+
+        assert!(knowledge_cards_message(&format!("{payload}\n多餘未驗證內容")).is_none());
+    }
+
+    #[test]
     fn knowledge_retention_cards_validate_ids_and_expose_keep_select() {
         let payload = concat!(
             "OPENAB_KNOWLEDGE_CARDS_V1\n",
@@ -10956,7 +11657,9 @@ mod tests {
             .unwrap()
             .to_string();
         assert!(rendered.contains("oab_knowledge:retention_keep"));
-        assert!(rendered.contains("weekly_reading_digest|eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee|ffffffffffffffffffffffffffffffff"));
+        assert!(rendered.contains(
+            "weekly_reading_digest|eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee|ffffffffffffffffffffffffffffffff"
+        ));
         assert!(rendered.contains("2026-09-02"));
 
         assert!(knowledge_cards_message(
@@ -11156,8 +11859,8 @@ mod tests {
             TaskState::Failed,
             TaskState::Closed,
         ] {
-            let rows = serde_json::to_value(task_control_rows(&ui_task(state, Some("retry me"))))
-                .unwrap();
+            let rows =
+                serde_json::to_value(task_control_rows(&ui_task(state, Some("retry me")))).unwrap();
             for row in rows.as_array().unwrap() {
                 let count = row["components"].as_array().unwrap().len();
                 assert!(count <= 5, "{state:?} row has {count} buttons");
@@ -11268,10 +11971,9 @@ mod tests {
         assert!(replace_modal.contains("oab_queue_replace:10"));
         assert!(replace_modal.contains("Implement queue management"));
 
-        let confirmation = serde_json::to_string(
-            &queue_clear_confirmation_card(&task, &items).into_message(),
-        )
-        .unwrap();
+        let confirmation =
+            serde_json::to_string(&queue_clear_confirmation_card(&task, &items).into_message())
+                .unwrap();
         assert!(confirmation.contains("oab_queue:confirm_clear:12"));
         assert!(confirmation.contains("2"));
     }
@@ -11279,10 +11981,9 @@ mod tests {
     #[test]
     fn empty_queue_manager_never_renders_an_empty_action_row() {
         let task = ui_task(TaskState::Ready, None);
-        let card = serde_json::to_value(
-            queue_manager_card(&task, &[], &[], None, None).into_message(),
-        )
-        .unwrap();
+        let card =
+            serde_json::to_value(queue_manager_card(&task, &[], &[], None, None).into_message())
+                .unwrap();
         let rows = card
             .get("components")
             .and_then(serde_json::Value::as_array)
@@ -11322,8 +12023,7 @@ mod tests {
 
     #[test]
     fn help_and_project_home_expose_session_manager() {
-        let help =
-            serde_json::to_string(&help_action_center(None, &[], true, true, None)).unwrap();
+        let help = serde_json::to_string(&help_action_center(None, &[], true, true, None)).unwrap();
         assert!(help.contains("oab_help:sessions"));
         assert!(help.contains("oab_help:all_sessions"));
         assert!(help.contains("oab_admin:open"));
@@ -11333,18 +12033,28 @@ mod tests {
         assert!(!regular_channel_help.contains("oab_help:all_sessions"));
 
         let ready_task = ui_task(TaskState::Ready, None);
-        let task_help =
-            serde_json::to_string(&help_action_center(None, &[], false, false, Some(&ready_task)))
-                .unwrap();
+        let task_help = serde_json::to_string(&help_action_center(
+            None,
+            &[],
+            false,
+            false,
+            Some(&ready_task),
+        ))
+        .unwrap();
         assert!(task_help.contains("Current task"));
         assert!(task_help.contains("oab_task:continue"));
         assert!(task_help.contains("oab_task:actions"));
         assert!(task_help.contains("oab_task:commands"));
 
         let running_task = ui_task(TaskState::Running, None);
-        let running_help =
-            serde_json::to_string(&help_action_center(None, &[], false, false, Some(&running_task)))
-                .unwrap();
+        let running_help = serde_json::to_string(&help_action_center(
+            None,
+            &[],
+            false,
+            false,
+            Some(&running_task),
+        ))
+        .unwrap();
         assert!(running_help.contains("排入佇列"));
         assert!(running_help.contains("oab_queue:open"));
         // Help must agree with the Task Status Card about what is possible.
@@ -11506,7 +12216,7 @@ mod tests {
             .map(|index| ui_project_command(&format!("command-{index}")))
             .collect::<Vec<_>>();
         let command_refs = commands.iter().collect::<Vec<_>>();
-        let value = serde_json::to_value(project_commands_message(&ui_binding(), &command_refs))
+        let value = serde_json::to_value(project_commands_message(&ui_binding(), &command_refs, 3))
             .expect("commands card should serialize");
         let select = component_with_custom_id(&value, "oab_project_commands").unwrap();
         assert_eq!(
@@ -11516,6 +12226,7 @@ mod tests {
         assert!(value
             .to_string()
             .contains("顯示前 25 個，共 30 個 commands"));
+        assert!(value.to_string().contains("Command Queue (3)"));
 
         let current = serde_json::to_string(&task_commands_message(
             &ui_task(TaskState::Ready, None),
@@ -11565,6 +12276,63 @@ mod tests {
         assert!(picker.contains("oab_project_command:pick:force-sync"));
         assert!(picker.contains("heshi-mentu"));
         assert!(picker.contains("選擇書籍 slug"));
+    }
+
+    #[test]
+    fn repository_command_queue_card_exposes_state_specific_controls() {
+        let command = ui_project_command("git-status");
+        let commands = vec![&command];
+        let now = chrono::Utc::now();
+        let waiting = RepositoryCommandJob {
+            id: 7,
+            workspace_alias: "openab".into(),
+            project_channel_id: 2,
+            requested_by: 3,
+            command_id: "git-status".into(),
+            book_slug: None,
+            state: RepositoryCommandState::Pending,
+            created_at: now,
+            started_at: None,
+            finished_at: None,
+            recovered_from_active: false,
+            result: None,
+        };
+        let waiting_card = serde_json::to_string(&repository_command_queue_message(
+            &ui_binding(),
+            &[waiting.clone()],
+            &commands,
+            Some(7),
+            None,
+        ))
+        .unwrap();
+        assert!(waiting_card.contains("oab_repo_queue:next:7"));
+        assert!(waiting_card.contains("oab_repo_queue:remove:7"));
+        assert!(!waiting_card.contains("oab_repo_queue:cancel:7"));
+
+        let completed = RepositoryCommandJob {
+            state: RepositoryCommandState::Completed,
+            finished_at: Some(now),
+            result: Some(RepositoryCommandResult {
+                exit_code: Some(0),
+                timed_out: false,
+                stdout: "clean".into(),
+                stderr: String::new(),
+                truncated: false,
+                elapsed_ms: 12,
+                error: None,
+            }),
+            ..waiting
+        };
+        let completed_card = serde_json::to_string(&repository_command_queue_message(
+            &ui_binding(),
+            &[completed],
+            &commands,
+            Some(7),
+            None,
+        ))
+        .unwrap();
+        assert!(completed_card.contains("oab_repo_queue:result:7"));
+        assert!(!completed_card.contains("oab_repo_queue:remove:7"));
     }
 
     #[test]
@@ -11673,8 +12441,7 @@ mod tests {
             .collect::<Vec<_>>();
         entries[1].task.workspace_alias = "example-library".into();
         entries[1].task.project_channel_id = 42;
-        let value =
-            serde_json::to_value(all_sessions_message(&entries, Some(2), None)).unwrap();
+        let value = serde_json::to_value(all_sessions_message(&entries, Some(2), None)).unwrap();
         let select = component_with_custom_id(&value, "oab_all_sessions:select").unwrap();
         assert_eq!(
             select["options"].as_array().unwrap().len(),
