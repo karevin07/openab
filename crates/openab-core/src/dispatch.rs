@@ -22,9 +22,7 @@ use serde::{Deserialize, Serialize};
 use tracing::{debug, error, info, info_span, warn};
 
 use crate::acp::ContentBlock;
-use crate::adapter::{
-    AdapterRouter, ChannelRef, ChatAdapter, MessageRef, TaskLifecycleEvent,
-};
+use crate::adapter::{AdapterRouter, ChannelRef, ChatAdapter, MessageRef, TaskLifecycleEvent};
 use crate::config::ReactionsConfig;
 use crate::error_display::format_user_error;
 use crate::reactions::StatusReactionController;
@@ -344,7 +342,7 @@ struct PersistedQueueFile {
 /// Borrowed mirror of [`PersistedQueueFile`] used only for writing. Serialising
 /// from references keeps a snapshot from deep-copying every lane — and every
 /// base64 image block inside it — on each queue mutation. Field names and order
-/// must stay identical to `PersistedQueueFile` so the on-disk shape is unchanged.
+/// must stay identical to `PersistedQueueFile` so the durable snapshot shape is unchanged.
 #[derive(Serialize)]
 struct PersistedQueueFileRef<'a> {
     version: u32,
@@ -402,7 +400,7 @@ struct PersistedMessageRef {
 }
 
 struct QueueStore {
-    path: PathBuf,
+    backend: QueueStoreBackend,
     lanes: Mutex<HashMap<String, PersistedLane>>,
     next_message_id: AtomicU64,
     /// Monotonic snapshot counter, assigned while `lanes` is held. Serialising
@@ -410,10 +408,16 @@ struct QueueStore {
     /// `write_snapshot` out of order; the sequence lets the older one notice it
     /// has been superseded instead of rolling the file back.
     snapshot_seq: AtomicU64,
-    /// Guards the file write and records the newest sequence already on disk.
+    /// Guards persistence and records the newest sequence already committed.
     /// Deliberately separate from `lanes` so an fsync never blocks `submit` or
     /// the queue-management APIs.
     writer: Mutex<u64>,
+}
+
+enum QueueStoreBackend {
+    Json(PathBuf),
+    #[cfg(feature = "discord")]
+    Sqlite(crate::control_db::ControlDb),
 }
 
 impl QueueStore {
@@ -476,11 +480,52 @@ impl QueueStore {
             "loaded persistent dispatch queue"
         );
         Self {
-            path,
+            backend: QueueStoreBackend::Json(path),
             lanes: Mutex::new(lanes),
             next_message_id: AtomicU64::new(next_message_id),
             snapshot_seq: AtomicU64::new(0),
             writer: Mutex::new(0),
+        }
+    }
+
+    #[cfg(feature = "discord")]
+    fn load_from_control_db(
+        db: crate::control_db::ControlDb,
+        legacy_path: PathBuf,
+    ) -> anyhow::Result<Self> {
+        let data = db.load_or_import_dispatch_queue(&legacy_path)?;
+        let file: PersistedQueueFile = serde_json::from_slice(&data)?;
+        if file.version != QUEUE_STORE_VERSION {
+            anyhow::bail!("unsupported queue store version {}", file.version);
+        }
+        let max_id = file
+            .lanes
+            .iter()
+            .flat_map(|lane| lane.pending.iter().chain(&lane.active))
+            .map(|message| message.id)
+            .max()
+            .unwrap_or(0);
+        let next_message_id = file.next_message_id.max(max_id.saturating_add(1)).max(1);
+        let lanes = file
+            .lanes
+            .into_iter()
+            .map(|lane| (lane.key.clone(), lane))
+            .collect::<HashMap<_, _>>();
+        info!(count = lanes.len(), path = %db.path().display(), "loaded persistent dispatch queue from control database");
+        Ok(Self {
+            backend: QueueStoreBackend::Sqlite(db),
+            lanes: Mutex::new(lanes),
+            next_message_id: AtomicU64::new(next_message_id),
+            snapshot_seq: AtomicU64::new(0),
+            writer: Mutex::new(0),
+        })
+    }
+
+    fn backend_path(&self) -> &std::path::Path {
+        match &self.backend {
+            QueueStoreBackend::Json(path) => path,
+            #[cfg(feature = "discord")]
+            QueueStoreBackend::Sqlite(db) => db.path(),
         }
     }
 
@@ -546,13 +591,15 @@ impl QueueStore {
                 .into_iter()
                 .map(|(message, recovered)| PersistedMessage::from_queued(message, recovered))
                 .collect::<Vec<_>>();
-            let lane = lanes.entry(key.to_string()).or_insert_with(|| PersistedLane {
-                key: key.to_string(),
-                adapter_kind: adapter_kind.to_string(),
-                thread_channel: PersistedChannelRef::from(thread_channel),
-                pending: Vec::new(),
-                active: Vec::new(),
-            });
+            let lane = lanes
+                .entry(key.to_string())
+                .or_insert_with(|| PersistedLane {
+                    key: key.to_string(),
+                    adapter_kind: adapter_kind.to_string(),
+                    thread_channel: PersistedChannelRef::from(thread_channel),
+                    pending: Vec::new(),
+                    active: Vec::new(),
+                });
             lane.adapter_kind = adapter_kind.to_string();
             lane.thread_channel = PersistedChannelRef::from(thread_channel);
             lane.pending = pending;
@@ -637,11 +684,11 @@ impl QueueStore {
 
     /// Apply `mutate` to the in-memory lanes, then persist the resulting
     /// snapshot. Serialisation runs under the `lanes` lock because it borrows
-    /// the map; the write and its two fsyncs deliberately do not, so a slow
-    /// disk cannot stall `submit` or the queue-management APIs.
+    /// the map; persistence deliberately does not, so a slow storage commit
+    /// cannot stall `submit` or the queue-management APIs.
     ///
     /// Durability is unchanged: when this returns, a snapshot at least as new
-    /// as this mutation is on disk — either the one written here, or a later
+    /// as this mutation is durable — either the one written here, or a later
     /// one that superseded it.
     fn mutate(&self, mutate: impl FnOnce(&mut HashMap<String, PersistedLane>)) {
         let (seq, data) = {
@@ -656,7 +703,7 @@ impl QueueStore {
             match self.serialize_locked(&lanes) {
                 Ok(data) => (seq, data),
                 Err(error) => {
-                    warn!(%error, path = %self.path.display(), "failed to serialize dispatch queue");
+                    warn!(%error, path = %self.backend_path().display(), "failed to serialize dispatch queue");
                     return;
                 }
             }
@@ -675,8 +722,8 @@ impl QueueStore {
         Ok(serde_json::to_vec_pretty(&file)?)
     }
 
-    /// Write one serialised snapshot, skipping it when a newer snapshot already
-    /// reached disk. Sequence order equals lock-acquisition order, so a higher
+    /// Persist one serialised snapshot, skipping it when a newer snapshot already
+    /// committed. Sequence order equals lock-acquisition order, so a higher
     /// sequence always contains every earlier mutation — dropping the stale
     /// write loses nothing and stops it from rolling the file back.
     fn write_snapshot(&self, seq: u64, data: &[u8]) {
@@ -684,10 +731,15 @@ impl QueueStore {
         if *last_written >= seq {
             return;
         }
-        match atomic_write(&self.path, data) {
+        let result = match &self.backend {
+            QueueStoreBackend::Json(path) => atomic_write(path, data),
+            #[cfg(feature = "discord")]
+            QueueStoreBackend::Sqlite(db) => db.replace_dispatch_queue(data),
+        };
+        match result {
             Ok(()) => *last_written = seq,
             Err(error) => {
-                warn!(%error, path = %self.path.display(), "failed to persist dispatch queue");
+                warn!(%error, path = %self.backend_path().display(), "failed to persist dispatch queue");
             }
         }
     }
@@ -1130,7 +1182,7 @@ impl Dispatcher {
         }
     }
 
-    /// Enable durable queue snapshots. The store is loaded synchronously so
+    /// Enable legacy JSON queue snapshots. The store is loaded synchronously so
     /// callers can reconcile external UI metadata before restored consumers
     /// are started with `restore_persisted`.
     pub fn with_persistence(mut self, path: PathBuf) -> Self {
@@ -1139,6 +1191,19 @@ impl Dispatcher {
             .store(store.next_message_id(), Ordering::Relaxed);
         self.queue_store = Some(store);
         self
+    }
+
+    #[cfg(feature = "discord")]
+    pub fn with_control_db_persistence(
+        mut self,
+        db: crate::control_db::ControlDb,
+        legacy_path: PathBuf,
+    ) -> anyhow::Result<Self> {
+        let store = Arc::new(QueueStore::load_from_control_db(db, legacy_path)?);
+        self.next_message_id
+            .store(store.next_message_id(), Ordering::Relaxed);
+        self.queue_store = Some(store);
+        Ok(self)
     }
 
     pub fn persisted_queue_summaries(&self) -> Vec<PersistedQueueSummary> {
@@ -1245,12 +1310,7 @@ impl Dispatcher {
         queue: &PendingQueue,
     ) {
         if let Some(store) = &self.queue_store {
-            store.update_pending(
-                key,
-                adapter_kind,
-                thread_channel,
-                queue.snapshot(),
-            );
+            store.update_pending(key, adapter_kind, thread_channel, queue.snapshot());
         }
     }
 
@@ -1355,12 +1415,7 @@ impl Dispatcher {
         };
 
         queue.insert(message_id, msg, false);
-        self.persist_pending_queue(
-            &thread_key,
-            adapter.platform(),
-            &thread_channel,
-            &queue,
-        );
+        self.persist_pending_queue(&thread_key, adapter.platform(), &thread_channel, &queue);
 
         if let Err(e) = tx.send(message_id).await {
             // Consumer has exited between our check and the send — race-safe
@@ -1398,11 +1453,7 @@ impl Dispatcher {
                         cap,
                     )
                 });
-                (
-                    entry.tx.clone(),
-                    Arc::clone(&entry.queue),
-                    entry.generation,
-                )
+                (entry.tx.clone(), Arc::clone(&entry.queue), entry.generation)
             };
 
             retry_queue.insert(failed_id, failed_msg, false);
@@ -1488,12 +1539,7 @@ impl Dispatcher {
     }
 
     /// Remove one pending message without interrupting the active ACP turn.
-    pub fn remove_pending_message(
-        &self,
-        platform: &str,
-        thread_id: &str,
-        message_id: u64,
-    ) -> bool {
+    pub fn remove_pending_message(&self, platform: &str, thread_id: &str, message_id: u64) -> bool {
         for (key, queue, adapter_kind, thread_channel) in
             self.pending_queue_handles(platform, thread_id)
         {
@@ -1560,13 +1606,16 @@ impl Dispatcher {
             .iter()
             .filter(|(key, _)| key.as_str() == prefix || key.starts_with(&lane_prefix))
             .find_map(|(key, handle)| {
-                handle.activity.claim_replace(message_id).then(|| ReplaceClaim {
-                    key: key.clone(),
-                    queue: Arc::clone(&handle.queue),
-                    activity: Arc::clone(&handle.activity),
-                    adapter_kind: handle.adapter_kind.clone(),
-                    thread_channel: handle.thread_channel.clone(),
-                })
+                handle
+                    .activity
+                    .claim_replace(message_id)
+                    .then(|| ReplaceClaim {
+                        key: key.clone(),
+                        queue: Arc::clone(&handle.queue),
+                        activity: Arc::clone(&handle.activity),
+                        adapter_kind: handle.adapter_kind.clone(),
+                        thread_channel: handle.thread_channel.clone(),
+                    })
             });
         let Some(target) = target else {
             return false;
@@ -1698,12 +1747,7 @@ impl Dispatcher {
                     store.remove_lane(&k);
                 }
                 for active in handle.activity.list() {
-                    if let Some(claim) = self
-                        .replace_claims
-                        .lock()
-                        .unwrap()
-                        .remove(&active.id)
-                    {
+                    if let Some(claim) = self.replace_claims.lock().unwrap().remove(&active.id) {
                         claim.activity.release_replace();
                     }
                 }
@@ -1890,10 +1934,7 @@ async fn dispatch_batch(
     let batch_size = batch.len();
     let session_key = Dispatcher::session_key(thread_channel);
     if let Err(error) = adapter
-        .update_task_lifecycle(
-            thread_channel,
-            TaskLifecycleEvent::Started { batch_size },
-        )
+        .update_task_lifecycle(thread_channel, TaskLifecycleEvent::Started { batch_size })
         .await
     {
         warn!(%error, "failed to mark task as running");
@@ -1990,9 +2031,7 @@ async fn dispatch_batch(
             let _ = adapter
                 .update_task_lifecycle(
                     thread_channel,
-                    TaskLifecycleEvent::Failed {
-                        message: user_msg,
-                    },
+                    TaskLifecycleEvent::Failed { message: user_msg },
                 )
                 .await;
             return;
@@ -2638,17 +2677,11 @@ mod tests {
             vec![1, 2]
         );
         assert!(d.edit_pending_message("discord", "T1", 2, "updated"));
-        assert_eq!(
-            d.pending_messages("discord", "T1")[1].prompt,
-            "updated"
-        );
+        assert_eq!(d.pending_messages("discord", "T1")[1].prompt, "updated");
         assert!(d.remove_pending_message("discord", "T1", 1));
         assert!(!d.remove_pending_message("discord", "T1", 1));
         queue_b.insert(3, make_msg("new arrival", 10), false);
-        assert_eq!(
-            d.clear_pending_messages_through("discord", "T1", 2),
-            1
-        );
+        assert_eq!(d.clear_pending_messages_through("discord", "T1", 2), 1);
         assert_eq!(d.pending_messages("discord", "T1")[0].id, 3);
         assert_eq!(d.clear_pending_messages("discord", "T1"), 1);
         assert!(d.pending_messages("discord", "T1").is_empty());
@@ -2696,10 +2729,7 @@ mod tests {
         let replacement_id = d
             .enqueue_claimed_replacement(10, make_msg("replacement", 10))
             .unwrap();
-        assert_eq!(
-            d.pending_messages("discord", "T1")[0].id,
-            replacement_id
-        );
+        assert_eq!(d.pending_messages("discord", "T1")[0].id, replacement_id);
         assert!(activity.inner.lock().unwrap().replace_paused);
         let waiter_activity = Arc::clone(&activity);
         let waiter = tokio::spawn(async move { waiter_activity.wait_until_unpaused().await });
@@ -2889,10 +2919,7 @@ mod tests {
             .text_blocks
             .iter()
             .any(|text| text == "interrupted"));
-        assert!(calls[1]
-            .text_blocks
-            .iter()
-            .any(|text| text == "pending"));
+        assert!(calls[1].text_blocks.iter().any(|text| text == "pending"));
 
         tokio::time::timeout(Duration::from_secs(2), async {
             loop {
@@ -2914,12 +2941,7 @@ mod tests {
         let dispatcher = make_dispatcher(BatchGrouping::Thread).with_persistence(path.clone());
         let queue = insert_dummy_handle(&dispatcher, "discord:T1");
         queue.insert(1, make_msg("keep after shutdown", 10), false);
-        dispatcher.persist_pending_queue(
-            "discord:T1",
-            "discord",
-            &make_channel("T1"),
-            &queue,
-        );
+        dispatcher.persist_pending_queue("discord:T1", "discord", &make_channel("T1"), &queue);
 
         dispatcher.shutdown();
 
@@ -2938,12 +2960,7 @@ mod tests {
         let dispatcher = make_dispatcher(BatchGrouping::Thread).with_persistence(path.clone());
         let queue = insert_dummy_handle(&dispatcher, "discord:T1");
         queue.insert(1, make_msg("discard", 10), false);
-        dispatcher.persist_pending_queue(
-            "discord:T1",
-            "discord",
-            &make_channel("T1"),
-            &queue,
-        );
+        dispatcher.persist_pending_queue("discord:T1", "discord", &make_channel("T1"), &queue);
 
         assert_eq!(dispatcher.cancel_buffered_thread("discord", "T1"), 1);
         assert!(QueueStore::load(path).summaries().is_empty());

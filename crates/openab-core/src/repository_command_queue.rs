@@ -12,6 +12,8 @@ use std::sync::{Arc, Mutex};
 use tokio::sync::oneshot;
 use tracing::{info, warn};
 
+use crate::control_db::ControlDb;
+
 const MAX_FINISHED_JOBS: usize = 50;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -86,7 +88,13 @@ struct QueueInner {
 pub struct RepositoryCommandQueue {
     inner: Arc<Mutex<QueueInner>>,
     cancellations: Arc<tokio::sync::Mutex<HashMap<u64, oneshot::Sender<()>>>>,
-    path: PathBuf,
+    backend: RepositoryCommandQueueBackend,
+}
+
+#[derive(Clone)]
+enum RepositoryCommandQueueBackend {
+    Json(PathBuf),
+    Sqlite(ControlDb),
 }
 
 impl RepositoryCommandQueue {
@@ -139,7 +147,7 @@ impl RepositoryCommandQueue {
         let queue = Self {
             inner: Arc::new(Mutex::new(inner)),
             cancellations: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
-            path,
+            backend: RepositoryCommandQueueBackend::Json(path.clone()),
         };
         if recovered > 0 {
             let inner = queue.lock();
@@ -147,8 +155,30 @@ impl RepositoryCommandQueue {
                 warn!(%error, "failed to persist recovered repository command queue");
             }
         }
-        info!(recovered, path = %queue.path.display(), "loaded repository command queue");
+        info!(recovered, path = %path.display(), "loaded repository command queue");
         queue
+    }
+
+    pub fn load_from_control_db(db: ControlDb, legacy_path: PathBuf) -> anyhow::Result<Self> {
+        let (next_id, jobs) = db.load_or_import_repository_jobs(&legacy_path)?;
+        let mut inner = QueueInner {
+            next_id: next_id.max(1),
+            jobs,
+            active_workers: HashSet::new(),
+        };
+        let recovered = recover_active_jobs(&mut inner);
+        normalize_next_id(&mut inner);
+        let queue = Self {
+            inner: Arc::new(Mutex::new(inner)),
+            cancellations: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
+            backend: RepositoryCommandQueueBackend::Sqlite(db.clone()),
+        };
+        if recovered > 0 {
+            let inner = queue.lock();
+            queue.persist_locked(&inner)?;
+        }
+        info!(recovered, path = %db.path().display(), "loaded repository command queue from control database");
+        Ok(queue)
     }
 
     pub fn enqueue(
@@ -411,23 +441,56 @@ impl RepositoryCommandQueue {
     }
 
     fn persist_locked(&self, inner: &QueueInner) -> anyhow::Result<()> {
-        let data = serde_json::to_string_pretty(&QueueDisk {
-            next_id: inner.next_id,
-            jobs: inner.jobs.clone(),
-        })?;
-        if let Some(parent) = self.path.parent() {
-            std::fs::create_dir_all(parent)?;
+        match &self.backend {
+            RepositoryCommandQueueBackend::Json(path) => {
+                let data = serde_json::to_string_pretty(&QueueDisk {
+                    next_id: inner.next_id,
+                    jobs: inner.jobs.clone(),
+                })?;
+                if let Some(parent) = path.parent() {
+                    std::fs::create_dir_all(parent)?;
+                }
+                let temporary = path.with_extension("json.tmp");
+                std::fs::write(&temporary, data)?;
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::PermissionsExt;
+                    std::fs::set_permissions(&temporary, std::fs::Permissions::from_mode(0o600))?;
+                }
+                std::fs::rename(temporary, path)?;
+            }
+            RepositoryCommandQueueBackend::Sqlite(db) => {
+                db.replace_repository_jobs(inner.next_id, &inner.jobs)?;
+            }
         }
-        let temporary = self.path.with_extension("json.tmp");
-        std::fs::write(&temporary, data)?;
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(&temporary, std::fs::Permissions::from_mode(0o600))?;
-        }
-        std::fs::rename(temporary, &self.path)?;
         Ok(())
     }
+}
+
+fn recover_active_jobs(inner: &mut QueueInner) -> usize {
+    let mut recovered = 0;
+    for job in &mut inner.jobs {
+        if job.state == RepositoryCommandState::Running {
+            job.state = RepositoryCommandState::Pending;
+            job.started_at = None;
+            job.finished_at = None;
+            job.recovered_from_active = true;
+            job.result = None;
+            recovered += 1;
+        }
+    }
+    recovered
+}
+
+fn normalize_next_id(inner: &mut QueueInner) {
+    inner.next_id = inner
+        .jobs
+        .iter()
+        .map(|job| job.id)
+        .max()
+        .unwrap_or(0)
+        .saturating_add(1)
+        .max(inner.next_id);
 }
 
 pub fn cancelled_result() -> RepositoryCommandResult {

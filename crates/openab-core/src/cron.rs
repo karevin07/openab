@@ -252,10 +252,12 @@ fn should_create_cron_thread(job: &CronJobConfig, resolved_thread_id: Option<&st
 }
 
 fn cron_sender_thread_id(channel: &ChannelRef) -> Option<String> {
-    channel
-        .thread_id
-        .clone()
-        .or_else(|| channel.parent_id.as_ref().map(|_| channel.channel_id.clone()))
+    channel.thread_id.clone().or_else(|| {
+        channel
+            .parent_id
+            .as_ref()
+            .map(|_| channel.channel_id.clone())
+    })
 }
 
 /// Validate all cronjob configs (fail-fast on bad cron expressions or timezones).
@@ -303,9 +305,7 @@ pub fn validate_cronjobs(
 
 fn validate_cronjob_routing(job: &CronJobConfig) -> Result<(), String> {
     if !job.has_channel_target() {
-        return Err(
-            "set channel or workspace_alias so the scheduler knows where to post".into(),
-        );
+        return Err("set channel or workspace_alias so the scheduler knows where to post".into());
     }
     if !job.has_prompt_source() {
         return Err("set message or action_id so the scheduler has a prompt".into());
@@ -406,6 +406,8 @@ pub struct CronBindings {
     pub resolve_action_prompt: Option<Arc<dyn Fn(&str, &str) -> Option<String> + Send + Sync>>,
     pub session: Option<Arc<dyn CronSessionView>>,
     pub sticky_store_path: Option<PathBuf>,
+    #[cfg(feature = "discord")]
+    pub sticky_store: Option<Arc<CronStickyStore>>,
     pub toggles: Option<Arc<CronToggleStore>>,
 }
 
@@ -413,22 +415,42 @@ pub struct CronBindings {
 /// Cursor cannot rewrite the schedule file. Missing keys fall back to the TOML value.
 #[derive(Debug)]
 pub struct CronToggleStore {
-    path: PathBuf,
+    backend: CronToggleBackend,
     inner: std::sync::RwLock<HashMap<String, bool>>,
+}
+
+#[derive(Debug)]
+enum CronToggleBackend {
+    Json(PathBuf),
+    #[cfg(feature = "discord")]
+    Sqlite(crate::control_db::ControlDb),
+    Memory,
 }
 
 impl CronToggleStore {
     pub fn load(path: PathBuf) -> Self {
         let map = load_json_map(&path);
         Self {
-            path,
+            backend: CronToggleBackend::Json(path),
             inner: std::sync::RwLock::new(map),
         }
     }
 
+    #[cfg(feature = "discord")]
+    pub fn load_from_control_db(
+        db: crate::control_db::ControlDb,
+        legacy_path: PathBuf,
+    ) -> anyhow::Result<Self> {
+        let map = db.load_or_import_cron_toggles(&legacy_path)?;
+        Ok(Self {
+            backend: CronToggleBackend::Sqlite(db),
+            inner: std::sync::RwLock::new(map),
+        })
+    }
+
     pub fn in_memory() -> Self {
         Self {
-            path: PathBuf::new(),
+            backend: CronToggleBackend::Memory,
             inner: std::sync::RwLock::new(HashMap::new()),
         }
     }
@@ -455,10 +477,52 @@ impl CronToggleStore {
     pub fn set_enabled(&self, id: &str, enabled: bool) -> std::io::Result<()> {
         let mut map = self.write_map();
         map.insert(id.to_string(), enabled);
-        if self.path.as_os_str().is_empty() {
-            return Ok(());
+        match &self.backend {
+            CronToggleBackend::Json(path) => save_json_pretty(path, &*map),
+            #[cfg(feature = "discord")]
+            CronToggleBackend::Sqlite(db) => {
+                db.replace_cron_toggles(&map).map_err(std::io::Error::other)
+            }
+            CronToggleBackend::Memory => Ok(()),
         }
-        save_json_pretty(&self.path, &*map)
+    }
+}
+
+#[cfg(feature = "discord")]
+#[derive(Debug)]
+pub struct CronStickyStore {
+    db: crate::control_db::ControlDb,
+    inner: std::sync::RwLock<HashMap<String, String>>,
+}
+
+#[cfg(feature = "discord")]
+impl CronStickyStore {
+    pub fn load_from_control_db(
+        db: crate::control_db::ControlDb,
+        legacy_path: PathBuf,
+    ) -> anyhow::Result<Self> {
+        let map = db.load_or_import_cron_threads(&legacy_path)?;
+        Ok(Self {
+            db,
+            inner: std::sync::RwLock::new(map),
+        })
+    }
+
+    fn get(&self, job_id: &str) -> Option<String> {
+        self.inner
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(job_id)
+            .cloned()
+    }
+
+    fn set(&self, job_id: &str, thread_id: &str) -> anyhow::Result<()> {
+        let mut map = self
+            .inner
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        map.insert(job_id.to_string(), thread_id.to_string());
+        self.db.replace_cron_threads(&map)
     }
 }
 
@@ -550,6 +614,10 @@ fn sticky_thread_id(job: &CronJobConfig, bindings: &CronBindings) -> Option<Stri
         return None;
     }
     let key = job.sticky_key()?;
+    #[cfg(feature = "discord")]
+    if let Some(store) = &bindings.sticky_store {
+        return store.get(key);
+    }
     let path = bindings.sticky_store_path.as_ref()?;
     load_sticky_threads(path).remove(key)
 }
@@ -561,8 +629,18 @@ fn persist_sticky_thread(job: &CronJobConfig, bindings: &CronBindings, thread_id
     let Some(key) = job.sticky_key() else {
         return;
     };
+    #[cfg(feature = "discord")]
+    if let Some(store) = &bindings.sticky_store {
+        if let Err(error) = store.set(key, thread_id) {
+            warn!(id = key, %error, "failed to persist sticky cron thread to control database");
+        }
+        return;
+    }
     let Some(path) = bindings.sticky_store_path.as_ref() else {
-        warn!(id = key, "sticky cronjob has no store path, thread_id will not persist");
+        warn!(
+            id = key,
+            "sticky cronjob has no store path, thread_id will not persist"
+        );
         return;
     };
     let mut map = load_sticky_threads(path);
@@ -1014,8 +1092,7 @@ async fn fire_cronjob(
                 DisableOnSuccessResult::NotAchieved(reason) => {
                     info!(
                         id = job.id.as_deref().unwrap_or(""),
-                        reason,
-                        "disable_on_success not achieved, firing cronjob normally"
+                        reason, "disable_on_success not achieved, firing cronjob normally"
                     );
                 }
             }
@@ -1079,11 +1156,7 @@ async fn fire_cronjob(
             .await
         {
             Ok(ch) => {
-                if let Some(thread_id) = ch
-                    .thread_id
-                    .as_deref()
-                    .or(Some(ch.channel_id.as_str()))
-                {
+                if let Some(thread_id) = ch.thread_id.as_deref().or(Some(ch.channel_id.as_str())) {
                     persist_sticky_thread(job, bindings, thread_id);
                     if let (Some(path), Some(id)) =
                         (usercron_path.as_deref(), non_empty_opt(job.id.as_deref()))
@@ -1125,7 +1198,7 @@ async fn fire_cronjob(
         thread_id: cron_sender_thread_id(&reply_channel),
         is_bot: true,
         timestamp: Some(Utc::now().to_rfc3339()),
-        message_id: None, // cron jobs don't originate from a message
+        message_id: None,  // cron jobs don't originate from a message
         receiver_id: None, // cron jobs are self-triggered, no external receiver
         output_instructions: None,
     };
@@ -2042,7 +2115,10 @@ message = "a"
             origin_event_id: None,
         };
 
-        assert_eq!(cron_sender_thread_id(&channel).as_deref(), Some("thread-456"));
+        assert_eq!(
+            cron_sender_thread_id(&channel).as_deref(),
+            Some("thread-456")
+        );
     }
 
     // --- validate_cronjobs tests ---
@@ -2350,8 +2426,7 @@ command = "echo"
         job.channel = "stale".into();
         let bindings = CronBindings {
             resolve_channel: Some(Arc::new(|platform, alias| {
-                (platform == "discord" && alias == "example-library")
-                    .then(|| "resolved-channel".into())
+                (platform == "discord" && alias == "example-library").then(|| "resolved-channel".into())
             })),
             ..CronBindings::default()
         };
@@ -2369,8 +2444,7 @@ command = "echo"
         job.message = "fallback".into();
         let bindings = CronBindings {
             resolve_action_prompt: Some(Arc::new(|alias, action_id| {
-                (alias == "openab" && action_id == "daily_summary")
-                    .then(|| "from-action".into())
+                (alias == "openab" && action_id == "daily_summary").then(|| "from-action".into())
             })),
             ..CronBindings::default()
         };

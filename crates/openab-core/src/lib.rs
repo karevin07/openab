@@ -4,6 +4,8 @@ pub mod acp_mcp;
 pub mod adapter;
 pub mod bot_turns;
 pub mod config;
+#[cfg(feature = "discord")]
+pub mod control_db;
 pub mod cron;
 pub mod cursor_session;
 pub mod directives;

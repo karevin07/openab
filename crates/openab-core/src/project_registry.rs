@@ -11,6 +11,8 @@ use std::path::PathBuf;
 use std::sync::{Arc, RwLock};
 use tracing::{info, warn};
 
+use crate::control_db::ControlDb;
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ProjectBinding {
     pub guild_id: u64,
@@ -38,7 +40,13 @@ pub enum ProjectAccessTarget {
 #[derive(Clone)]
 pub struct ProjectRegistry {
     bindings: Arc<RwLock<HashMap<u64, ProjectBinding>>>,
-    path: PathBuf,
+    backend: ProjectRegistryBackend,
+}
+
+#[derive(Clone)]
+enum ProjectRegistryBackend {
+    Json(PathBuf),
+    Sqlite(ControlDb),
 }
 
 impl ProjectRegistry {
@@ -78,8 +86,18 @@ impl ProjectRegistry {
         info!(count = bindings.len(), path = %path.display(), "loaded project registry");
         Self {
             bindings: Arc::new(RwLock::new(bindings)),
-            path,
+            backend: ProjectRegistryBackend::Json(path),
         }
+    }
+
+    pub fn load_from_control_db(db: ControlDb, legacy_path: PathBuf) -> anyhow::Result<Self> {
+        let entries = db.load_or_import_projects(&legacy_path)?;
+        let bindings = normalize_bindings(entries);
+        info!(count = bindings.len(), path = %db.path().display(), "loaded project registry from control database");
+        Ok(Self {
+            bindings: Arc::new(RwLock::new(bindings)),
+            backend: ProjectRegistryBackend::Sqlite(db),
+        })
     }
 
     pub fn contains_channel(&self, channel_id: u64) -> bool {
@@ -274,13 +292,42 @@ impl ProjectRegistry {
                 .cmp(&b.guild_id)
                 .then_with(|| a.workspace_alias.cmp(&b.workspace_alias))
         });
-        let data = serde_json::to_string_pretty(&entries)?;
-        if let Some(parent) = self.path.parent() {
-            std::fs::create_dir_all(parent)?;
+        match &self.backend {
+            ProjectRegistryBackend::Json(path) => {
+                let data = serde_json::to_string_pretty(&entries)?;
+                if let Some(parent) = path.parent() {
+                    std::fs::create_dir_all(parent)?;
+                }
+                std::fs::write(path, data)?;
+            }
+            ProjectRegistryBackend::Sqlite(db) => db.replace_projects(&entries)?,
         }
-        std::fs::write(&self.path, data)?;
         Ok(())
     }
+}
+
+fn normalize_bindings(entries: Vec<ProjectBinding>) -> HashMap<u64, ProjectBinding> {
+    let mut bindings = HashMap::with_capacity(entries.len());
+    for mut binding in entries {
+        if binding.workspace_alias.is_empty() {
+            warn!(
+                channel_id = binding.channel_id,
+                "ignoring project binding with empty workspace alias"
+            );
+            continue;
+        }
+        if let Some(role_id) = binding.access_role_id.take() {
+            if !binding.access_role_ids.contains(&role_id) {
+                binding.access_role_ids.push(role_id);
+            }
+        }
+        binding.access_user_ids.sort_unstable();
+        binding.access_user_ids.dedup();
+        binding.access_role_ids.sort_unstable();
+        binding.access_role_ids.dedup();
+        bindings.insert(binding.channel_id, binding);
+    }
+    bindings
 }
 
 #[cfg(test)]

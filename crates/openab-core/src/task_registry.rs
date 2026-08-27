@@ -7,6 +7,8 @@ use std::path::PathBuf;
 use std::sync::{Arc, RwLock};
 use tracing::{info, warn};
 
+use crate::control_db::ControlDb;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum TaskState {
@@ -46,7 +48,13 @@ pub struct TaskRecord {
 #[derive(Clone)]
 pub struct TaskRegistry {
     tasks: Arc<RwLock<HashMap<u64, TaskRecord>>>,
-    path: PathBuf,
+    backend: TaskRegistryBackend,
+}
+
+#[derive(Clone)]
+enum TaskRegistryBackend {
+    Json(PathBuf),
+    Sqlite(ControlDb),
 }
 
 impl TaskRegistry {
@@ -69,8 +77,21 @@ impl TaskRegistry {
         info!(count = tasks.len(), path = %path.display(), "loaded task registry");
         Self {
             tasks: Arc::new(RwLock::new(tasks)),
-            path,
+            backend: TaskRegistryBackend::Json(path),
         }
+    }
+
+    pub fn load_from_control_db(db: ControlDb, legacy_path: PathBuf) -> anyhow::Result<Self> {
+        let entries = db.load_or_import_tasks(&legacy_path)?;
+        let tasks = entries
+            .into_iter()
+            .map(|task| (task.thread_id, task))
+            .collect::<HashMap<_, _>>();
+        info!(count = tasks.len(), path = %db.path().display(), "loaded task registry from control database");
+        Ok(Self {
+            tasks: Arc::new(RwLock::new(tasks)),
+            backend: TaskRegistryBackend::Sqlite(db),
+        })
     }
 
     pub fn task_for_thread(&self, thread_id: u64) -> Option<TaskRecord> {
@@ -127,11 +148,7 @@ impl TaskRegistry {
     /// Reconcile task metadata after pending queue entries are removed through
     /// the Discord queue manager. An active turn remains Running; an idle task
     /// whose queue becomes empty returns to Ready.
-    pub fn discard_queued(
-        &self,
-        thread_id: u64,
-        count: usize,
-    ) -> anyhow::Result<TaskRecord> {
+    pub fn discard_queued(&self, thread_id: u64, count: usize) -> anyhow::Result<TaskRecord> {
         self.update(thread_id, |task| {
             task.queued_messages = task.queued_messages.saturating_sub(count);
             if task.state == TaskState::Queued && task.queued_messages == 0 {
@@ -310,11 +327,16 @@ impl TaskRegistry {
                 .cmp(&b.project_channel_id)
                 .then_with(|| a.created_at.cmp(&b.created_at))
         });
-        let data = serde_json::to_string_pretty(&entries)?;
-        if let Some(parent) = self.path.parent() {
-            std::fs::create_dir_all(parent)?;
+        match &self.backend {
+            TaskRegistryBackend::Json(path) => {
+                let data = serde_json::to_string_pretty(&entries)?;
+                if let Some(parent) = path.parent() {
+                    std::fs::create_dir_all(parent)?;
+                }
+                std::fs::write(path, data)?;
+            }
+            TaskRegistryBackend::Sqlite(db) => db.replace_tasks(&entries)?,
         }
-        std::fs::write(&self.path, data)?;
         Ok(())
     }
 }
@@ -414,9 +436,7 @@ mod tests {
         registry.enqueue(20).unwrap();
         registry.start_turn(20, 1).unwrap();
 
-        let changed = registry
-            .reconcile_restored_queues(&HashMap::new())
-            .unwrap();
+        let changed = registry.reconcile_restored_queues(&HashMap::new()).unwrap();
         assert_eq!(changed[0].state, TaskState::Ready);
         assert_eq!(changed[0].queued_messages, 0);
     }

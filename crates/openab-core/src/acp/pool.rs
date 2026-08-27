@@ -67,6 +67,8 @@ pub struct SessionPool {
     hung_threshold_secs: u64,
     mapping_path: PathBuf,
     meta_path: PathBuf,
+    #[cfg(feature = "discord")]
+    control_db: Option<crate::control_db::ControlDb>,
     handoff_dir: PathBuf,
     default_config_options: HashMap<String, String>,
     #[cfg(feature = "acp-mcp")]
@@ -155,7 +157,12 @@ fn classify_hung(
 /// either resumes the session, so both are credentials. Extracted from the loop in `cleanup_idle`
 /// so the redaction can be exercised by a test for real — R1 redacted the sites it enumerated and
 /// this force-evict site was outside that list, logging both ids raw.
-fn warn_force_evicting_hung(key: &str, session_id: Option<&str>, age_secs: u64, threshold_secs: u64) {
+fn warn_force_evicting_hung(
+    key: &str,
+    session_id: Option<&str>,
+    age_secs: u64,
+    threshold_secs: u64,
+) {
     warn!(
         thread_id = %crate::redact::redact_session_ids(key),
         session_id = %session_id.map(crate::redact::redact_session_ids).unwrap_or_default(),
@@ -372,6 +379,8 @@ impl SessionPool {
             hung_threshold_secs,
             mapping_path,
             meta_path,
+            #[cfg(feature = "discord")]
+            control_db: None,
             handoff_dir,
             default_config_options,
             #[cfg(feature = "acp-mcp")]
@@ -379,6 +388,18 @@ impl SessionPool {
             #[cfg(feature = "acp-mcp")]
             facade_url: None,
         }
+    }
+
+    #[cfg(feature = "discord")]
+    pub fn with_control_db(mut self, db: crate::control_db::ControlDb) -> anyhow::Result<Self> {
+        let persisted = db.load_or_import_session_mappings(&self.mapping_path)?;
+        let session_workdirs = db.load_or_import_session_workdirs(&self.meta_path)?;
+        let state = self.state.get_mut();
+        state.suspended = persisted.clone();
+        state.persisted = persisted;
+        state.session_workdirs = session_workdirs;
+        self.control_db = Some(db);
+        Ok(self)
     }
 
     /// Wire the facade session-token registrar + facade URL, set by the root
@@ -413,6 +434,13 @@ impl SessionPool {
     }
 
     fn save_mapping(&self, persisted: &HashMap<String, String>) {
+        #[cfg(feature = "discord")]
+        if let Some(db) = &self.control_db {
+            if let Err(error) = db.replace_session_mappings(persisted) {
+                warn!(%error, "failed to persist thread mapping to control database");
+            }
+            return;
+        }
         let data = match serde_json::to_string_pretty(persisted) {
             Ok(d) => d,
             Err(e) => {
@@ -429,6 +457,13 @@ impl SessionPool {
     }
 
     fn save_meta(&self, workdirs: &HashMap<String, String>) {
+        #[cfg(feature = "discord")]
+        if let Some(db) = &self.control_db {
+            if let Err(error) = db.replace_session_workdirs(workdirs) {
+                warn!(%error, "failed to persist session metadata to control database");
+            }
+            return;
+        }
         let data = match serde_json::to_string_pretty(workdirs) {
             Ok(d) => d,
             Err(e) => {
@@ -497,14 +532,19 @@ impl SessionPool {
     /// Reject a chat that already belongs to a Discord thread before creating UI for it.
     pub async fn ensure_external_session_available(&self, session_id: &str) -> Result<()> {
         if !self.external_session_is_available(session_id).await {
-            return Err(anyhow!("Cursor chat is already attached to a Discord thread"));
+            return Err(anyhow!(
+                "Cursor chat is already attached to a Discord thread"
+            ));
         }
         Ok(())
     }
 
     pub async fn external_session_is_available(&self, session_id: &str) -> bool {
         let state = self.state.read().await;
-        !state.persisted.values().any(|current| current == session_id)
+        !state
+            .persisted
+            .values()
+            .any(|current| current == session_id)
     }
 
     /// Attach an existing external ACP session to an idle thread without spawning an agent.
@@ -859,7 +899,12 @@ impl SessionPool {
         // supersedes under the same key (its guard cannot fire if that predecessor is hung). F3.
         #[cfg(feature = "acp-mcp")]
         if let Some(token) = session_token {
-            install_facade_token(&mut state, thread_id, token, self.session_registrar.as_ref());
+            install_facade_token(
+                &mut state,
+                thread_id,
+                token,
+                self.session_registrar.as_ref(),
+            );
         }
         self.save_mapping(&state.persisted);
 
@@ -894,11 +939,12 @@ impl SessionPool {
     {
         let conn = {
             let state = self.state.read().await;
-            state
-                .active
-                .get(thread_id)
-                .cloned()
-                .ok_or_else(|| anyhow!("no connection for thread {}", crate::redact::redact_session_ids(thread_id)))?
+            state.active.get(thread_id).cloned().ok_or_else(|| {
+                anyhow!(
+                    "no connection for thread {}",
+                    crate::redact::redact_session_ids(thread_id)
+                )
+            })?
         };
 
         let mut conn = conn.lock().await;
@@ -926,11 +972,12 @@ impl SessionPool {
     ) -> Result<Vec<ConfigOption>> {
         let conn = {
             let state = self.state.read().await;
-            state
-                .active
-                .get(thread_id)
-                .cloned()
-                .ok_or_else(|| anyhow!("no connection for thread {}", crate::redact::redact_session_ids(thread_id)))?
+            state.active.get(thread_id).cloned().ok_or_else(|| {
+                anyhow!(
+                    "no connection for thread {}",
+                    crate::redact::redact_session_ids(thread_id)
+                )
+            })?
         };
         let mut conn = conn.lock().await;
         conn.set_config_option(config_id, value).await
@@ -942,11 +989,12 @@ impl SessionPool {
     pub async fn get_usage(&self, thread_id: &str) -> Result<crate::acp::protocol::UsageReport> {
         let conn = {
             let state = self.state.read().await;
-            state
-                .active
-                .get(thread_id)
-                .cloned()
-                .ok_or_else(|| anyhow!("no connection for thread {}", crate::redact::redact_session_ids(thread_id)))?
+            state.active.get(thread_id).cloned().ok_or_else(|| {
+                anyhow!(
+                    "no connection for thread {}",
+                    crate::redact::redact_session_ids(thread_id)
+                )
+            })?
         };
         let mut conn = conn.lock().await;
         conn.get_usage().await
@@ -961,7 +1009,12 @@ impl SessionPool {
                 .cancel_handles
                 .get(thread_id)
                 .cloned()
-                .ok_or_else(|| anyhow!("no session for thread {}", crate::redact::redact_session_ids(thread_id)))?
+                .ok_or_else(|| {
+                    anyhow!(
+                        "no session for thread {}",
+                        crate::redact::redact_session_ids(thread_id)
+                    )
+                })?
         };
         let data = serde_json::to_string(&serde_json::json!({
             "jsonrpc": "2.0",
@@ -1004,8 +1057,7 @@ impl SessionPool {
 
         let Some(active) = active else {
             let state = self.state.read().await;
-            if !state.suspended.contains_key(thread_id)
-                && !state.persisted.contains_key(thread_id)
+            if !state.suspended.contains_key(thread_id) && !state.persisted.contains_key(thread_id)
             {
                 return Err(anyhow!(
                     "no resumable session for thread {}",
@@ -1020,9 +1072,9 @@ impl SessionPool {
         // A held connection lock means a turn or another connection operation is
         // active even if its activity flag has not been updated yet.
         let session_id = {
-            let conn = active
-                .try_lock()
-                .map_err(|_| anyhow!("session is busy; wait for the current reply or cancel it first"))?;
+            let conn = active.try_lock().map_err(|_| {
+                anyhow!("session is busy; wait for the current reply or cancel it first")
+            })?;
             conn.acp_session_id
                 .clone()
                 .ok_or_else(|| anyhow!("session has no resumable ACP session ID yet"))?
@@ -1033,7 +1085,9 @@ impl SessionPool {
         let mut state = self.state.write().await;
         if remove_if_same_handle(&mut state.active, thread_id, &active).is_none() {
             let _ = std::fs::remove_file(marker_path);
-            return Err(anyhow!("session changed while preparing the hand-off; try again"));
+            return Err(anyhow!(
+                "session changed while preparing the hand-off; try again"
+            ));
         }
         state.cancel_handles.remove(thread_id);
         state.activity.remove(thread_id);
@@ -1041,9 +1095,7 @@ impl SessionPool {
         state
             .persisted
             .insert(thread_id.to_string(), session_id.clone());
-        state
-            .suspended
-            .insert(thread_id.to_string(), session_id);
+        state.suspended.insert(thread_id.to_string(), session_id);
         #[cfg(feature = "acp-mcp")]
         revoke_facade_token_for_key(&mut state, thread_id, self.session_registrar.as_ref());
         self.save_mapping(&state.persisted);
@@ -1105,7 +1157,10 @@ impl SessionPool {
             info!(thread_id = %crate::redact::redact_session_ids(thread_id), "session reset");
             Ok(())
         } else {
-            Err(anyhow!("no session for thread {}", crate::redact::redact_session_ids(thread_id)))
+            Err(anyhow!(
+                "no session for thread {}",
+                crate::redact::redact_session_ids(thread_id)
+            ))
         }
     }
 
@@ -1311,11 +1366,11 @@ mod tests {
         get_or_insert_gate, has_session_state, purge_session_entries, remove_if_same_handle,
         session_state, PoolState, SessionPool, SessionState,
     };
-    use crate::config::AgentConfig;
-    use std::time::Duration;
     use crate::acp::connection::SessionActivity;
+    use crate::config::AgentConfig;
     use std::collections::HashMap;
     use std::sync::Arc;
+    use std::time::Duration;
     use tokio::sync::Mutex;
     use tokio::time::Instant;
 
@@ -1397,19 +1452,23 @@ mod tests {
         attach_external_session_state(&mut state, "discord:1", "chat-a", "/tmp/repo").unwrap();
         attach_external_session_state(&mut state, "discord:1", "chat-a", "/tmp/repo").unwrap();
 
-        assert_eq!(state.persisted.get("discord:1").map(String::as_str), Some("chat-a"));
-        assert_eq!(state.suspended.get("discord:1").map(String::as_str), Some("chat-a"));
+        assert_eq!(
+            state.persisted.get("discord:1").map(String::as_str),
+            Some("chat-a")
+        );
+        assert_eq!(
+            state.suspended.get("discord:1").map(String::as_str),
+            Some("chat-a")
+        );
         assert_eq!(
             state.session_workdirs.get("discord:1").map(String::as_str),
             Some("/tmp/repo")
         );
         assert!(
-            attach_external_session_state(&mut state, "discord:2", "chat-a", "/tmp/repo")
-                .is_err()
+            attach_external_session_state(&mut state, "discord:2", "chat-a", "/tmp/repo").is_err()
         );
         assert!(
-            attach_external_session_state(&mut state, "discord:1", "chat-b", "/tmp/repo")
-                .is_err()
+            attach_external_session_state(&mut state, "discord:1", "chat-b", "/tmp/repo").is_err()
         );
     }
 
@@ -1425,11 +1484,28 @@ mod tests {
         let mut state = empty_pool_state();
 
         // Predecessor registers, then a successor takes over the SAME key.
-        super::install_facade_token(&mut state, "discord:acp_x", "T_pred".into(), Some(&registrar));
-        assert!(reg.revoked().is_empty(), "nothing to revoke on the first install");
-        super::install_facade_token(&mut state, "discord:acp_x", "T_succ".into(), Some(&registrar));
+        super::install_facade_token(
+            &mut state,
+            "discord:acp_x",
+            "T_pred".into(),
+            Some(&registrar),
+        );
+        assert!(
+            reg.revoked().is_empty(),
+            "nothing to revoke on the first install"
+        );
+        super::install_facade_token(
+            &mut state,
+            "discord:acp_x",
+            "T_succ".into(),
+            Some(&registrar),
+        );
 
-        assert_eq!(reg.revoked(), vec!["T_pred"], "the predecessor token must be revoked");
+        assert_eq!(
+            reg.revoked(),
+            vec!["T_pred"],
+            "the predecessor token must be revoked"
+        );
         assert_eq!(
             state.facade_tokens.get("discord:acp_x").map(String::as_str),
             Some("T_succ"),
@@ -1446,14 +1522,25 @@ mod tests {
         let reg = Arc::new(CountingRegistrar::default());
         let registrar: Arc<dyn crate::acp_mcp::SessionTokenRegistrar> = reg.clone();
         let mut state = empty_pool_state();
-        state.facade_tokens.insert("discord:acp_x".into(), "T_hung".into());
+        state
+            .facade_tokens
+            .insert("discord:acp_x".into(), "T_hung".into());
         // A different session's token must be untouched.
-        state.facade_tokens.insert("discord:acp_y".into(), "T_other".into());
+        state
+            .facade_tokens
+            .insert("discord:acp_y".into(), "T_other".into());
 
         super::revoke_facade_token_for_key(&mut state, "discord:acp_x", Some(&registrar));
 
-        assert_eq!(reg.revoked(), vec!["T_hung"], "only the evicted session's token is revoked");
-        assert!(!state.facade_tokens.contains_key("discord:acp_x"), "and it is forgotten");
+        assert_eq!(
+            reg.revoked(),
+            vec!["T_hung"],
+            "only the evicted session's token is revoked"
+        );
+        assert!(
+            !state.facade_tokens.contains_key("discord:acp_x"),
+            "and it is forgotten"
+        );
         assert_eq!(
             state.facade_tokens.get("discord:acp_y").map(String::as_str),
             Some("T_other"),
@@ -1769,11 +1856,23 @@ mod tests {
         });
 
         let out = String::from_utf8(buf.lock().unwrap().clone()).unwrap();
-        assert!(out.contains("force-evicting hung session"), "the warning must fire: {out}");
+        assert!(
+            out.contains("force-evicting hung session"),
+            "the warning must fire: {out}"
+        );
         assert!(!out.contains(uuid), "no raw uuid may reach the log: {out}");
-        assert!(!out.contains("acp_") && !out.contains("sess_"), "no raw id prefix either: {out}");
-        assert!(out.contains('#'), "the redaction tag must be present: {out}");
-        assert!(out.contains("discord"), "the readable platform half must survive: {out}");
+        assert!(
+            !out.contains("acp_") && !out.contains("sess_"),
+            "no raw id prefix either: {out}"
+        );
+        assert!(
+            out.contains('#'),
+            "the redaction tag must be present: {out}"
+        );
+        assert!(
+            out.contains("discord"),
+            "the readable platform half must survive: {out}"
+        );
     }
 
     #[test]

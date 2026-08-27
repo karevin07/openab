@@ -584,6 +584,14 @@ async fn main() -> anyhow::Result<()> {
         });
     }
 
+    #[cfg(feature = "discord")]
+    let openab_state_dir = std::env::var("HOME")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_default()
+        .join(".openab");
+    #[cfg(feature = "discord")]
+    let control_db = openab_core::control_db::ControlDb::open(openab_state_dir.join("control.db"))?;
+
     let pool_inner = acp::SessionPool::new(
         cfg.agent,
         cfg.pool.max_sessions,
@@ -592,6 +600,8 @@ async fn main() -> anyhow::Result<()> {
             .saturating_add(cfg.pool.hung_grace_secs),
         cfg.pool.default_config_options,
     );
+    #[cfg(feature = "discord")]
+    let pool_inner = pool_inner.with_control_db(control_db.clone())?;
     // Facade session wiring: only when the facade is actually serving. With no `[mcp]` there is
     // no registrar and no facade url, and the pool simply starts sessions without browser
     // capabilities — there is no longer a proxy path for it to fall back to.
@@ -939,12 +949,11 @@ async fn main() -> anyhow::Result<()> {
 
     #[cfg(feature = "discord")]
     let project_registry = {
-        let path = std::env::var("HOME")
-            .map(std::path::PathBuf::from)
-            .unwrap_or_default()
-            .join(".openab")
-            .join("discord-projects.json");
-        let registry = openab_core::project_registry::ProjectRegistry::load(path);
+        let path = openab_state_dir.join("discord-projects.json");
+        let registry = openab_core::project_registry::ProjectRegistry::load_from_control_db(
+            control_db.clone(),
+            path,
+        )?;
         let aliases = router.workspace_aliases_map();
         for binding in registry.all() {
             if aliases.contains_key(&binding.workspace_alias) {
@@ -966,12 +975,8 @@ async fn main() -> anyhow::Result<()> {
 
     #[cfg(feature = "discord")]
     let task_registry = {
-        let path = std::env::var("HOME")
-            .map(std::path::PathBuf::from)
-            .unwrap_or_default()
-            .join(".openab")
-            .join("discord-tasks.json");
-        openab_core::task_registry::TaskRegistry::load(path)
+        let path = openab_state_dir.join("discord-tasks.json");
+        openab_core::task_registry::TaskRegistry::load_from_control_db(control_db.clone(), path)?
     };
 
     // Shutdown signal for Slack adapter
@@ -1683,10 +1688,21 @@ async fn main() -> anyhow::Result<()> {
         .map(PathBuf::from)
         .unwrap_or_default()
         .join(".openab");
+    #[cfg(feature = "discord")]
+    let cron_toggles = Arc::new(cron::CronToggleStore::load_from_control_db(
+        control_db.clone(),
+        openab_data_dir.join("cron-toggles.json"),
+    )?);
+    #[cfg(not(feature = "discord"))]
     let cron_toggles = Arc::new(cron::CronToggleStore::load(
         openab_data_dir.join("cron-toggles.json"),
     ));
     let cron_sticky_path = openab_data_dir.join("cron-threads.json");
+    #[cfg(feature = "discord")]
+    let cron_sticky_store = Arc::new(cron::CronStickyStore::load_from_control_db(
+        control_db.clone(),
+        cron_sticky_path.clone(),
+    )?);
     let (cron_run_now_tx, cron_run_now_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
 
     let has_cron_work = !cfg.cron.jobs.is_empty() || usercron_path.is_some();
@@ -1744,6 +1760,8 @@ async fn main() -> anyhow::Result<()> {
             })),
             session: Some(pool.clone() as Arc<dyn cron::CronSessionView>),
             sticky_store_path: Some(cron_sticky_path.clone()),
+            #[cfg(feature = "discord")]
+            sticky_store: Some(cron_sticky_store.clone()),
             toggles: Some(cron_toggles.clone()),
         };
         info!(baseline = cronjobs.len(), usercron = ?usercron_path, "starting cron scheduler");
@@ -1835,11 +1853,7 @@ async fn main() -> anyhow::Result<()> {
             &discord_cfg.message_processing_mode,
             discord_cfg.max_buffered_messages,
         );
-        let discord_queue_path = std::env::var("HOME")
-            .map(std::path::PathBuf::from)
-            .unwrap_or_default()
-            .join(".openab")
-            .join("discord-queue.json");
+        let discord_queue_path = openab_state_dir.join("discord-queue.json");
         let discord_dispatcher = Arc::new(
             dispatch::Dispatcher::with_idle_timeout(
                 router.clone(),
@@ -1848,7 +1862,7 @@ async fn main() -> anyhow::Result<()> {
                 discord_grouping,
                 discord_idle,
             )
-            .with_persistence(discord_queue_path),
+            .with_control_db_persistence(control_db.clone(), discord_queue_path)?,
         );
         let mut restored_queue_counts = std::collections::HashMap::new();
         for summary in discord_dispatcher.persisted_queue_summaries() {
@@ -1904,22 +1918,16 @@ async fn main() -> anyhow::Result<()> {
         dispatchers.lock().unwrap().push(discord_dispatcher.clone());
 
         // Initialize reminder store
-        let reminder_path = std::env::var("HOME")
-            .map(std::path::PathBuf::from)
-            .unwrap_or_default()
-            .join(".openab")
-            .join("reminders.json");
-        let reminder_store = remind::ReminderStore::load(reminder_path);
+        let reminder_path = openab_state_dir.join("reminders.json");
+        let reminder_store =
+            remind::ReminderStore::load_from_control_db(control_db.clone(), reminder_path)?;
 
-        let repository_command_queue_path = std::env::var("HOME")
-            .map(std::path::PathBuf::from)
-            .unwrap_or_default()
-            .join(".openab")
-            .join("repository-command-queue.json");
+        let repository_command_queue_path = openab_state_dir.join("repository-command-queue.json");
         let repository_command_queue =
-            openab_core::repository_command_queue::RepositoryCommandQueue::load(
+            openab_core::repository_command_queue::RepositoryCommandQueue::load_from_control_db(
+                control_db.clone(),
                 repository_command_queue_path,
-            );
+            )?;
 
         // Construct ambient dispatcher if enabled and channels configured.
         let ambient_dispatcher = if cfg.ambient.enabled && !cfg.ambient.discord.channels.is_empty()
