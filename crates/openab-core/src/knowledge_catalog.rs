@@ -13,6 +13,10 @@ use tracing::warn;
 const MIGRATION_0001: &str = include_str!("../migrations/0001_knowledge_catalog.sql");
 const MIGRATION_0002: &str = include_str!("../migrations/0002_knowledge_workflows.sql");
 const MIGRATION_0003: &str = include_str!("../migrations/0003_knowledge_search_cards.sql");
+const MIGRATION_0004: &str = include_str!("../migrations/0004_knowledge_synthesis_cards.sql");
+const MIGRATION_0005: &str = include_str!("../migrations/0005_knowledge_reading_overview_cards.sql");
+const MIGRATION_0006: &str = include_str!("../migrations/0006_knowledge_capture_preview_cards.sql");
+const MIGRATION_0007: &str = include_str!("../migrations/0007_knowledge_search_prompt_tighten.sql");
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct KnowledgeField {
@@ -221,6 +225,10 @@ impl KnowledgeCatalog {
             (1, MIGRATION_0001),
             (2, MIGRATION_0002),
             (3, MIGRATION_0003),
+            (4, MIGRATION_0004),
+            (5, MIGRATION_0005),
+            (6, MIGRATION_0006),
+            (7, MIGRATION_0007),
         ] {
             let applied = connection
                 .query_row(
@@ -521,7 +529,31 @@ mod tests {
         assert!(recent.contains("不要輸出 Markdown table"));
         let search = catalog.global_prompt("search").unwrap();
         assert!(search.contains("1 至 5 筆搜尋結果"));
+        assert!(search.contains("必須嚴格以 search card contract"));
+        assert!(search.contains("不要編號清單文字"));
         assert!(search.contains("跨頁推論或長篇綜合分析"));
+        let world = catalog
+            .sources
+            .iter()
+            .find(|source| source.source_id == "world_stories")
+            .unwrap();
+        let synthesis = world.action("synthesis").unwrap();
+        assert!(synthesis.prompt_template.contains("synthesis card contract"));
+        assert!(synthesis.prompt_template.contains("不要 Markdown table"));
+        let reading = catalog.source("personal_reading_list").unwrap();
+        let overview = reading.action("overview").unwrap();
+        assert!(overview.prompt_template.contains("synthesis card contract"));
+        assert!(overview.prompt_template.contains("To Read"));
+        let capture = catalog.global_prompt("capture").unwrap();
+        assert!(capture.contains("capture_preview card contract"));
+        assert!(capture.contains("不要直接寫入 Notion"));
+        let confirm = catalog.global_action("capture_confirm").unwrap();
+        assert_eq!(confirm.behavior, "prompt");
+        assert!(confirm.prompt_template.contains("明確寫入授權"));
+        assert_eq!(
+            catalog.global_action("capture_cancel").unwrap().behavior,
+            "local"
+        );
     }
 
     #[test]
@@ -553,6 +585,33 @@ mod tests {
                 row.get(0)
             })
             .unwrap();
-        assert_eq!(version, 3);
+        assert_eq!(version, 7);
+        let world = catalog
+            .sources
+            .iter()
+            .find(|source| source.source_id == "world_stories")
+            .unwrap();
+        assert!(world
+            .action("synthesis")
+            .unwrap()
+            .prompt_template
+            .contains("synthesis card contract"));
+        let reading = catalog.source("personal_reading_list").unwrap();
+        assert!(reading
+            .action("overview")
+            .unwrap()
+            .prompt_template
+            .contains("synthesis card contract"));
+        assert!(reading
+            .action("overview")
+            .unwrap()
+            .prompt_template
+            .contains("不要 Markdown table"));
+        assert!(catalog
+            .global_prompt("capture")
+            .unwrap()
+            .contains("capture_preview card contract"));
+        assert!(catalog.global_action("capture_confirm").is_some());
+        assert!(catalog.global_action("capture_cancel").is_some());
     }
 }

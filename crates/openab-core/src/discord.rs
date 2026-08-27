@@ -1,5 +1,5 @@
-use crate::acp::protocol::{ConfigOption, UsageReport};
 use crate::acp::{ContentBlock, SessionSnapshot, SessionState};
+use crate::acp::protocol::{ConfigOption, UsageReport};
 use crate::adapter::{
     AdapterRouter, ChannelRef, ChatAdapter, MessageRef, SenderContext, TaskLifecycleEvent,
 };
@@ -68,7 +68,7 @@ use serenity::prelude::*;
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::LazyLock;
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 use tracing::{debug, error, info, warn};
 
 /// Hard cap on consecutive bot messages in a channel or thread.
@@ -779,17 +779,62 @@ fn project_info_embed(binding: &ProjectBinding) -> CreateEmbed {
 }
 
 const KNOWLEDGE_CARDS_PREFIX: &str = "OPENAB_KNOWLEDGE_CARDS_V1";
+const KNOWLEDGE_CARDS_INVALID_FALLBACK: &str =
+    "⚠️ Knowledge 卡片驗證失敗，無法顯示結構化結果。請再試一次，或改以文字回覆。";
 const KNOWLEDGE_CARD_TITLE_MAX: usize = 80;
 const KNOWLEDGE_CARD_META_MAX: usize = 120;
 const KNOWLEDGE_CARD_SUMMARY_MAX: usize = 160;
 const KNOWLEDGE_CARD_NEXT_STEP_MAX: usize = 160;
 const KNOWLEDGE_CARD_URL_MAX: usize = 200;
 const KNOWLEDGE_EMBED_DESCRIPTION_MAX: usize = 4096;
+const KNOWLEDGE_MESSAGE_CONTENT_MAX: usize = 1900;
+
+/// Channel → Discord user who last submitted a Knowledge prompt in that thread.
+/// Used to bind `capture_preview` confirm/cancel buttons to the initiator.
+static KNOWLEDGE_CAPTURE_OWNERS: LazyLock<Mutex<HashMap<u64, u64>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
+fn remember_knowledge_capture_owner(channel_id: u64, user_id: u64) {
+    match KNOWLEDGE_CAPTURE_OWNERS.lock() {
+        Ok(mut owners) => {
+            owners.insert(channel_id, user_id);
+        }
+        Err(poisoned) => {
+            poisoned.into_inner().insert(channel_id, user_id);
+        }
+    }
+}
+
+fn knowledge_capture_owner(channel_id: u64) -> Option<u64> {
+    match KNOWLEDGE_CAPTURE_OWNERS.lock() {
+        Ok(owners) => owners.get(&channel_id).copied(),
+        Err(poisoned) => poisoned.into_inner().get(&channel_id).copied(),
+    }
+}
+
+fn clear_knowledge_capture_owner(channel_id: u64) {
+    match KNOWLEDGE_CAPTURE_OWNERS.lock() {
+        Ok(mut owners) => {
+            owners.remove(&channel_id);
+        }
+        Err(poisoned) => {
+            poisoned.into_inner().remove(&channel_id);
+        }
+    }
+}
+
+fn knowledge_cards_marker_present(content: &str) -> bool {
+    content
+        .lines()
+        .any(|line| line.trim() == KNOWLEDGE_CARDS_PREFIX)
+}
 
 #[derive(Debug, Deserialize)]
 struct KnowledgeCardEnvelope {
     kind: String,
     heading: String,
+    #[serde(default)]
+    overview: String,
     #[serde(default)]
     project_id: String,
     items: Vec<KnowledgeCardItem>,
@@ -881,9 +926,11 @@ fn parse_and_validate_knowledge_cards(
         return None;
     }
     if envelope.kind != "search"
+        && envelope.kind != "synthesis"
         && envelope.kind != "retention"
         && envelope.kind != "project_notes"
         && envelope.kind != "project_note_preview"
+        && envelope.kind != "capture_preview"
     {
         return None;
     }
@@ -896,14 +943,15 @@ fn parse_and_validate_knowledge_cards(
     if envelope.kind == "project_note_preview" && envelope.items.len() != 1 {
         return None;
     }
+    if envelope.kind == "synthesis" && envelope.overview.trim().is_empty() {
+        return None;
+    }
 
     for item in &envelope.items {
         let requires_url = envelope.kind != "project_note_preview";
+        let notion_only = envelope.kind != "capture_preview";
         let url = item.url.trim();
-        if (requires_url
-            && (!url.starts_with("https://app.notion.com/")
-                || url.len() > KNOWLEDGE_CARD_URL_MAX
-                || url.contains(')')))
+        if (requires_url && !knowledge_card_url_is_valid(url, notion_only))
             || item.title.trim().is_empty()
         {
             return None;
@@ -918,6 +966,17 @@ fn parse_and_validate_knowledge_cards(
     }
 
     Some((envelope, project))
+}
+
+fn knowledge_card_url_is_valid(url: &str, notion_only: bool) -> bool {
+    if url.is_empty() || url.len() > KNOWLEDGE_CARD_URL_MAX || url.contains(')') {
+        return false;
+    }
+    if notion_only {
+        url.starts_with("https://app.notion.com/")
+    } else {
+        url.starts_with("https://")
+    }
 }
 
 fn knowledge_item_body(item: &KnowledgeCardItem) -> String {
@@ -970,6 +1029,7 @@ fn ranked_knowledge_list_embed(kind: &str, items: &[KnowledgeCardItem]) -> Optio
     }
     let colour = match kind {
         "project_notes" => 0x57F287,
+        "synthesis" => 0xF2C94C,
         _ => 0x2F80ED,
     };
     Some(
@@ -984,12 +1044,32 @@ fn ranked_knowledge_list_embed(kind: &str, items: &[KnowledgeCardItem]) -> Optio
 }
 
 fn knowledge_cards_message(content: &str) -> Option<CreateMessage> {
+    knowledge_cards_message_for(content, None)
+}
+
+fn knowledge_cards_message_for(
+    content: &str,
+    capture_owner: Option<u64>,
+) -> Option<CreateMessage> {
     let catalog = knowledge_catalog();
     let (envelope, project) = parse_and_validate_knowledge_cards(content)?;
 
-    let mut message = CreateMessage::new().content(truncate_chars(envelope.heading.trim(), 240));
+    let heading = truncate_chars(envelope.heading.trim(), 240);
+    let message_content = if envelope.kind == "synthesis" {
+        let overview = truncate_chars(
+            envelope.overview.trim(),
+            KNOWLEDGE_MESSAGE_CONTENT_MAX.saturating_sub(heading.chars().count() + 2),
+        );
+        suppress_mentions(&format!("{heading}\n\n{overview}"))
+    } else {
+        suppress_mentions(&heading)
+    };
+    let mut message = CreateMessage::new().content(message_content);
 
-    if envelope.kind == "search" || envelope.kind == "project_notes" {
+    if envelope.kind == "search"
+        || envelope.kind == "synthesis"
+        || envelope.kind == "project_notes"
+    {
         return Some(message.embeds(vec![ranked_knowledge_list_embed(
             &envelope.kind,
             &envelope.items,
@@ -1024,6 +1104,7 @@ fn knowledge_cards_message(content: &str) -> Option<CreateMessage> {
         let colour = match envelope.kind.as_str() {
             "retention" => 0xE67E22,
             "project_note_preview" => 0x57F287,
+            "capture_preview" => 0x5865F2,
             _ => 0x2F80ED,
         };
         let mut embed = CreateEmbed::new()
@@ -1066,8 +1147,45 @@ fn knowledge_cards_message(content: &str) -> Option<CreateMessage> {
             .label(cancel_action.label.clone())
             .style(knowledge_button_style(&cancel_action.button_style)),
         ])]);
+    } else if envelope.kind == "capture_preview" {
+        let confirm_action = catalog.global_action("capture_confirm")?;
+        let cancel_action = catalog.global_action("capture_cancel")?;
+        // Bind buttons to the Knowledge prompt initiator so only they can confirm.
+        let Some(owner_id) = capture_owner else {
+            warn!("capture_preview card missing owner; posting embeds without confirm buttons");
+            return Some(message);
+        };
+        message = message.components(vec![CreateActionRow::Buttons(vec![
+            CreateButton::new(format!(
+                "oab_knowledge:{}:{}",
+                confirm_action.action_id, owner_id
+            ))
+            .label(confirm_action.label.clone())
+            .style(knowledge_button_style(&confirm_action.button_style)),
+            CreateButton::new(format!(
+                "oab_knowledge:{}:{}",
+                cancel_action.action_id, owner_id
+            ))
+            .label(cancel_action.label.clone())
+            .style(knowledge_button_style(&cancel_action.button_style)),
+        ])]);
     }
     Some(message)
+}
+
+fn knowledge_delivery_message(content: &str, channel_id: u64) -> CreateMessage {
+    let owner = knowledge_capture_owner(channel_id);
+    if let Some(builder) = knowledge_cards_message_for(content, owner) {
+        return builder;
+    }
+    if knowledge_cards_marker_present(content) {
+        warn!(
+            channel_id,
+            "knowledge cards marker present but validation failed; using fallback"
+        );
+        return CreateMessage::new().content(KNOWLEDGE_CARDS_INVALID_FALLBACK);
+    }
+    CreateMessage::new().content(content)
 }
 
 fn knowledge_source(id: &str, kind: &str) -> Option<&'static KnowledgeSource> {
@@ -1182,6 +1300,22 @@ fn knowledge_global_modal(action_id: &str) -> Option<CreateModal> {
     )
 }
 
+/// Short Discord-visible request body for Knowledge UI launches.
+///
+/// The full agent prompt (adapter context, skill instructions) stays internal;
+/// Discord only shows the action title plus optional user-facing modal fields.
+fn knowledge_request_preview(title: &str, user_facing: &[(&str, &str)]) -> String {
+    if user_facing.is_empty() {
+        return title.to_string();
+    }
+    let conditions = user_facing
+        .iter()
+        .map(|(name, value)| format!("- {name}: {value}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    format!("{title}\n{conditions}")
+}
+
 fn knowledge_global_prompt(
     action_id: &str,
     submitted: &[(&str, &str)],
@@ -1207,7 +1341,7 @@ fn knowledge_global_prompt(
 fn knowledge_global_modal_prompt(
     action_id: &str,
     modal: &serenity::model::application::ModalInteraction,
-) -> Option<(String, String)> {
+) -> Option<(String, String, String)> {
     let action = knowledge_catalog().global_action(action_id)?;
     let submitted = action
         .inputs
@@ -1226,7 +1360,14 @@ fn knowledge_global_modal_prompt(
         .iter()
         .map(|(name, value)| (name.as_str(), value.as_str()))
         .collect::<Vec<_>>();
-    knowledge_global_prompt(action_id, &borrowed, None)
+    let (title, prompt) = knowledge_global_prompt(action_id, &borrowed, None)?;
+    let user_facing: Vec<(&str, &str)> = borrowed
+        .iter()
+        .copied()
+        .filter(|(_, value)| *value != "未提供")
+        .collect();
+    let preview = knowledge_request_preview(&title, &user_facing);
+    Some((title, prompt, preview))
 }
 
 fn knowledge_action_prompt(
@@ -1259,7 +1400,7 @@ fn knowledge_modal_action_prompt(
     source: &KnowledgeSource,
     action_id: &str,
     modal: &serenity::model::application::ModalInteraction,
-) -> Option<(String, String)> {
+) -> Option<(String, String, String)> {
     let action = source.action(action_id)?;
     let submitted = action
         .inputs
@@ -1278,7 +1419,14 @@ fn knowledge_modal_action_prompt(
         .iter()
         .map(|(name, value)| (name.as_str(), value.as_str()))
         .collect::<Vec<_>>();
-    knowledge_action_prompt(source, action_id, &borrowed)
+    let (title, prompt) = knowledge_action_prompt(source, action_id, &borrowed)?;
+    let user_facing: Vec<(&str, &str)> = borrowed
+        .iter()
+        .copied()
+        .filter(|(_, value)| *value != "未提供")
+        .collect();
+    let preview = knowledge_request_preview(&title, &user_facing);
+    Some((title, prompt, preview))
 }
 
 fn knowledge_scheduled_source_select() -> CreateActionRow {
@@ -3071,7 +3219,9 @@ impl ChatAdapter for DiscordAdapter {
     }
 
     fn prefers_unsplit_delivery(&self, content: &str) -> bool {
-        knowledge_cards_payload_is_valid(content)
+        // Keep marker+JSON together even when validation fails, so we can
+        // replace the whole payload with a clear fallback instead of leaking JSON.
+        knowledge_cards_marker_present(content)
     }
 
     async fn send_message(
@@ -3080,13 +3230,9 @@ impl ChatAdapter for DiscordAdapter {
         content: &str,
     ) -> anyhow::Result<MessageRef> {
         let ch_id: u64 = Self::resolve_channel(channel).parse()?;
-        let msg = if let Some(builder) = knowledge_cards_message(content) {
-            ChannelId::new(ch_id)
-                .send_message(&self.http, builder)
-                .await?
-        } else {
-            ChannelId::new(ch_id).say(&self.http, content).await?
-        };
+        let msg = ChannelId::new(ch_id)
+            .send_message(&self.http, knowledge_delivery_message(content, ch_id))
+            .await?;
         Ok(MessageRef {
             channel: channel.clone(),
             message_id: msg.id.to_string(),
@@ -3127,8 +3273,7 @@ impl ChatAdapter for DiscordAdapter {
             // Invalid message ID, fall back to plain send
             return self.send_message(channel, content).await;
         }
-        let builder = knowledge_cards_message(content)
-            .unwrap_or_else(|| serenity::builder::CreateMessage::new().content(content))
+        let builder = knowledge_delivery_message(content, ch_id)
             .reference_message((ChannelId::new(ch_id), MessageId::new(msg_id)));
         match ChannelId::new(ch_id)
             .send_message(&self.http, builder)
@@ -6000,6 +6145,8 @@ impl Handler {
         user: &serenity::model::user::User,
         title: &str,
         prompt: String,
+        preview: Option<&str>,
+        bind_capture_owner: bool,
     ) -> Result<u64, String> {
         let title = truncate_for_discord(title.trim(), 100);
         let parent_id = scope
@@ -6050,12 +6197,31 @@ impl Handler {
             (thread.id.get(), Some(channel_id))
         };
 
-        let preview = suppress_mentions(&truncate_for_discord(&prompt, 1800));
+        // Keep the agent prompt out of Discord; show only the short action label
+        // (plus optional modal fields passed via `preview`).
+        if bind_capture_owner {
+            remember_knowledge_capture_owner(target_id, user.id.get());
+        }
+        let ahead = self
+            .dispatcher
+            .active_messages("discord", &target_id.to_string())
+            .len()
+            + self
+                .dispatcher
+                .pending_messages("discord", &target_id.to_string())
+                .len();
+        let preview = suppress_mentions(&truncate_for_discord(preview.unwrap_or(&title), 1800));
+        let mut request_content =
+            format!("👤 **Request from <@{}>**\n{}", user.id, preview,);
+        if ahead > 0 {
+            request_content.push_str(&format!(
+                "\n\n⏳ 已排入 Queue（前方還有 {ahead} 則進行中／等待中）"
+            ));
+        }
         let trigger = ChannelId::new(target_id)
             .send_message(
                 &ctx.http,
-                CreateMessage::new()
-                    .content(format!("👤 **Request from <@{}>**\n{}", user.id, preview,)),
+                CreateMessage::new().content(request_content),
             )
             .await
             .map_err(|error| format!("Could not post knowledge request: {error}"))?;
@@ -6274,6 +6440,8 @@ impl Handler {
                     &comp.user,
                     &format!("{}｜{action_title}", source.title),
                     prompt,
+                    None,
+                    false,
                 )
                 .await;
             let content = result.map_or_else(
@@ -6282,6 +6450,154 @@ impl Handler {
             );
             let _ = comp
                 .edit_response(&ctx.http, EditInteractionResponse::new().content(content))
+                .await;
+            return;
+        }
+        if let Some(owner_raw) = action.strip_prefix("capture_confirm:") {
+            let Ok(owner_id) = owner_raw.parse::<u64>() else {
+                let _ = comp
+                    .create_response(
+                        &ctx.http,
+                        CreateInteractionResponse::Message(
+                            CreateInteractionResponseMessage::new()
+                                .content("⚠️ 這份收錄預覽已失效，請重新產生預覽。")
+                                .ephemeral(true),
+                        ),
+                    )
+                    .await;
+                return;
+            };
+            if comp.user.id.get() != owner_id {
+                let _ = comp
+                    .create_response(
+                        &ctx.http,
+                        CreateInteractionResponse::Message(
+                            CreateInteractionResponseMessage::new()
+                                .content("⚠️ 只有發起這次收錄預覽的人可以確認寫入。")
+                                .ephemeral(true),
+                        ),
+                    )
+                    .await;
+                return;
+            }
+            if let Err(error) = comp
+                .create_response(
+                    &ctx.http,
+                    CreateInteractionResponse::UpdateMessage(
+                        CreateInteractionResponseMessage::new()
+                            .content("⏳ 正在核對並寫入 Knowledge Library……")
+                            .embeds(Vec::new())
+                            .components(Vec::new()),
+                    ),
+                )
+                .await
+            {
+                tracing::error!(%error, "failed to acknowledge capture confirm");
+                return;
+            }
+            clear_knowledge_capture_owner(comp.channel_id.get());
+            let preview_message_id = comp.message.id.to_string();
+            let user_id = comp.user.id.get().to_string();
+            let submitted = [
+                ("Discord preview message ID", preview_message_id.as_str()),
+                ("Discord user ID", user_id.as_str()),
+            ];
+            let Some((action_title, prompt)) =
+                knowledge_global_prompt("capture_confirm", &submitted, None)
+            else {
+                let _ = comp
+                    .edit_response(
+                        &ctx.http,
+                        EditInteractionResponse::new().content("⚠️ 收錄確認工作流設定已失效。"),
+                    )
+                    .await;
+                return;
+            };
+            if let Err(error) = self
+                .submit_knowledge_prompt(ctx, scope, &comp.user, &action_title, prompt, None, false)
+                .await
+            {
+                let _ = comp
+                    .edit_response(
+                        &ctx.http,
+                        EditInteractionResponse::new()
+                            .content(format!("⚠️ 無法開始確認收錄：{error}")),
+                    )
+                    .await;
+            }
+            return;
+        }
+        if action == "capture_confirm" {
+            let _ = comp
+                .create_response(
+                    &ctx.http,
+                    CreateInteractionResponse::Message(
+                        CreateInteractionResponseMessage::new()
+                            .content("⚠️ 這份收錄預覽缺少授權綁定，請重新產生預覽後再確認。")
+                            .ephemeral(true),
+                    ),
+                )
+                .await;
+            return;
+        }
+        if let Some(owner_raw) = action.strip_prefix("capture_cancel:") {
+            let Ok(owner_id) = owner_raw.parse::<u64>() else {
+                let _ = comp
+                    .create_response(
+                        &ctx.http,
+                        CreateInteractionResponse::Message(
+                            CreateInteractionResponseMessage::new()
+                                .content("⚠️ 這份收錄預覽已失效。")
+                                .ephemeral(true),
+                        ),
+                    )
+                    .await;
+                return;
+            };
+            if comp.user.id.get() != owner_id {
+                let _ = comp
+                    .create_response(
+                        &ctx.http,
+                        CreateInteractionResponse::Message(
+                            CreateInteractionResponseMessage::new()
+                                .content("⚠️ 只有發起這次收錄預覽的人可以取消。")
+                                .ephemeral(true),
+                        ),
+                    )
+                    .await;
+                return;
+            }
+            clear_knowledge_capture_owner(comp.channel_id.get());
+            let content = knowledge_catalog()
+                .global_action("capture_cancel")
+                .and_then(|action| action.config_string("message_template"))
+                .unwrap_or_else(|| "已取消收錄預覽，未寫入 Notion。".to_string());
+            if let Err(error) = comp
+                .create_response(
+                    &ctx.http,
+                    CreateInteractionResponse::UpdateMessage(
+                        CreateInteractionResponseMessage::new()
+                            .content(content)
+                            .embeds(Vec::new())
+                            .components(Vec::new()),
+                    ),
+                )
+                .await
+            {
+                tracing::error!(%error, "failed to cancel capture preview");
+            }
+            return;
+        }
+        if action == "capture_cancel" {
+            let _ = comp
+                .create_response(
+                    &ctx.http,
+                    CreateInteractionResponse::Message(
+                        CreateInteractionResponseMessage::new()
+                            .content("⚠️ 這份收錄預覽缺少授權綁定，請重新產生預覽。")
+                            .ephemeral(true),
+                    ),
+                )
                 .await;
             return;
         }
@@ -6304,7 +6620,8 @@ impl Handler {
                     &ctx.http,
                     CreateInteractionResponse::UpdateMessage(
                         CreateInteractionResponseMessage::new()
-                            .content("⏳ 正在核對並儲存這份 Side Project 備忘……"),
+                            .content("⏳ 正在核對並儲存這份 Side Project 備忘……")
+                            .components(Vec::new()),
                     ),
                 )
                 .await
@@ -6339,6 +6656,8 @@ impl Handler {
                     &comp.user,
                     &format!("{}｜{action_title}", project.title),
                     prompt,
+                    None,
+                    false,
                 )
                 .await
             {
@@ -6375,7 +6694,9 @@ impl Handler {
                 .create_response(
                     &ctx.http,
                     CreateInteractionResponse::UpdateMessage(
-                        CreateInteractionResponseMessage::new().content(content),
+                        CreateInteractionResponseMessage::new()
+                            .content(content)
+                            .components(Vec::new()),
                     ),
                 )
                 .await
@@ -6437,7 +6758,7 @@ impl Handler {
                 return;
             }
             let result = self
-                .submit_knowledge_prompt(ctx, scope, &comp.user, &title, prompt)
+                .submit_knowledge_prompt(ctx, scope, &comp.user, &title, prompt, None, false)
                 .await;
             let content = result.map_or_else(
                 |error| format!("⚠️ 無法開始 Side Project 操作：{error}"),
@@ -6499,7 +6820,7 @@ impl Handler {
                 return;
             }
             let result = self
-                .submit_knowledge_prompt(ctx, scope, &comp.user, &title, prompt)
+                .submit_knowledge_prompt(ctx, scope, &comp.user, &title, prompt, None, false)
                 .await;
             let content = result.map_or_else(
                 |error| format!("⚠️ 無法開始排程資料庫操作：{error}"),
@@ -6541,7 +6862,7 @@ impl Handler {
                 return;
             }
             let result = self
-                .submit_knowledge_prompt(ctx, scope, &comp.user, &title, prompt)
+                .submit_knowledge_prompt(ctx, scope, &comp.user, &title, prompt, None, false)
                 .await;
             let content = result.map_or_else(
                 |error| format!("⚠️ 無法開始 Reading List 操作：{error}"),
@@ -6602,7 +6923,7 @@ impl Handler {
                 return;
             };
             let result = self
-                .submit_knowledge_prompt(ctx, scope, &comp.user, &title, prompt)
+                .submit_knowledge_prompt(ctx, scope, &comp.user, &title, prompt, None, false)
                 .await;
             let content = result.map_or_else(
                 |error| format!("⚠️ 無法開始查詢：{error}"),
@@ -6682,7 +7003,7 @@ impl Handler {
         } else {
             knowledge_global_modal_prompt(action, modal)
         };
-        let Some((title, prompt)) = request else {
+        let Some((title, prompt, preview)) = request else {
             let _ = modal
                 .create_response(
                     &ctx.http,
@@ -6700,7 +7021,15 @@ impl Handler {
             return;
         }
         let result = self
-            .submit_knowledge_prompt(ctx, scope, &modal.user, &title, prompt)
+            .submit_knowledge_prompt(
+                ctx,
+                scope,
+                &modal.user,
+                &title,
+                prompt,
+                Some(&preview),
+                action == "capture",
+            )
             .await;
         let content = result.map_or_else(
             |error| format!("⚠️ 無法開始知識整理：{error}"),
@@ -11660,6 +11989,39 @@ mod tests {
     }
 
     #[test]
+    fn knowledge_request_preview_hides_adapter_and_keeps_user_fields() {
+        let source = knowledge_scheduled_source("github_ai_data_weekly").unwrap();
+        let (title, prompt) = knowledge_scheduled_source_prompt(source, "synthesis").unwrap();
+        assert!(title.contains("跨期整理"));
+        assert!(prompt.contains("Structured Knowledge Adapter"));
+        assert!(prompt.contains("operation_id: synthesis"));
+
+        let preview = knowledge_request_preview(&title, &[]);
+        assert_eq!(preview, title);
+        assert!(!preview.contains("Structured Knowledge Adapter"));
+        assert!(!preview.contains("operation_id"));
+        assert!(!preview.contains("data_source_id"));
+
+        let with_fields = knowledge_request_preview(
+            &title,
+            &[("標題包含", "Context Database"), ("週次或時間範圍", "最近 4 期")],
+        );
+        assert!(with_fields.starts_with(&title));
+        assert!(with_fields.contains("- 標題包含: Context Database"));
+        assert!(with_fields.contains("- 週次或時間範圍: 最近 4 期"));
+        assert!(!with_fields.contains("Structured Knowledge Adapter"));
+
+        // Modal call sites omit empty optional fields ("未提供") from Discord preview.
+        let filtered: Vec<(&str, &str)> = [("問題", "什麼是 Agent"), ("範圍", "未提供")]
+            .into_iter()
+            .filter(|(_, value)| *value != "未提供")
+            .collect();
+        let skips_empty = knowledge_request_preview("查詢知識", &filtered);
+        assert_eq!(skips_empty, "查詢知識\n- 問題: 什麼是 Agent");
+        assert!(!skips_empty.contains("未提供"));
+    }
+
+    #[test]
     fn knowledge_modals_collect_the_expected_fields() {
         let capture = serde_json::to_value(knowledge_capture_modal())
             .unwrap()
@@ -11818,6 +12180,39 @@ mod tests {
     }
 
     #[test]
+    fn knowledge_synthesis_renders_overview_and_ranked_embed() {
+        let payload = concat!(
+            "✅ `notion_notion-fetch`\n\n",
+            "OPENAB_KNOWLEDGE_CARDS_V1\n",
+            r#"{"kind":"synthesis","heading":"🌍 World Stories｜最近 3 期（W32–W34）","overview":"• 日本皇室文化贊助角色持續深化\n• 挪威王室健康與繼承值得追蹤","items":[{"title":"W34｜尤金妮公主女兒取名 Adelaide","url":"https://app.notion.com/p/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","meta":"獨有 · Anecdote｜🇬🇧","summary":"串起英國與葡萄牙王室史"},{"title":"W33｜荷蘭皇家馬車亮相馬術世錦賽","url":"https://app.notion.com/p/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","meta":"獨有 · Culture｜🇳🇱","summary":"1898 年馬車在現代賽事登場"},{"title":"W32｜盧森堡 Joyeux Entrée","url":"https://app.notion.com/p/cccccccccccccccccccccccccccccccc","meta":"獨有 · Tradition｜🇱🇺","summary":"中世紀入城儀式延續至今"}]}"#,
+        );
+        assert!(knowledge_cards_payload_is_valid(payload));
+        let message = knowledge_cards_message(payload).unwrap();
+        let rendered = serde_json::to_value(&message).unwrap().to_string();
+        assert!(rendered.contains("World Stories｜最近 3 期"));
+        assert!(rendered.contains("日本皇室文化贊助"));
+        assert!(rendered.contains("挪威王室健康"));
+        assert!(rendered.contains("**1.** ["));
+        assert!(rendered.contains("**3.** ["));
+        assert!(rendered.contains("尤金妮公主"));
+        assert!(rendered.contains("Knowledge · 3 筆"));
+        // Amber colour for synthesis embeds (0xF2C94C = 15911244).
+        assert!(rendered.contains("15911244"));
+        assert!(!rendered.contains("OPENAB_KNOWLEDGE_CARDS_V1"));
+        assert!(!rendered.contains("| 期別"));
+        assert_eq!(rendered.matches("\"description\"").count(), 1);
+
+        assert!(!knowledge_cards_payload_is_valid(&format!(
+            "OPENAB_KNOWLEDGE_CARDS_V1\n{}",
+            r#"{"kind":"synthesis","heading":"bad","overview":"x","items":[{"title":"x","url":"https://app.notion.com/p/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa)","meta":"","summary":""}]}"#
+        )));
+        assert!(!knowledge_cards_payload_is_valid(&format!(
+            "OPENAB_KNOWLEDGE_CARDS_V1\n{}",
+            r#"{"kind":"synthesis","heading":"no overview","items":[{"title":"x","url":"https://app.notion.com/p/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","meta":"","summary":""}]}"#
+        )));
+    }
+
+    #[test]
     fn knowledge_retention_cards_validate_ids_and_expose_keep_select() {
         let payload = concat!(
             "OPENAB_KNOWLEDGE_CARDS_V1\n",
@@ -11871,6 +12266,64 @@ mod tests {
             "OPENAB_KNOWLEDGE_CARDS_V1\n{\"kind\":\"project_note_preview\",\"heading\":\"bad\",\"project_id\":\"unknown\",\"items\":[{\"title\":\"x\",\"url\":\"\"}]}"
         )
         .is_none());
+    }
+
+    #[test]
+    fn knowledge_capture_preview_cards_accept_https_urls_and_confirm_buttons() {
+        let payload = concat!(
+            "OPENAB_KNOWLEDGE_CARDS_V1\n",
+            r#"{"kind":"capture_preview","heading":"收錄預覽（2 筆）","items":[{"title":"Agent reliability notes","url":"https://example.com/agent-reliability","meta":"Guide · Current · create","summary":"Production reliability patterns"},{"title":"既有 Notion 筆記","url":"https://app.notion.com/p/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","meta":"Article · Current · update","summary":"更新摘要與 tags"}]}"#,
+        );
+        assert!(knowledge_cards_payload_is_valid(payload));
+        let rendered = serde_json::to_value(knowledge_cards_message_for(payload, Some(42)).unwrap())
+            .unwrap()
+            .to_string();
+        assert!(rendered.contains("收錄預覽"));
+        assert!(rendered.contains("Agent reliability notes"));
+        assert!(rendered.contains("oab_knowledge:capture_confirm:42"));
+        assert!(rendered.contains("oab_knowledge:capture_cancel:42"));
+        assert!(rendered.contains("Guide · Current · create"));
+        // Blurple colour for capture previews (0x5865F2 = 5793266).
+        assert!(rendered.contains("5793266"));
+        assert!(!rendered.contains("OPENAB_KNOWLEDGE_CARDS_V1"));
+
+        // Without an owner, embeds still render but confirm buttons are omitted.
+        let unbound = serde_json::to_value(knowledge_cards_message(payload).unwrap())
+            .unwrap()
+            .to_string();
+        assert!(unbound.contains("Agent reliability notes"));
+        assert!(!unbound.contains("capture_confirm"));
+
+        assert!(!knowledge_cards_payload_is_valid(&format!(
+            "OPENAB_KNOWLEDGE_CARDS_V1\n{}",
+            r#"{"kind":"capture_preview","heading":"bad","items":[{"title":"x","url":"http://insecure.example/x","meta":"","summary":""}]}"#
+        )));
+        assert!(!knowledge_cards_payload_is_valid(&format!(
+            "OPENAB_KNOWLEDGE_CARDS_V1\n{}",
+            r#"{"kind":"capture_preview","heading":"bad","items":[{"title":"x","url":"https://example.com/a)b","meta":"","summary":""}]}"#
+        )));
+        // Other kinds must still require Notion URLs.
+        assert!(!knowledge_cards_payload_is_valid(&format!(
+            "OPENAB_KNOWLEDGE_CARDS_V1\n{}",
+            r#"{"kind":"search","heading":"bad","items":[{"title":"x","url":"https://example.com/x","meta":"","summary":""}]}"#
+        )));
+    }
+
+    #[test]
+    fn knowledge_invalid_cards_use_clear_fallback_instead_of_raw_json() {
+        let invalid = concat!(
+            "OPENAB_KNOWLEDGE_CARDS_V1\n",
+            r#"{"kind":"search","heading":"broken","items":[{"title":"x","url":"https://example.com/x"}]}"#,
+        );
+        assert!(knowledge_cards_marker_present(invalid));
+        assert!(!knowledge_cards_payload_is_valid(invalid));
+        assert!(knowledge_cards_message(invalid).is_none());
+        let fallback = serde_json::to_value(knowledge_delivery_message(invalid, 99))
+            .unwrap()
+            .to_string();
+        assert!(fallback.contains("卡片驗證失敗"));
+        assert!(!fallback.contains("OPENAB_KNOWLEDGE_CARDS_V1"));
+        assert!(!fallback.contains("https://example.com/x"));
     }
 
     #[test]
