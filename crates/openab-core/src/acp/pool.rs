@@ -2,7 +2,7 @@ use crate::acp::connection::{AcpConnection, SessionActivity};
 use crate::acp::protocol::ConfigOption;
 use crate::config::AgentConfig;
 use anyhow::{anyhow, Result};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tokio::sync::{Mutex, RwLock};
@@ -96,6 +96,16 @@ pub struct SessionSnapshot {
     /// True while an external ACP client owns this session through the
     /// handoff marker. Status UIs use this to prevent conflicting actions.
     pub externally_detached: bool,
+}
+
+/// One session currently retained by the pool, for management UIs that do not
+/// have a separate task/project registry (for example the OpenCode knowledge
+/// assistant).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionPoolEntry {
+    pub key: String,
+    pub snapshot: SessionSnapshot,
+    pub prompt_in_flight: bool,
 }
 type ActiveSnapshot = Vec<(String, Arc<Mutex<AcpConnection>>)>;
 type EvictionCandidate = (String, Arc<Mutex<AcpConnection>>, Instant, Option<String>);
@@ -518,6 +528,48 @@ impl SessionPool {
             working_dir,
             externally_detached: self.handoff_marker_path(thread_id).is_file(),
         }
+    }
+
+    /// List retained sessions whose routing key starts with `prefix`.
+    ///
+    /// Active and persisted maps overlap by design, so collect a set first and
+    /// return one stable entry per platform/thread key without exposing ACP
+    /// provider session IDs.
+    pub async fn session_entries(&self, prefix: &str) -> Vec<SessionPoolEntry> {
+        let state = self.state.read().await;
+        let mut keys = HashSet::new();
+        keys.extend(
+            state
+                .active
+                .keys()
+                .chain(state.suspended.keys())
+                .chain(state.persisted.keys())
+                .filter(|key| key.starts_with(prefix))
+                .cloned(),
+        );
+        let mut entries = keys
+            .into_iter()
+            .map(|key| {
+                let lifecycle = session_state(&state, &key);
+                SessionPoolEntry {
+                    snapshot: SessionSnapshot {
+                        state: lifecycle,
+                        working_dir: state.session_workdirs.get(&key).cloned().or_else(|| {
+                            (lifecycle != SessionState::None)
+                                .then(|| self.config.working_dir.clone())
+                        }),
+                        externally_detached: self.handoff_marker_path(&key).is_file(),
+                    },
+                    prompt_in_flight: state
+                        .active
+                        .get(&key)
+                        .is_some_and(|connection| connection.try_lock().is_err()),
+                    key,
+                }
+            })
+            .collect::<Vec<_>>();
+        entries.sort_by(|left, right| left.key.cmp(&right.key));
+        entries
     }
 
     /// True when this thread's ACP connection currently holds its mutex (prompt in flight).
@@ -1433,6 +1485,46 @@ mod tests {
         assert_eq!(session_state(&state, "suspended"), SessionState::Suspended);
         assert_eq!(session_state(&state, "persisted"), SessionState::Persisted);
         assert_eq!(session_state(&state, "missing"), SessionState::None);
+    }
+
+    #[tokio::test]
+    async fn session_entries_are_filtered_deduplicated_and_sorted() {
+        let dir = tempfile::tempdir().unwrap();
+        let pool = SessionPool::new_in(dir.path(), AgentConfig::default(), 4, 600, HashMap::new());
+        {
+            let mut state = pool.state.write().await;
+            state
+                .persisted
+                .insert("discord:22".into(), "session-22".into());
+            state
+                .persisted
+                .insert("discord:11".into(), "session-11".into());
+            state
+                .suspended
+                .insert("discord:11".into(), "session-11".into());
+            state
+                .persisted
+                .insert("slack:33".into(), "session-33".into());
+            state
+                .session_workdirs
+                .insert("discord:11".into(), "/tmp/knowledge".into());
+        }
+
+        let entries = pool.session_entries("discord:").await;
+        assert_eq!(
+            entries
+                .iter()
+                .map(|entry| entry.key.as_str())
+                .collect::<Vec<_>>(),
+            ["discord:11", "discord:22"]
+        );
+        assert_eq!(entries[0].snapshot.state, SessionState::Suspended);
+        assert_eq!(
+            entries[0].snapshot.working_dir.as_deref(),
+            Some("/tmp/knowledge")
+        );
+        assert_eq!(entries[1].snapshot.state, SessionState::Persisted);
+        assert!(!entries[0].prompt_in_flight);
     }
 
     #[test]

@@ -1,5 +1,5 @@
 use crate::acp::protocol::{ConfigOption, UsageReport};
-use crate::acp::{ContentBlock, SessionSnapshot, SessionState};
+use crate::acp::{ContentBlock, SessionPoolEntry, SessionSnapshot, SessionState};
 use crate::adapter::{
     AdapterRouter, ChannelRef, ChatAdapter, MessageRef, SenderContext, TaskLifecycleEvent,
 };
@@ -304,9 +304,29 @@ fn session_state_presentation(
     (state.to_string(), colour, guidance)
 }
 
-const SESSION_CLOSE_CONFIRMATION: &str = "⚠️ **Close this session?** This stops current work, drops buffered messages, and removes the OpenAB session mapping. Choose whether to archive the Discord thread too. The repository and Cursor checkpoint are always kept.";
+fn session_close_confirmation() -> String {
+    if agent_presentation().local_handoff_enabled || agent_presentation().local_publish_enabled {
+        return "⚠️ **Close this session?** This stops current work, drops buffered messages, and removes the OpenAB session mapping. Choose whether to archive the Discord thread too. The repository and Cursor checkpoint are always kept."
+            .to_string();
+    }
+    format!(
+        "⚠️ **Close this session?** This stops current work, drops buffered messages, and removes the {} session context. Choose whether to archive the Discord thread too. Notion content is always kept.",
+        agent_presentation().name
+    )
+}
 
 fn session_closed_note(dropped: usize) -> String {
+    if !agent_presentation().local_handoff_enabled && !agent_presentation().local_publish_enabled {
+        let dropped = if dropped > 0 {
+            format!(" {dropped} buffered message(s) were dropped.")
+        } else {
+            String::new()
+        };
+        return format!(
+            "✅ {} session closed.{dropped} Notion content and the Discord thread were kept; send a new message to start a fresh session context.",
+            agent_presentation().name
+        );
+    }
     if dropped > 0 {
         format!(
             "✅ Session closed and {dropped} buffered message(s) dropped. Cursor checkpoint was kept; send a new message to start a fresh session context."
@@ -1803,6 +1823,31 @@ fn knowledge_slash_command() -> CreateCommand {
     CreateCommand::new("knowledge").description(description)
 }
 
+fn knowledge_session_slash_command() -> CreateCommand {
+    CreateCommand::new("session")
+        .description("查看、停止或關閉 OpenCode sessions")
+        .add_option(CreateCommandOption::new(
+            CommandOptionType::SubCommand,
+            "manage",
+            "管理知識小幫手目前保留的所有 sessions",
+        ))
+        .add_option(CreateCommandOption::new(
+            CommandOptionType::SubCommand,
+            "status",
+            "查看目前 channel 或 thread 的 session",
+        ))
+        .add_option(CreateCommandOption::new(
+            CommandOptionType::SubCommand,
+            "stop",
+            "停止目前執行，但保留 session context",
+        ))
+        .add_option(CreateCommandOption::new(
+            CommandOptionType::SubCommand,
+            "close",
+            "關閉目前 session 並清除排隊訊息",
+        ))
+}
+
 fn development_slash_commands() -> Vec<CreateCommand> {
     let mut session = CreateCommand::new("session")
         .description("管理目前工作階段、模型與執行狀態")
@@ -2061,7 +2106,7 @@ fn apply_knowledge_command_profile(
     knowledge_ui_enabled: bool,
 ) -> Vec<CreateCommand> {
     if knowledge_ui_enabled {
-        vec![knowledge_slash_command()]
+        vec![knowledge_slash_command(), knowledge_session_slash_command()]
     } else {
         default_commands
     }
@@ -2118,6 +2163,187 @@ fn knowledge_home_message() -> CreateInteractionResponseMessage {
     CreateInteractionResponseMessage::new()
         .embed(embed)
         .components(components)
+}
+
+fn discord_thread_id_from_session_key(key: &str) -> Option<u64> {
+    key.strip_prefix("discord:")?.parse().ok()
+}
+
+fn knowledge_session_presentation(entry: &SessionPoolEntry) -> (&'static str, &'static str, u32) {
+    if entry.snapshot.externally_detached {
+        return ("🟣", "外部使用中", 0x9B59B6);
+    }
+    match (entry.snapshot.state, entry.prompt_in_flight) {
+        (SessionState::Active, true) => ("🟢", "執行中", 0x2ECC71),
+        (SessionState::Active, false) => ("🟢", "已連線", 0x2ECC71),
+        (SessionState::Suspended | SessionState::Persisted, _) => ("🟦", "可接續", 0x3498DB),
+        (SessionState::None, _) => ("⚪", "已關閉", 0x95A5A6),
+    }
+}
+
+fn knowledge_sessions_card(
+    entries: &[SessionPoolEntry],
+    guild_id: Option<u64>,
+    selected_thread_id: Option<u64>,
+    note: Option<String>,
+) -> InteractionCard {
+    let selected = selected_thread_id.and_then(|thread_id| {
+        entries
+            .iter()
+            .find(|entry| discord_thread_id_from_session_key(&entry.key) == Some(thread_id))
+    });
+    let active = entries
+        .iter()
+        .filter(|entry| entry.prompt_in_flight)
+        .count();
+    let resumable = entries
+        .iter()
+        .filter(|entry| entry.snapshot.state != SessionState::None)
+        .count();
+    let mut embed = CreateEmbed::new()
+        .title("🧠 OpenCode Sessions")
+        .description(
+            "管理知識小幫手保留的 session context。Close 會停止執行、清除該 thread 的排隊訊息並移除 OpenCode session mapping；不會修改 Notion 內容，也不會封存 Discord thread。",
+        )
+        .colour(0x5865F2)
+        .field(
+            "總覽",
+            format!(
+                "**{}** sessions · **{active}** processing · **{resumable}** resumable",
+                entries.len()
+            ),
+            false,
+        );
+
+    if let Some(entry) = selected {
+        let thread_id = discord_thread_id_from_session_key(&entry.key)
+            .expect("knowledge session entries have Discord keys");
+        let (icon, state, colour) = knowledge_session_presentation(entry);
+        embed = embed
+            .title(format!("{icon} OpenCode Session"))
+            .colour(colour)
+            .field("狀態", format!("**{state}**"), true)
+            .field("Discord thread", format!("<#{thread_id}>"), true);
+        if let Some(working_dir) = entry.snapshot.working_dir.as_deref() {
+            embed = embed.field(
+                "Workspace",
+                inline_code(&truncate_for_discord(working_dir, 500)),
+                false,
+            );
+        }
+    } else if entries.is_empty() {
+        embed = embed.field(
+            "Sessions",
+            "_目前沒有保留中的 OpenCode session。從 `/knowledge` 開始查詢後，對應 thread 會出現在這裡。_",
+            false,
+        );
+    } else {
+        let list = entries
+            .iter()
+            .filter_map(|entry| {
+                let thread_id = discord_thread_id_from_session_key(&entry.key)?;
+                let (icon, state, _) = knowledge_session_presentation(entry);
+                Some(format!("{icon} <#{thread_id}> · {state}"))
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        embed = embed.field("目前 sessions", list, false);
+    }
+    embed = embed.footer(CreateEmbedFooter::new(
+        "一個 Discord thread 對應一個 OpenCode session · 不使用 Cursor checkpoint",
+    ));
+
+    let mut rows = Vec::new();
+    if !entries.is_empty() {
+        let options = entries
+            .iter()
+            .filter_map(|entry| {
+                let thread_id = discord_thread_id_from_session_key(&entry.key)?;
+                let (icon, state, _) = knowledge_session_presentation(entry);
+                let mut option = CreateSelectMenuOption::new(
+                    format!("OpenCode · {thread_id}"),
+                    thread_id.to_string(),
+                )
+                .description(format!("{icon} {state}"));
+                if selected_thread_id == Some(thread_id) {
+                    option = option.default_selection(true);
+                }
+                Some(option)
+            })
+            .take(SELECT_MENU_PAGE_SIZE)
+            .collect();
+        rows.push(CreateActionRow::SelectMenu(
+            CreateSelectMenu::new(
+                "oab_knowledge_sessions:select",
+                CreateSelectMenuKind::String { options },
+            )
+            .placeholder("選擇 OpenCode session"),
+        ));
+    }
+
+    let mut buttons = Vec::new();
+    if let Some(entry) = selected {
+        let thread_id = discord_thread_id_from_session_key(&entry.key)
+            .expect("knowledge session entries have Discord keys");
+        if let Some(guild_id) = guild_id {
+            buttons.push(
+                CreateButton::new_link(format!(
+                    "https://discord.com/channels/{guild_id}/{thread_id}"
+                ))
+                .label("Open thread"),
+            );
+        }
+        buttons.push(
+            CreateButton::new(format!("oab_knowledge_sessions:refresh:{thread_id}"))
+                .label("↻ Refresh")
+                .style(ButtonStyle::Secondary),
+        );
+        buttons.push(
+            CreateButton::new(format!("oab_knowledge_sessions:stop:{thread_id}"))
+                .label("■ Stop")
+                .style(ButtonStyle::Secondary)
+                .disabled(!entry.prompt_in_flight),
+        );
+        buttons.push(
+            CreateButton::new(format!("oab_knowledge_sessions:close:{thread_id}"))
+                .label("✕ Close…")
+                .style(ButtonStyle::Danger),
+        );
+    } else {
+        buttons.push(
+            CreateButton::new("oab_knowledge_sessions:refresh")
+                .label("↻ Refresh")
+                .style(ButtonStyle::Secondary),
+        );
+    }
+    rows.push(CreateActionRow::Buttons(buttons));
+
+    InteractionCard {
+        content: note
+            .map(|value| truncate_for_discord(&value, 1900))
+            .unwrap_or_default(),
+        embed,
+        components: rows,
+    }
+}
+
+#[cfg(test)]
+fn knowledge_sessions_message(
+    entries: &[SessionPoolEntry],
+    guild_id: Option<u64>,
+    selected_thread_id: Option<u64>,
+    note: Option<String>,
+) -> CreateInteractionResponseMessage {
+    knowledge_sessions_card(entries, guild_id, selected_thread_id, note).into_message()
+}
+
+fn knowledge_sessions_edit(
+    entries: &[SessionPoolEntry],
+    guild_id: Option<u64>,
+    selected_thread_id: Option<u64>,
+    note: Option<String>,
+) -> EditInteractionResponse {
+    knowledge_sessions_card(entries, guild_id, selected_thread_id, note).into_edit()
 }
 
 fn knowledge_capture_modal() -> CreateModal {
@@ -5420,7 +5646,9 @@ impl EventHandler for Handler {
     async fn interaction_create(&self, ctx: Context, interaction: Interaction) {
         match interaction {
             Interaction::Command(cmd)
-                if agent_presentation().knowledge_ui_enabled && cmd.data.name != "knowledge" =>
+                if agent_presentation().knowledge_ui_enabled
+                    && cmd.data.name != "knowledge"
+                    && cmd.data.name != "session" =>
             {
                 let _ = cmd
                     .create_response(
@@ -5450,6 +5678,9 @@ impl EventHandler for Handler {
             }
             Interaction::Command(cmd) if cmd.data.name == "session" => {
                 match cmd.data.options.first().map(|option| option.name.as_str()) {
+                    Some("manage") if agent_presentation().knowledge_ui_enabled => {
+                        self.handle_knowledge_sessions_command(&ctx, &cmd).await;
+                    }
                     Some("model") => {
                         self.handle_config_command(&ctx, &cmd, "model", "model")
                             .await;
@@ -5505,6 +5736,11 @@ impl EventHandler for Handler {
             }
             Interaction::Component(comp) if comp.data.custom_id.starts_with("oab_session:") => {
                 self.handle_session_control(&ctx, &comp).await;
+            }
+            Interaction::Component(comp)
+                if comp.data.custom_id.starts_with("oab_knowledge_sessions:") =>
+            {
+                self.handle_knowledge_sessions_component(&ctx, &comp).await;
             }
             Interaction::Component(comp) if comp.data.custom_id.starts_with("oab_queue:") => {
                 self.handle_queue_control(&ctx, &comp).await;
@@ -6455,6 +6691,204 @@ impl Handler {
             .await
         {
             tracing::error!(%error, "failed to show Knowledge Home");
+        }
+    }
+
+    async fn knowledge_session_entries(&self) -> Vec<SessionPoolEntry> {
+        self.router
+            .pool()
+            .session_entries("discord:")
+            .await
+            .into_iter()
+            .filter(|entry| discord_thread_id_from_session_key(&entry.key).is_some())
+            .collect()
+    }
+
+    async fn handle_knowledge_sessions_command(
+        &self,
+        ctx: &Context,
+        cmd: &serenity::model::application::CommandInteraction,
+    ) {
+        if !agent_presentation().knowledge_ui_enabled {
+            let _ = cmd
+                .create_response(
+                    &ctx.http,
+                    CreateInteractionResponse::Message(
+                        CreateInteractionResponseMessage::new()
+                            .content("⚠️ OpenCode session manager is disabled for this agent.")
+                            .ephemeral(true),
+                    ),
+                )
+                .await;
+            return;
+        }
+        if let Err(message) = self.resolve_command_scope(ctx, cmd).await {
+            let _ = cmd
+                .create_response(
+                    &ctx.http,
+                    CreateInteractionResponse::Message(
+                        CreateInteractionResponseMessage::new()
+                            .content(message)
+                            .ephemeral(true),
+                    ),
+                )
+                .await;
+            return;
+        }
+        let entries = self.knowledge_session_entries().await;
+        let response = knowledge_sessions_card(
+            &entries,
+            cmd.guild_id.map(|guild_id| guild_id.get()),
+            None,
+            None,
+        )
+        .into_message()
+        .ephemeral(true);
+        if let Err(error) = cmd
+            .create_response(&ctx.http, CreateInteractionResponse::Message(response))
+            .await
+        {
+            tracing::error!(%error, "failed to show OpenCode session manager");
+        }
+    }
+
+    async fn handle_knowledge_sessions_component(
+        &self,
+        ctx: &Context,
+        comp: &serenity::model::application::ComponentInteraction,
+    ) {
+        if !agent_presentation().knowledge_ui_enabled
+            || comp.user.bot
+            || is_denied_user(
+                false,
+                self.allow_all_users,
+                &self.allowed_users,
+                comp.user.id.get(),
+            )
+        {
+            let response = CreateInteractionResponse::Message(
+                CreateInteractionResponseMessage::new()
+                    .content("🚫 你沒有管理 OpenCode sessions 的權限。")
+                    .ephemeral(true),
+            );
+            let _ = comp.create_response(&ctx.http, response).await;
+            return;
+        }
+
+        let mut parts = comp
+            .data
+            .custom_id
+            .strip_prefix("oab_knowledge_sessions:")
+            .unwrap_or("")
+            .split(':');
+        let action = parts.next().unwrap_or("");
+        let button_thread_id = parts.next().and_then(|value| value.parse::<u64>().ok());
+        let selected_thread_id = if action == "select" {
+            first_string_select(&comp.data.kind).and_then(|value| value.parse::<u64>().ok())
+        } else {
+            button_thread_id
+        };
+        let entries = self.knowledge_session_entries().await;
+        let selected_is_valid = selected_thread_id.is_some_and(|thread_id| {
+            entries
+                .iter()
+                .any(|entry| discord_thread_id_from_session_key(&entry.key) == Some(thread_id))
+        });
+
+        if action == "close" {
+            let Some(thread_id) = selected_thread_id.filter(|_| selected_is_valid) else {
+                let response = CreateInteractionResponse::Message(
+                    CreateInteractionResponseMessage::new()
+                        .content("⚠️ 這個 OpenCode session 已不存在，請重新整理清單。")
+                        .ephemeral(true),
+                );
+                let _ = comp.create_response(&ctx.http, response).await;
+                return;
+            };
+            let confirmation = CreateInteractionResponseMessage::new()
+                .content(format!(
+                    "⚠️ **關閉 <#{thread_id}> 的 OpenCode session？**\n這會停止目前執行、清除排隊訊息並移除 session context；Notion 內容與 Discord thread 都會保留。"
+                ))
+                .components(vec![CreateActionRow::Buttons(vec![
+                    CreateButton::new(format!(
+                        "oab_knowledge_sessions:confirm_close:{thread_id}"
+                    ))
+                    .label("Close session")
+                    .style(ButtonStyle::Danger),
+                    CreateButton::new(format!("oab_knowledge_sessions:keep:{thread_id}"))
+                        .label("Keep session")
+                        .style(ButtonStyle::Secondary),
+                ])])
+                .ephemeral(true);
+            if let Err(error) = comp
+                .create_response(&ctx.http, CreateInteractionResponse::Message(confirmation))
+                .await
+            {
+                tracing::error!(%error, thread_id, "failed to confirm OpenCode session close");
+            }
+            return;
+        }
+
+        if let Err(error) = comp.defer(&ctx.http).await {
+            tracing::error!(%error, action, "failed to defer OpenCode session manager action");
+            return;
+        }
+
+        let mut selected_after = selected_thread_id.filter(|_| selected_is_valid);
+        let note = match action {
+            "select" | "refresh" | "keep" => None,
+            "stop" if selected_is_valid => {
+                let thread_id = selected_thread_id.expect("validated session has a thread id");
+                let key = format!("discord:{thread_id}");
+                Some(match self.router.pool().cancel_session(&key).await {
+                    Ok(()) => "🛑 Stop signal sent. Session context remains available.".to_string(),
+                    Err(error) => format!("⚠️ Could not stop this session: {error}"),
+                })
+            }
+            "confirm_close" if selected_is_valid => {
+                let thread_id = selected_thread_id.expect("validated session has a thread id");
+                let key = format!("discord:{thread_id}");
+                let dropped = self
+                    .dispatcher
+                    .cancel_buffered_thread("discord", &thread_id.to_string());
+                clear_knowledge_capture_owner(thread_id);
+                selected_after = None;
+                Some(match self.router.pool().reset_session(&key).await {
+                    Ok(()) if dropped > 0 => format!(
+                        "✅ OpenCode session closed; {dropped} buffered message(s) were dropped. The Discord thread and Notion content were kept."
+                    ),
+                    Ok(()) => "✅ OpenCode session closed. The Discord thread and Notion content were kept."
+                        .to_string(),
+                    Err(error) if dropped > 0 => format!(
+                        "🧹 Dropped {dropped} buffered message(s), but the session was already unavailable: {error}"
+                    ),
+                    Err(error) => format!("⚠️ Could not close this session: {error}"),
+                })
+            }
+            "stop" | "confirm_close" => {
+                selected_after = None;
+                Some("⚠️ 這個 OpenCode session 已不存在，清單已更新。".to_string())
+            }
+            _ => Some(
+                "⚠️ This OpenCode session action is no longer available. Run `/session manage` again."
+                    .to_string(),
+            ),
+        };
+
+        let entries = self.knowledge_session_entries().await;
+        if let Err(error) = comp
+            .edit_response(
+                &ctx.http,
+                knowledge_sessions_edit(
+                    &entries,
+                    comp.guild_id.map(|guild_id| guild_id.get()),
+                    selected_after,
+                    note,
+                ),
+            )
+            .await
+        {
+            tracing::error!(%error, action, "failed to update OpenCode session manager");
         }
     }
 
@@ -8199,7 +8633,7 @@ impl Handler {
 
         if action == "close" {
             let confirmation = CreateInteractionResponseMessage::new()
-                .content(SESSION_CLOSE_CONFIRMATION)
+                .content(session_close_confirmation())
                 .components(vec![CreateActionRow::Buttons(vec![
                     CreateButton::new("oab_session:confirm_close_archive")
                         .label("Close & archive")
@@ -12175,8 +12609,9 @@ mod tests {
 
     #[test]
     fn close_copy_states_what_is_removed_and_retained() {
-        assert!(SESSION_CLOSE_CONFIRMATION.contains("OpenAB session mapping"));
-        assert!(SESSION_CLOSE_CONFIRMATION.contains("Cursor checkpoint are always kept"));
+        let confirmation = session_close_confirmation();
+        assert!(confirmation.contains("OpenAB session mapping"));
+        assert!(confirmation.contains("Cursor checkpoint are always kept"));
         assert!(session_closed_note(0).contains("Cursor checkpoint was kept"));
         assert!(session_closed_note(2).contains("2 buffered message(s) dropped"));
     }
@@ -12260,7 +12695,7 @@ mod tests {
     }
 
     #[test]
-    fn knowledge_profile_replaces_development_slash_commands() {
+    fn knowledge_profile_keeps_only_knowledge_and_session_management() {
         let defaults = vec![
             CreateCommand::new("help").description("Help"),
             CreateCommand::new("session").description("Session"),
@@ -12277,13 +12712,68 @@ mod tests {
                     .to_string()
             })
             .collect::<Vec<_>>();
-        assert_eq!(names, ["knowledge"]);
+        assert_eq!(names, ["knowledge", "session"]);
+        let rendered = serde_json::to_value(commands).unwrap().to_string();
+        for available in ["manage", "status", "stop", "close"] {
+            assert!(rendered.contains(&format!(r#""name":"{available}""#)));
+        }
+        for development_only in ["model", "agent", "reset", "attach", "detach"] {
+            assert!(!rendered.contains(&format!(r#""name":"{development_only}""#)));
+        }
 
         let defaults = vec![CreateCommand::new("help").description("Help")];
         let commands = apply_knowledge_command_profile(defaults, false);
         let rendered = serde_json::to_value(commands).unwrap().to_string();
         assert!(rendered.contains("help"));
         assert!(!rendered.contains("knowledge"));
+    }
+
+    #[test]
+    fn knowledge_session_manager_lists_and_controls_opencode_sessions() {
+        let entries = vec![
+            SessionPoolEntry {
+                key: "discord:111".into(),
+                snapshot: SessionSnapshot {
+                    state: SessionState::Active,
+                    working_dir: Some("/srv/example-bot/openab".into()),
+                    externally_detached: false,
+                },
+                prompt_in_flight: true,
+            },
+            SessionPoolEntry {
+                key: "discord:222".into(),
+                snapshot: SessionSnapshot {
+                    state: SessionState::Persisted,
+                    working_dir: None,
+                    externally_detached: false,
+                },
+                prompt_in_flight: false,
+            },
+        ];
+        let overview =
+            serde_json::to_value(knowledge_sessions_message(&entries, Some(9), None, None))
+                .unwrap()
+                .to_string();
+        assert!(overview.contains("OpenCode Sessions"));
+        assert!(overview.contains("<#111>"));
+        assert!(overview.contains("<#222>"));
+        assert!(overview.contains("oab_knowledge_sessions:select"));
+        assert!(overview.contains("不使用 Cursor checkpoint"));
+
+        let selected = serde_json::to_value(knowledge_sessions_message(
+            &entries,
+            Some(9),
+            Some(111),
+            None,
+        ))
+        .unwrap()
+        .to_string();
+        assert!(selected.contains("https://discord.com/channels/9/111"));
+        assert!(selected.contains("oab_knowledge_sessions:stop:111"));
+        assert!(selected.contains("oab_knowledge_sessions:close:111"));
+        assert!(selected.contains("執行中"));
+        assert_eq!(discord_thread_id_from_session_key("discord:111"), Some(111));
+        assert_eq!(discord_thread_id_from_session_key("slack:111"), None);
     }
 
     #[test]
