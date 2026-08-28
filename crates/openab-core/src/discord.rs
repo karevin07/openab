@@ -13,7 +13,7 @@ use crate::control_db::UiSurface;
 use crate::cron::{job_applies_to_project, next_run_unix, sticky_thread_id_for, CronToggleStore};
 // Only the client stays here; every admin card, modal and handler now lives in
 // `discord_admin_ui`, which owns the wire types it renders.
-use crate::discord_admin::DiscordAdminClient;
+use crate::discord_admin::{DiscordAdminClient, DiscordAdminReporter};
 // Help and the session-control card both render the Session Manager; the card
 // itself and the handoff-state rule live with the rest of that flow.
 use crate::directives::resolve_workspace;
@@ -3958,6 +3958,7 @@ pub struct DiscordAdapter {
     http: Arc<Http>,
     task_registry: Option<TaskRegistry>,
     project_registry: Option<ProjectRegistry>,
+    reporter: Option<DiscordAdminReporter>,
 }
 
 impl DiscordAdapter {
@@ -3966,6 +3967,7 @@ impl DiscordAdapter {
             http,
             task_registry: None,
             project_registry: None,
+            reporter: None,
         }
     }
 
@@ -3973,11 +3975,13 @@ impl DiscordAdapter {
         http: Arc<Http>,
         task_registry: TaskRegistry,
         project_registry: ProjectRegistry,
+        reporter: Option<DiscordAdminReporter>,
     ) -> Self {
         Self {
             http,
             task_registry: Some(task_registry),
             project_registry: Some(project_registry),
+            reporter,
         }
     }
 
@@ -3993,6 +3997,7 @@ impl DiscordAdapter {
         content: &str,
         reply_to_message_id: Option<u64>,
     ) -> anyhow::Result<Option<String>> {
+        let validated = parse_and_validate_knowledge_cards(content).map(|(envelope, _)| envelope);
         let Some(payload) =
             knowledge_components_v2_message(content, channel_id, reply_to_message_id)
         else {
@@ -4205,11 +4210,28 @@ impl ChatAdapter for DiscordAdapter {
         channel: &ChannelRef,
         event: TaskLifecycleEvent,
     ) -> anyhow::Result<()> {
+        let thread_id: u64 = Self::resolve_channel(channel).parse()?;
+        let task = self.task_registry.as_ref().and_then(|registry| registry.task_for_thread(thread_id));
+        let report_type = match &event {
+            TaskLifecycleEvent::SessionOpened => Some("opened"),
+            TaskLifecycleEvent::Finished => Some("turn_completed"),
+            TaskLifecycleEvent::Failed { .. } => Some("failed"),
+            _ => None,
+        };
+        if let (Some(reporter), Some(event_type)) = (&self.reporter, report_type) {
+            let title = task.as_ref().map(|value| value.title.as_str()).unwrap_or("Discord session");
+            let workspace = task.as_ref().map(|value| value.workspace_alias.as_str()).unwrap_or("");
+            if let Err(error) = reporter.report(thread_id, event_type, title, workspace).await {
+                tracing::warn!(%error, thread_id, event_type, "failed to report session event");
+            }
+        }
+        if matches!(event, TaskLifecycleEvent::SessionOpened) {
+            return Ok(());
+        }
         let Some(registry) = &self.task_registry else {
             return Ok(());
         };
-        let thread_id: u64 = Self::resolve_channel(channel).parse()?;
-        let Some(previous) = registry.task_for_thread(thread_id) else {
+        let Some(previous) = task else {
             return Ok(());
         };
         let post_queue_notice =
@@ -4219,6 +4241,7 @@ impl ChatAdapter for DiscordAdapter {
             TaskLifecycleEvent::Started { batch_size } => {
                 registry.start_turn(thread_id, batch_size)?
             }
+            TaskLifecycleEvent::SessionOpened => unreachable!(),
             TaskLifecycleEvent::Finished => registry.finish_turn(thread_id, None)?,
             TaskLifecycleEvent::Failed { message } => {
                 registry.finish_turn(thread_id, Some(truncate_for_discord(&message, 900)))?
@@ -4390,6 +4413,8 @@ pub struct Handler {
     pub cron_sticky_path: Option<PathBuf>,
     /// Optional client for the isolated Discord Admin Bot control plane.
     pub admin_control: Option<DiscordAdminClient>,
+    /// Write-only structured telemetry client for the Admin Bot report store.
+    pub admin_reporter: Option<DiscordAdminReporter>,
     /// Optional client for the isolated Git push broker.
     pub git_push_broker: Option<GitPushBrokerClient>,
 }
@@ -4400,6 +4425,27 @@ pub(crate) struct DiscordCommandScope {
 }
 
 impl Handler {
+    async fn report_session_event(&self, thread_id: u64, event_type: &str) {
+        let Some(reporter) = &self.admin_reporter else {
+            return;
+        };
+        let task = self.task_registry.task_for_thread(thread_id);
+        let title = task
+            .as_ref()
+            .map(|value| value.title.as_str())
+            .unwrap_or("Discord session");
+        let workspace = task
+            .as_ref()
+            .map(|value| value.workspace_alias.as_str())
+            .unwrap_or("");
+        if let Err(error) = reporter
+            .report(thread_id, event_type, title, workspace)
+            .await
+        {
+            tracing::warn!(%error, thread_id, event_type, "failed to report explicit session event");
+        }
+    }
+
     pub(crate) fn discord_adapter(&self, ctx: &Context) -> Arc<dyn ChatAdapter> {
         self.adapter
             .get_or_init(|| {
@@ -4407,6 +4453,7 @@ impl Handler {
                     ctx.http.clone(),
                     self.task_registry.clone(),
                     self.project_registry.clone(),
+                    self.admin_reporter.clone(),
                 ))
             })
             .clone()
@@ -6992,13 +7039,17 @@ impl Handler {
         }
 
         let mut selected_after = selected_thread_id.filter(|_| selected_is_valid);
+        let mut reported_event: Option<(u64, &'static str)> = None;
         let note = match action {
             "select" | "refresh" | "keep" => None,
             "stop" if selected_is_valid => {
                 let thread_id = selected_thread_id.expect("validated session has a thread id");
                 let key = format!("discord:{thread_id}");
                 Some(match self.router.pool().cancel_session(&key).await {
-                    Ok(()) => "🛑 Stop signal sent. Session context remains available.".to_string(),
+                    Ok(()) => {
+                        reported_event = Some((thread_id, "stopped"));
+                        "🛑 Stop signal sent. Session context remains available.".to_string()
+                    }
                     Err(error) => format!("⚠️ Could not stop this session: {error}"),
                 })
             }
@@ -7011,11 +7062,14 @@ impl Handler {
                 clear_knowledge_capture_owner(thread_id);
                 selected_after = None;
                 Some(match self.router.pool().reset_session(&key).await {
-                    Ok(()) if dropped > 0 => format!(
-                        "✅ OpenCode session closed; {dropped} buffered message(s) were dropped. The Discord thread and Notion content were kept."
-                    ),
-                    Ok(()) => "✅ OpenCode session closed. The Discord thread and Notion content were kept."
-                        .to_string(),
+                    Ok(()) if dropped > 0 => {
+                        reported_event = Some((thread_id, "closed"));
+                        format!("✅ OpenCode session closed; {dropped} buffered message(s) were dropped. The Discord thread and Notion content were kept.")
+                    }
+                    Ok(()) => {
+                        reported_event = Some((thread_id, "closed"));
+                        "✅ OpenCode session closed. The Discord thread and Notion content were kept.".to_string()
+                    }
                     Err(error) if dropped > 0 => format!(
                         "🧹 Dropped {dropped} buffered message(s), but the session was already unavailable: {error}"
                     ),
@@ -7031,6 +7085,9 @@ impl Handler {
                     .to_string(),
             ),
         };
+        if let Some((thread_id, event_type)) = reported_event {
+            self.report_session_event(thread_id, event_type).await;
+        }
 
         let entries = self.knowledge_session_entries().await;
         if let Err(error) = comp
@@ -8851,6 +8908,9 @@ impl Handler {
             "⚠️ Unknown session command.".to_string()
         };
 
+        if matches!(&task_state_update, Some(TaskState::Closed)) {
+            self.report_session_event(cmd.channel_id.get(), "closed").await;
+        }
         if let Some(state) = task_state_update {
             if let Ok(task) = self.task_registry.set_state(cmd.channel_id.get(), state) {
                 if let Some(binding) = self
@@ -8940,11 +9000,15 @@ impl Handler {
 
         let mut task_state_update = None;
         let mut archive_after_close = false;
+        let mut stopped = false;
         let mut note = match action {
             "refresh" => None,
             "cancel" => Some(
                 match self.router.pool().cancel_session(&scope.session_key).await {
-                    Ok(()) => "🛑 Stop signal sent. The session remains available.".to_string(),
+                    Ok(()) => {
+                        stopped = true;
+                        "🛑 Stop signal sent. The session remains available.".to_string()
+                    }
                     Err(error) => format!("⚠️ Could not stop the current task: {error}"),
                 },
             ),
@@ -8988,6 +9052,13 @@ impl Handler {
                     .to_string(),
             ),
         };
+
+        if stopped {
+            self.report_session_event(comp.channel_id.get(), "stopped").await;
+        }
+        if matches!(&task_state_update, Some(TaskState::Closed)) {
+            self.report_session_event(comp.channel_id.get(), "closed").await;
+        }
 
         let snapshot = self
             .router
@@ -11080,6 +11151,9 @@ impl Handler {
         let thread_key = format!("discord:{}", cmd.channel_id.get());
         let result = self.router.pool().cancel_session(&thread_key).await;
         let stopped = result.is_ok();
+        if stopped {
+            self.report_session_event(cmd.channel_id.get(), "stopped").await;
+        }
 
         let msg = match result {
             Ok(()) => "🛑 Cancel signal sent.".to_string(),
@@ -11111,6 +11185,9 @@ impl Handler {
             .cancel_buffered_thread("discord", &cmd.channel_id.get().to_string());
 
         let cancel_result = self.router.pool().cancel_session(&session_key).await;
+        if cancel_result.is_ok() {
+            self.report_session_event(cmd.channel_id.get(), "stopped").await;
+        }
 
         // Buffer count is approximate (sweep races with new arrivals) so we surface
         // a binary "cleared / nothing" signal rather than a misleading exact number.
@@ -11146,6 +11223,9 @@ impl Handler {
             .cancel_buffered_thread("discord", &cmd.channel_id.get().to_string());
 
         let result = self.router.pool().reset_session(&session_key).await;
+        if result.is_ok() {
+            self.report_session_event(cmd.channel_id.get(), "closed").await;
+        }
 
         let msg = match result {
             Ok(()) if dropped > 0 => {

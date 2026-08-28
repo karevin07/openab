@@ -1903,6 +1903,7 @@ async fn main() -> anyhow::Result<()> {
             Arc::new(serenity::http::Http::new(&discord_cfg.bot_token)),
             task_registry.clone(),
             project_registry.clone(),
+            None,
         ));
         for task in &reconciled_tasks {
             if let Err(error) = recovery_adapter.refresh_task_ui(task).await {
@@ -1987,6 +1988,7 @@ async fn main() -> anyhow::Result<()> {
             cron_run_now: has_cron_work.then_some(cron_run_now_tx),
             cron_sticky_path: Some(cron_sticky_path.clone()),
             admin_control,
+            admin_reporter: openab_core::discord_admin::DiscordAdminReporter::from_env()?,
             git_push_broker,
         };
 

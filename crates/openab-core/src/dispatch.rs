@@ -2038,6 +2038,15 @@ async fn dispatch_batch(
         }
     };
 
+    if created_now {
+        if let Err(error) = adapter
+            .update_task_lifecycle(thread_channel, TaskLifecycleEvent::SessionOpened)
+            .await
+        {
+            warn!(%error, "failed to report opened session");
+        }
+    }
+
     // Only apply directives/bindings if this is genuinely the first message.
     if created_now {
         let title_to_apply = parse_result

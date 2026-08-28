@@ -6,6 +6,70 @@ use reqwest::StatusCode;
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use std::path::Path;
 use std::time::Duration;
+use std::sync::atomic::{AtomicU64, Ordering};
+
+static REPORT_EVENT_SEQUENCE: AtomicU64 = AtomicU64::new(1);
+
+#[derive(Clone)]
+pub struct DiscordAdminReporter {
+    http: reqwest::Client,
+    url: String,
+    token: String,
+    source_id: String,
+}
+
+#[derive(Serialize)]
+struct SessionEventEnvelope<'a> {
+    events: [SessionEventRequest<'a>; 1],
+}
+
+#[derive(Serialize)]
+struct SessionEventRequest<'a> {
+    source_id: &'a str,
+    event_id: String,
+    thread_id: u64,
+    event_type: &'a str,
+    occurred_at: String,
+    title: &'a str,
+    workspace_alias: &'a str,
+}
+
+impl DiscordAdminReporter {
+    pub fn from_env() -> Result<Option<Self>> {
+        let token = match std::env::var("DISCORD_ADMIN_REPORT_TOKEN") {
+            Ok(value) if !value.trim().is_empty() => value.trim().to_string(),
+            _ => return Ok(None),
+        };
+        anyhow::ensure!(token.len() >= 32, "Discord Admin report token must contain at least 32 characters");
+        let source_id = std::env::var("OPENAB_REPORT_SOURCE").unwrap_or_else(|_| "coding".into());
+        anyhow::ensure!(matches!(source_id.as_str(), "coding" | "knowledge"), "OPENAB_REPORT_SOURCE must be coding or knowledge");
+        let base = std::env::var("DISCORD_ADMIN_REPORT_URL")
+            .unwrap_or_else(|_| "http://discord-admin:8787".into());
+        Ok(Some(Self {
+            http: reqwest::Client::builder().timeout(Duration::from_secs(5)).build()?,
+            url: format!("{}/v1/telemetry/session-events", base.trim_end_matches('/')),
+            token,
+            source_id,
+        }))
+    }
+
+    pub async fn report(&self, thread_id: u64, event_type: &str, title: &str, workspace_alias: &str) -> Result<()> {
+        let occurred_at = chrono::Utc::now().to_rfc3339();
+        let sequence = REPORT_EVENT_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+        let body = SessionEventEnvelope { events: [SessionEventRequest {
+            source_id: &self.source_id,
+            event_id: format!("{}:{thread_id}:{event_type}:{sequence}", occurred_at),
+            thread_id,
+            event_type,
+            occurred_at,
+            title,
+            workspace_alias,
+        }] };
+        let response = self.http.post(&self.url).bearer_auth(&self.token).json(&body).send().await?;
+        anyhow::ensure!(response.status().is_success(), "Discord Admin report endpoint returned {}", response.status());
+        Ok(())
+    }
+}
 
 #[derive(Clone)]
 pub struct DiscordAdminClient {

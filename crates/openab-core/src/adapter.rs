@@ -485,6 +485,7 @@ pub struct SenderContext {
 pub enum TaskLifecycleEvent {
     Enqueued,
     Started { batch_size: usize },
+    SessionOpened,
     Finished,
     Failed { message: String },
 }
