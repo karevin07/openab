@@ -1617,6 +1617,263 @@ fn knowledge_slash_command() -> CreateCommand {
     CreateCommand::new("knowledge").description(description)
 }
 
+fn development_slash_commands() -> Vec<CreateCommand> {
+    let mut session = CreateCommand::new("session")
+        .description("管理目前工作階段、模型與執行狀態")
+        .add_option(CreateCommandOption::new(
+            CommandOptionType::SubCommand,
+            "status",
+            "開啟工作階段狀態與控制卡片",
+        ))
+        .add_option(CreateCommandOption::new(
+            CommandOptionType::SubCommand,
+            "model",
+            "選擇目前工作階段使用的 AI model",
+        ))
+        .add_option(CreateCommandOption::new(
+            CommandOptionType::SubCommand,
+            "agent",
+            "選擇目前工作階段使用的 agent mode",
+        ))
+        .add_option(CreateCommandOption::new(
+            CommandOptionType::SubCommand,
+            "stop",
+            "停止目前執行，保留排隊訊息與 session context",
+        ))
+        .add_option(CreateCommandOption::new(
+            CommandOptionType::SubCommand,
+            "stop-all",
+            "停止目前執行並清空所有排隊訊息",
+        ))
+        .add_option(CreateCommandOption::new(
+            CommandOptionType::SubCommand,
+            "reset",
+            "清空排隊訊息並重設目前 session",
+        ));
+    if agent_presentation().local_publish_enabled {
+        session = session.add_option(
+            CreateCommandOption::new(
+                CommandOptionType::SubCommand,
+                "attach",
+                "將已退出的本機 chat 接到這個 project 或 thread",
+            )
+            .add_sub_option(
+                CreateCommandOption::new(
+                    CommandOptionType::String,
+                    "chat_id",
+                    "從這個 project 最近退出的 chats 選擇",
+                )
+                .required(true)
+                .set_autocomplete(true),
+            )
+            .add_sub_option(CreateCommandOption::new(
+                CommandOptionType::String,
+                "title",
+                "在 project channel 執行時使用的新 thread 標題",
+            )),
+        );
+    }
+    if agent_presentation().local_handoff_enabled {
+        session = session.add_option(CreateCommandOption::new(
+            CommandOptionType::SubCommand,
+            "detach",
+            "暫停 Discord 操作，將 session 交給本機 ACP client",
+        ));
+    }
+    session = session.add_option(CreateCommandOption::new(
+        CommandOptionType::SubCommand,
+        "close",
+        "關閉 session 並清除排隊訊息",
+    ));
+
+    let workspace = CreateCommand::new("workspace")
+        .description("查看目前 channel 的 repository routing")
+        .add_option(CreateCommandOption::new(
+            CommandOptionType::SubCommand,
+            "status",
+            "查看目前 session workspace 與 channel 預設值",
+        ))
+        .add_option(CreateCommandOption::new(
+            CommandOptionType::SubCommand,
+            "list",
+            "列出可用的 workspace aliases",
+        ));
+
+    let project = CreateCommand::new("project")
+        .description("建立與管理 private repository channels")
+        .default_member_permissions(Permissions::MANAGE_CHANNELS)
+        .add_option(
+            CreateCommandOption::new(
+                CommandOptionType::SubCommand,
+                "create",
+                "為 workspace 建立 private project channel",
+            )
+            .add_sub_option(
+                CreateCommandOption::new(
+                    CommandOptionType::String,
+                    "workspace",
+                    "從 /workspace list 選擇 workspace alias",
+                )
+                .required(true)
+                .set_autocomplete(true),
+            )
+            .add_sub_option(CreateCommandOption::new(
+                CommandOptionType::String,
+                "name",
+                "選填的 Discord channel 名稱",
+            ))
+            .add_sub_option(CreateCommandOption::new(
+                CommandOptionType::Role,
+                "role",
+                "可存取 private channel 的選填 role",
+            )),
+        )
+        .add_option(CreateCommandOption::new(
+            CommandOptionType::SubCommand,
+            "list",
+            "列出這個 server 的 project channels",
+        ))
+        .add_option(CreateCommandOption::new(
+            CommandOptionType::SubCommand,
+            "status",
+            "查看目前 channel 綁定的 project",
+        ))
+        .add_option(CreateCommandOption::new(
+            CommandOptionType::SubCommand,
+            "home",
+            "建立或更新 Project Home 卡片",
+        ))
+        .add_option(CreateCommandOption::new(
+            CommandOptionType::SubCommand,
+            "remove",
+            "解除 channel mapping，不刪除 channel 或 repository",
+        ))
+        .add_option(
+            CreateCommandOption::new(
+                CommandOptionType::SubCommandGroup,
+                "access",
+                "管理 project channel 的 users 與 roles",
+            )
+            .add_sub_option(
+                CreateCommandOption::new(
+                    CommandOptionType::SubCommand,
+                    "add",
+                    "授予 user 或 role 存取權",
+                )
+                .add_sub_option(CreateCommandOption::new(
+                    CommandOptionType::User,
+                    "user",
+                    "要授權的 user",
+                ))
+                .add_sub_option(CreateCommandOption::new(
+                    CommandOptionType::Role,
+                    "role",
+                    "要授權的 role",
+                )),
+            )
+            .add_sub_option(
+                CreateCommandOption::new(
+                    CommandOptionType::SubCommand,
+                    "remove",
+                    "移除 user 或 role 存取權",
+                )
+                .add_sub_option(CreateCommandOption::new(
+                    CommandOptionType::User,
+                    "user",
+                    "要移除的 user",
+                ))
+                .add_sub_option(CreateCommandOption::new(
+                    CommandOptionType::Role,
+                    "role",
+                    "要移除的 role",
+                )),
+            ),
+        );
+
+    let account = CreateCommand::new("account")
+        .description("查看 backend 帳號用量或進行登入")
+        .add_option(CreateCommandOption::new(
+            CommandOptionType::SubCommand,
+            "usage",
+            "查看 backend 帳號用量與計費資訊",
+        ))
+        .add_option(CreateCommandOption::new(
+            CommandOptionType::SubCommand,
+            "auth",
+            "在 Bot DM 啟動 backend device login",
+        ));
+
+    let thread = CreateCommand::new("thread")
+        .description("匯出目前討論串或設定 channel reminder")
+        .add_option(
+            CreateCommandOption::new(
+                CommandOptionType::SubCommand,
+                "export",
+                "將目前 thread 下載為文字檔",
+            )
+            .add_sub_option(CreateCommandOption::new(
+                CommandOptionType::Integer,
+                "limit",
+                "只匯出最近 N 則訊息（1–5000）",
+            ))
+            .add_sub_option(CreateCommandOption::new(
+                CommandOptionType::String,
+                "since",
+                "只匯出指定 message ID 之後的訊息",
+            ))
+            .add_sub_option(CreateCommandOption::new(
+                CommandOptionType::Integer,
+                "days",
+                "只匯出最近 N 天訊息（1–365）",
+            ))
+            .add_sub_option(CreateCommandOption::new(
+                CommandOptionType::Boolean,
+                "all",
+                "匯出全部訊息（最多 5000；預設最近 100）",
+            )),
+        )
+        .add_option(
+            CreateCommandOption::new(
+                CommandOptionType::SubCommand,
+                "remind",
+                "延遲後在目前 channel 提醒 users 或 roles",
+            )
+            .add_sub_option(
+                CreateCommandOption::new(
+                    CommandOptionType::String,
+                    "targets",
+                    "要提醒的 users/roles（例如 @user @role）",
+                )
+                .required(true),
+            )
+            .add_sub_option(
+                CreateCommandOption::new(
+                    CommandOptionType::String,
+                    "message",
+                    "提醒內容",
+                )
+                .required(true),
+            )
+            .add_sub_option(
+                CreateCommandOption::new(
+                    CommandOptionType::String,
+                    "delay",
+                    "多久後提醒（例如 30m、2h、1d）",
+                )
+                .required(true),
+            ),
+        );
+
+    vec![
+        CreateCommand::new("help").description("開啟 OpenAB 工作中心與操作說明"),
+        session,
+        workspace,
+        project,
+        account,
+        thread,
+    ]
+}
+
 fn apply_knowledge_command_profile(
     default_commands: Vec<CreateCommand>,
     knowledge_ui_enabled: bool,
@@ -1626,6 +1883,21 @@ fn apply_knowledge_command_profile(
     } else {
         default_commands
     }
+}
+
+fn command_feedback_card(
+    title: impl Into<String>,
+    description: impl Into<String>,
+    colour: u32,
+) -> CreateInteractionResponseMessage {
+    CreateInteractionResponseMessage::new()
+        .embed(
+            CreateEmbed::new()
+                .title(title)
+                .description(description)
+                .colour(colour),
+        )
+        .ephemeral(true)
 }
 
 fn knowledge_home_message() -> CreateInteractionResponseMessage {
@@ -3466,7 +3738,7 @@ pub struct Handler {
     pub dispatcher: Arc<crate::dispatch::Dispatcher>,
     /// Ambient mode dispatcher for passive channel listening.
     pub ambient: Option<Arc<crate::ambient::AmbientDispatcher>>,
-    /// Reminder store for /remind slash command.
+    /// Reminder store for `/thread remind`.
     pub reminder_store: ReminderStore,
     /// Track scheduled reminder IDs to prevent duplicate scheduling on reconnect.
     pub scheduled_ids: tokio::sync::Mutex<std::collections::HashSet<String>>,
@@ -4846,227 +5118,7 @@ impl EventHandler for Handler {
     async fn ready(&self, ctx: Context, ready: Ready) {
         info!(user = %ready.user.name, "discord bot connected");
 
-        let session_description = if agent_presentation().local_handoff_enabled
-            && agent_presentation().local_publish_enabled
-        {
-            format!(
-                "Attach, inspect, detach, or close a {} session",
-                agent_presentation().name
-            )
-        } else {
-            format!("Manage {} session lifecycle", agent_presentation().name)
-        };
-        let mut session_command = CreateCommand::new("session")
-            .description(session_description)
-            .add_option(CreateCommandOption::new(
-                CommandOptionType::SubCommand,
-                "status",
-                "Show session lifecycle state and workspace",
-            ));
-        if agent_presentation().local_publish_enabled {
-            session_command = session_command.add_option(
-                CreateCommandOption::new(
-                    CommandOptionType::SubCommand,
-                    "attach",
-                    "Attach an exited local chat to this project or thread",
-                )
-                .add_sub_option(
-                    CreateCommandOption::new(
-                        CommandOptionType::String,
-                        "chat_id",
-                        "Select a recent exited chat from this project",
-                    )
-                    .required(true)
-                    .set_autocomplete(true),
-                )
-                .add_sub_option(CreateCommandOption::new(
-                    CommandOptionType::String,
-                    "title",
-                    "New thread title when run in a project channel",
-                )),
-            );
-        }
-        if agent_presentation().local_handoff_enabled {
-            session_command = session_command.add_option(CreateCommandOption::new(
-                CommandOptionType::SubCommand,
-                "detach",
-                "Pause Discord ownership so a local ACP client can resume it",
-            ));
-        }
-        session_command = session_command.add_option(CreateCommandOption::new(
-            CommandOptionType::SubCommand,
-            "close",
-            "Close this session and clear buffered messages",
-        ));
-
-        // Build the shared command list once.
-        let commands = vec![
-            CreateCommand::new("models").description("Select the AI model for this session"),
-            CreateCommand::new("agents").description("Select the agent mode for this session"),
-            CreateCommand::new("cancel").description("Cancel the current operation"),
-            CreateCommand::new("cancel-all")
-                .description("Cancel current operation and drop all buffered messages"),
-            CreateCommand::new("reset").description("Reset the conversation session"),
-            CreateCommand::new("help").description(if agent_presentation().local_handoff_enabled {
-                "Show the Discord and Cursor handoff quick guide"
-            } else {
-                "Show the Discord development quick guide"
-            }),
-            CreateCommand::new("workspace")
-                .description("Inspect workspace routing for this channel or session")
-                .add_option(CreateCommandOption::new(
-                    CommandOptionType::SubCommand,
-                    "status",
-                    "Show the current session workspace and channel default",
-                ))
-                .add_option(CreateCommandOption::new(
-                    CommandOptionType::SubCommand,
-                    "list",
-                    "List configured workspace aliases",
-                )),
-            session_command,
-            CreateCommand::new("project")
-                .description("Create and manage private workspace channels")
-                .default_member_permissions(Permissions::MANAGE_CHANNELS)
-                .add_option(
-                    CreateCommandOption::new(
-                        CommandOptionType::SubCommand,
-                        "create",
-                        "Create a private channel for a workspace",
-                    )
-                    .add_sub_option(
-                        CreateCommandOption::new(
-                            CommandOptionType::String,
-                            "workspace",
-                            "Workspace alias from /workspace list (for example: openab)",
-                        )
-                        .required(true)
-                        .set_autocomplete(true),
-                    )
-                    .add_sub_option(CreateCommandOption::new(
-                        CommandOptionType::String,
-                        "name",
-                        "Optional Discord channel name",
-                    ))
-                    .add_sub_option(CreateCommandOption::new(
-                        CommandOptionType::Role,
-                        "role",
-                        "Optional role that can access the private channel",
-                    )),
-                )
-                .add_option(CreateCommandOption::new(
-                    CommandOptionType::SubCommand,
-                    "list",
-                    "List project channels in this server",
-                ))
-                .add_option(CreateCommandOption::new(
-                    CommandOptionType::SubCommand,
-                    "status",
-                    "Show the project bound to this channel",
-                ))
-                .add_option(CreateCommandOption::new(
-                    CommandOptionType::SubCommand,
-                    "home",
-                    "Create or update the interactive Project Home card",
-                ))
-                .add_option(CreateCommandOption::new(
-                    CommandOptionType::SubCommand,
-                    "remove",
-                    "Unlink this channel without deleting it or the repository",
-                ))
-                .add_option(
-                    CreateCommandOption::new(
-                        CommandOptionType::SubCommandGroup,
-                        "access",
-                        "Manage users and roles that can access this project channel",
-                    )
-                    .add_sub_option(
-                        CreateCommandOption::new(
-                            CommandOptionType::SubCommand,
-                            "add",
-                            "Grant a user or role access to this project channel",
-                        )
-                        .add_sub_option(CreateCommandOption::new(
-                            CommandOptionType::User,
-                            "user",
-                            "User to grant access",
-                        ))
-                        .add_sub_option(CreateCommandOption::new(
-                            CommandOptionType::Role,
-                            "role",
-                            "Role to grant access",
-                        )),
-                    )
-                    .add_sub_option(
-                        CreateCommandOption::new(
-                            CommandOptionType::SubCommand,
-                            "remove",
-                            "Revoke a user or role from this project channel",
-                        )
-                        .add_sub_option(CreateCommandOption::new(
-                            CommandOptionType::User,
-                            "user",
-                            "User to revoke",
-                        ))
-                        .add_sub_option(CreateCommandOption::new(
-                            CommandOptionType::Role,
-                            "role",
-                            "Role to revoke",
-                        )),
-                    ),
-                ),
-            CreateCommand::new("remind")
-                .description("Set a one-shot reminder to mention users/roles after a delay")
-                .add_option(
-                    CreateCommandOption::new(
-                        CommandOptionType::String,
-                        "targets",
-                        "Users/roles to mention (e.g. @user1 @role1)",
-                    )
-                    .required(true),
-                )
-                .add_option(
-                    CreateCommandOption::new(
-                        CommandOptionType::String,
-                        "message",
-                        "Reminder message",
-                    )
-                    .required(true),
-                )
-                .add_option(
-                    CreateCommandOption::new(
-                        CommandOptionType::String,
-                        "delay",
-                        "Delay before firing (e.g. 30m, 2h, 1d)",
-                    )
-                    .required(true),
-                ),
-            CreateCommand::new("auth").description("Authenticate the backend agent (device flow)"),
-            CreateCommand::new("usage")
-                .description("Show backend account usage and billing information"),
-            CreateCommand::new("export-thread")
-                .description("Download this thread as a text file")
-                .add_option(CreateCommandOption::new(
-                    CommandOptionType::Integer,
-                    "limit",
-                    "Export only the most recent N messages (1–5000)",
-                ))
-                .add_option(CreateCommandOption::new(
-                    CommandOptionType::String,
-                    "since",
-                    "Export messages after this message ID",
-                ))
-                .add_option(CreateCommandOption::new(
-                    CommandOptionType::Integer,
-                    "days",
-                    "Export messages from the last N days (1–365)",
-                ))
-                .add_option(CreateCommandOption::new(
-                    CommandOptionType::Boolean,
-                    "all",
-                    "Export all messages (up to 5000). Default is last 100.",
-                )),
-        ];
+        let commands = development_slash_commands();
         let commands =
             apply_knowledge_command_profile(commands, agent_presentation().knowledge_ui_enabled);
 
@@ -5139,23 +5191,6 @@ impl EventHandler for Handler {
             Interaction::Autocomplete(cmd) if cmd.data.name == "session" => {
                 self.handle_session_autocomplete(&ctx, &cmd).await;
             }
-            Interaction::Command(cmd) if cmd.data.name == "models" => {
-                self.handle_config_command(&ctx, &cmd, "model", "model")
-                    .await;
-            }
-            Interaction::Command(cmd) if cmd.data.name == "agents" => {
-                self.handle_config_command(&ctx, &cmd, "agent", "agent")
-                    .await;
-            }
-            Interaction::Command(cmd) if cmd.data.name == "cancel" => {
-                self.handle_cancel_command(&ctx, &cmd).await;
-            }
-            Interaction::Command(cmd) if cmd.data.name == "cancel-all" => {
-                self.handle_cancel_all_command(&ctx, &cmd).await;
-            }
-            Interaction::Command(cmd) if cmd.data.name == "reset" => {
-                self.handle_reset_command(&ctx, &cmd).await;
-            }
             Interaction::Command(cmd) if cmd.data.name == "help" => {
                 self.handle_help_command(&ctx, &cmd).await;
             }
@@ -5166,22 +5201,59 @@ impl EventHandler for Handler {
                 self.handle_workspace_command(&ctx, &cmd).await;
             }
             Interaction::Command(cmd) if cmd.data.name == "session" => {
-                self.handle_session_command(&ctx, &cmd).await;
+                match cmd.data.options.first().map(|option| option.name.as_str()) {
+                    Some("model") => {
+                        self.handle_config_command(&ctx, &cmd, "model", "model")
+                            .await;
+                    }
+                    Some("agent") => {
+                        self.handle_config_command(&ctx, &cmd, "agent", "agent")
+                            .await;
+                    }
+                    Some("stop") => self.handle_cancel_command(&ctx, &cmd).await,
+                    Some("stop-all") => self.handle_cancel_all_command(&ctx, &cmd).await,
+                    Some("reset") => self.handle_reset_command(&ctx, &cmd).await,
+                    _ => self.handle_session_command(&ctx, &cmd).await,
+                }
             }
             Interaction::Command(cmd) if cmd.data.name == "project" => {
                 self.handle_project_command(&ctx, &cmd).await;
             }
-            Interaction::Command(cmd) if cmd.data.name == "remind" => {
-                self.handle_remind_command(&ctx, &cmd).await;
+            Interaction::Command(cmd) if cmd.data.name == "account" => {
+                match cmd.data.options.first().map(|option| option.name.as_str()) {
+                    Some("auth") => self.handle_auth_command(&ctx, &cmd).await,
+                    Some("usage") => self.handle_usage_command(&ctx, &cmd).await,
+                    _ => {
+                        let _ = cmd
+                            .create_response(
+                                &ctx.http,
+                                CreateInteractionResponse::Message(
+                                    CreateInteractionResponseMessage::new()
+                                        .content("⚠️ 請選擇 `/account usage` 或 `/account auth`。")
+                                        .ephemeral(true),
+                                ),
+                            )
+                            .await;
+                    }
+                }
             }
-            Interaction::Command(cmd) if cmd.data.name == "export-thread" => {
-                self.handle_export_thread_command(&ctx, &cmd).await;
-            }
-            Interaction::Command(cmd) if cmd.data.name == "auth" => {
-                self.handle_auth_command(&ctx, &cmd).await;
-            }
-            Interaction::Command(cmd) if cmd.data.name == "usage" => {
-                self.handle_usage_command(&ctx, &cmd).await;
+            Interaction::Command(cmd) if cmd.data.name == "thread" => {
+                match cmd.data.options.first().map(|option| option.name.as_str()) {
+                    Some("export") => self.handle_export_thread_command(&ctx, &cmd).await,
+                    Some("remind") => self.handle_remind_command(&ctx, &cmd).await,
+                    _ => {
+                        let _ = cmd
+                            .create_response(
+                                &ctx.http,
+                                CreateInteractionResponse::Message(
+                                    CreateInteractionResponseMessage::new()
+                                        .content("⚠️ 請選擇 `/thread export` 或 `/thread remind`。")
+                                        .ephemeral(true),
+                                ),
+                            )
+                            .await;
+                    }
+                }
             }
             Interaction::Component(comp) if comp.data.custom_id.starts_with("oab_session:") => {
                 self.handle_session_control(&ctx, &comp).await;
@@ -9975,15 +10047,19 @@ impl Handler {
 
         let response = match Self::build_config_components(&config_options, category, None) {
             Some(rows) => CreateInteractionResponse::Message(
-                CreateInteractionResponseMessage::new()
-                    .content(format!("🔧 Select a {label}:"))
-                    .components(rows)
-                    .ephemeral(true),
+                command_feedback_card(
+                    "⚙️ Session settings",
+                    format!("Select the {label} for this session."),
+                    0x5865F2,
+                )
+                .components(rows),
             ),
             None => CreateInteractionResponse::Message(
-                CreateInteractionResponseMessage::new()
-                    .content(format!("⚠️ No {label} options available. Start a conversation first by @mentioning the bot."))
-                    .ephemeral(true),
+                command_feedback_card(
+                    "⚠️ Session not ready",
+                    format!("No {label} options are available. Start a conversation by mentioning the Bot first."),
+                    0xFEE75C,
+                ),
             ),
         };
 
@@ -10047,17 +10123,21 @@ impl Handler {
     ) {
         let thread_key = format!("discord:{}", cmd.channel_id.get());
         let result = self.router.pool().cancel_session(&thread_key).await;
+        let stopped = result.is_ok();
 
         let msg = match result {
             Ok(()) => "🛑 Cancel signal sent.".to_string(),
             Err(e) => format!("⚠️ {e}"),
         };
 
-        let response = CreateInteractionResponse::Message(
-            CreateInteractionResponseMessage::new()
-                .content(msg)
-                .ephemeral(true),
-        );
+        let (title, colour) = if stopped {
+            ("🛑 Stop requested", 0x57F287)
+        } else {
+            ("⚠️ Nothing stopped", 0xFEE75C)
+        };
+        let response = CreateInteractionResponse::Message(command_feedback_card(
+            title, msg, colour,
+        ));
         if let Err(e) = cmd.create_response(&ctx.http, response).await {
             tracing::error!(error = %e, "failed to respond to /cancel command");
         }
@@ -10068,7 +10148,7 @@ impl Handler {
         ctx: &Context,
         cmd: &serenity::model::application::CommandInteraction,
     ) {
-        // /cancel-all is the nuclear escape hatch: stop the in-flight turn AND clear
+        // `/session stop-all` is the escape hatch: stop the in-flight turn AND clear
         // every lane's buffer in this thread, so a human can intervene from a clean slate.
         let session_key = format!("discord:{}", cmd.channel_id.get());
         let dropped = self
@@ -10088,11 +10168,11 @@ impl Handler {
             (Err(_), _) => "🛑 Buffered messages cleared. No active session to cancel.".to_string(),
         };
 
-        let response = CreateInteractionResponse::Message(
-            CreateInteractionResponseMessage::new()
-                .content(msg)
-                .ephemeral(true),
-        );
+        let response = CreateInteractionResponse::Message(command_feedback_card(
+            "🧹 Stop & clear",
+            msg,
+            0xED4245,
+        ));
         if let Err(e) = cmd.create_response(&ctx.http, response).await {
             tracing::error!(error = %e, "failed to respond to /cancel-all command");
         }
@@ -10103,7 +10183,7 @@ impl Handler {
         ctx: &Context,
         cmd: &serenity::model::application::CommandInteraction,
     ) {
-        // /reset clears every lane's buffer in this thread and tears down the shared
+        // `/session reset` clears every lane's buffer and tears down the shared
         // ACP session — the next message in the thread starts a fresh conversation.
         let session_key = format!("discord:{}", cmd.channel_id.get());
         let dropped = self
@@ -10126,11 +10206,11 @@ impl Handler {
             }
         };
 
-        let response = CreateInteractionResponse::Message(
-            CreateInteractionResponseMessage::new()
-                .content(msg)
-                .ephemeral(true),
-        );
+        let response = CreateInteractionResponse::Message(command_feedback_card(
+            "🔄 Session reset",
+            msg,
+            0x5865F2,
+        ));
         if let Err(e) = cmd.create_response(&ctx.http, response).await {
             tracing::error!(error = %e, "failed to respond to /reset command");
         }
@@ -10141,7 +10221,7 @@ impl Handler {
         ctx: &Context,
         cmd: &serenity::model::application::CommandInteraction,
     ) {
-        // Only humans can use /remind
+        // Only humans can use `/thread remind`.
         if cmd.user.bot {
             let response = CreateInteractionResponse::Message(
                 CreateInteractionResponseMessage::new()
@@ -10152,8 +10232,18 @@ impl Handler {
             return;
         }
 
-        // Extract options
-        let opts = &cmd.data.options;
+        // `/thread remind` stores its fields under the selected subcommand.
+        let opts = cmd
+            .data
+            .options
+            .first()
+            .and_then(|option| match &option.value {
+                serenity::model::application::CommandDataOptionValue::SubCommand(options) => {
+                    Some(options.as_slice())
+                }
+                _ => None,
+            })
+            .unwrap_or(&cmd.data.options);
         let targets_raw = opts
             .iter()
             .find(|o| o.name == "targets")
@@ -10268,14 +10358,15 @@ impl Handler {
         remind::schedule_reminder(ctx.http.clone(), self.reminder_store.clone(), reminder);
 
         let delay_str = remind::format_delay(delay_secs);
-        let response = CreateInteractionResponse::Message(
-            CreateInteractionResponseMessage::new()
-                .content(format!(
-                    "⏰ Reminder set! Will fire in **{delay_str}** and mention {}",
-                    targets.join(" ")
-                ))
-                .ephemeral(true),
-        );
+        let response = CreateInteractionResponse::Message(command_feedback_card(
+            "⏰ Reminder scheduled",
+            format!(
+                "Will fire in **{delay_str}** and mention {}\n\n{}",
+                targets.join(" "),
+                message
+            ),
+            0x57F287,
+        ));
         if let Err(e) = cmd.create_response(&ctx.http, response).await {
             tracing::error!(error = %e, "failed to respond to /remind command");
         }
@@ -10286,11 +10377,11 @@ impl Handler {
         ctx: &Context,
         cmd: &serenity::model::application::CommandInteraction,
     ) {
-        // Reject bot users — consistent with other slash-command handlers (e.g. /remind).
+        // Reject bot users — consistent with `/thread remind`.
         if cmd.user.bot {
             let response = CreateInteractionResponse::Message(
                 CreateInteractionResponseMessage::new()
-                    .content("🤖 Bots cannot use `/auth`.")
+                    .content("🤖 Bots cannot use `/account auth`.")
                     .ephemeral(true),
             );
             let _ = cmd.create_response(&ctx.http, response).await;
@@ -10317,7 +10408,7 @@ impl Handler {
         if cmd.guild_id.is_some() {
             let response = CreateInteractionResponse::Message(
                 CreateInteractionResponseMessage::new()
-                    .content("🔒 `/auth` is only available in DMs for security. Please DM me and run `/auth` there.")
+                    .content("🔒 `/account auth` is only available in DMs. Please DM me and run it there.")
                     .ephemeral(true),
             );
             let _ = cmd.create_response(&ctx.http, response).await;
@@ -10492,7 +10583,7 @@ impl Handler {
                 let content = match res {
                     Ok(status) if status.success() => {
                         format!(
-                            "⚠️ Auth command exited (status 0) before a login URL was detected. Run `/auth` again to retry.{detail}"
+                            "⚠️ Auth command exited (status 0) before a login URL was detected. Run `/account auth` again to retry.{detail}"
                         )
                     }
                     Ok(status) => {
@@ -10601,7 +10692,7 @@ impl Handler {
                         .create_followup_message(
                             &token,
                             &CreateInteractionResponseFollowup::new()
-                                .content("⏰ Authentication timed out. Run `/auth` again to retry.")
+                                .content("⏰ Authentication timed out. Run `/account auth` again to retry.")
                                 .ephemeral(true),
                             Vec::new(),
                         )
@@ -10674,7 +10765,17 @@ impl Handler {
         }
 
         // --- Parse and validate filter params (mutual exclusion) ---
-        let opts = &cmd.data.options;
+        let opts = cmd
+            .data
+            .options
+            .first()
+            .and_then(|option| match &option.value {
+                serenity::model::application::CommandDataOptionValue::SubCommand(options) => {
+                    Some(options.as_slice())
+                }
+                _ => None,
+            })
+            .unwrap_or(&cmd.data.options);
         let limit_opt = opts
             .iter()
             .find(|o| o.name == "limit")
@@ -11943,6 +12044,42 @@ mod tests {
     }
 
     #[test]
+    fn development_commands_use_grouped_slash_surface() {
+        let commands = development_slash_commands();
+        let value = serde_json::to_value(commands).unwrap();
+        let names = value
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|command| command.get("name").and_then(serde_json::Value::as_str))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            names,
+            ["help", "session", "workspace", "project", "account", "thread"]
+        );
+
+        let rendered = value.to_string();
+        for grouped in [
+            "model", "agent", "stop", "stop-all", "reset", "usage", "auth", "export",
+            "remind",
+        ] {
+            assert!(
+                rendered.contains(&format!(r#""name":"{grouped}""#)),
+                "missing grouped command {grouped}"
+            );
+        }
+        for removed in [
+            r#""name":"models""#,
+            r#""name":"agents""#,
+            r#""name":"cancel""#,
+            r#""name":"cancel-all""#,
+            r#""name":"export-thread""#,
+        ] {
+            assert!(!rendered.contains(removed), "legacy top-level command leaked");
+        }
+    }
+
+    #[test]
     fn scheduled_source_actions_expose_native_search_and_retention() {
         let source = knowledge_scheduled_source("github_ai_data_weekly").unwrap();
         let rendered = serde_json::to_value(knowledge_scheduled_source_message(source))
@@ -13134,7 +13271,7 @@ mod tests {
         );
     }
 
-    // --- format_usage_report tests (/usage slash command) ---
+    // --- format_usage_report tests (`/account usage`) ---
 
     fn usage_breakdown() -> crate::acp::protocol::UsageBreakdown {
         crate::acp::protocol::UsageBreakdown {
