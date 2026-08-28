@@ -1,5 +1,5 @@
-use crate::acp::{ContentBlock, SessionSnapshot, SessionState};
 use crate::acp::protocol::{ConfigOption, UsageReport};
+use crate::acp::{ContentBlock, SessionSnapshot, SessionState};
 use crate::adapter::{
     AdapterRouter, ChannelRef, ChatAdapter, MessageRef, SenderContext, TaskLifecycleEvent,
 };
@@ -44,7 +44,7 @@ use crate::task_registry::{TaskRecord, TaskRegistry, TaskState};
 use crate::trust::l3_gate_applies;
 use crate::workspace_attachment::prepare_workspace_pngs;
 use async_trait::async_trait;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serenity::builder::{
     CreateActionRow, CreateAttachment, CreateAutocompleteResponse, CreateButton, CreateChannel,
     CreateCommand, CreateCommandOption, CreateEmbed, CreateEmbedFooter, CreateInputText,
@@ -52,7 +52,7 @@ use serenity::builder::{
     CreateMessage, CreateModal, CreateSelectMenu, CreateSelectMenuKind, CreateSelectMenuOption,
     CreateThread, EditChannel, EditInteractionResponse, EditMessage, EditThread, GetMessages,
 };
-use serenity::http::Http;
+use serenity::http::{Http, LightMethod, Request, Route};
 use serenity::model::application::{
     ActionRowComponent, ButtonStyle, Command, CommandOptionType, ComponentInteractionDataKind,
     InputTextStyle, Interaction,
@@ -860,6 +860,83 @@ struct KnowledgeCardItem {
     next_step: String,
 }
 
+const DISCORD_COMPONENTS_V2_FLAG: u64 = 1 << 15;
+
+#[derive(Debug, Serialize)]
+struct ComponentsV2Message {
+    flags: u64,
+    components: Vec<ComponentsV2Component>,
+    allowed_mentions: ComponentsV2AllowedMentions,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    message_reference: Option<ComponentsV2MessageReference>,
+}
+
+#[derive(Debug, Serialize)]
+struct ComponentsV2AllowedMentions {
+    parse: Vec<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct ComponentsV2MessageReference {
+    message_id: String,
+    channel_id: String,
+    fail_if_not_exists: bool,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(untagged)]
+enum ComponentsV2Component {
+    Container(ComponentsV2Container),
+    Section(ComponentsV2Section),
+    Text(ComponentsV2Text),
+    Separator(ComponentsV2Separator),
+}
+
+#[derive(Debug, Serialize)]
+struct ComponentsV2Container {
+    #[serde(rename = "type")]
+    component_type: u8,
+    accent_color: u32,
+    components: Vec<ComponentsV2Component>,
+}
+
+#[derive(Debug, Serialize)]
+struct ComponentsV2Section {
+    #[serde(rename = "type")]
+    component_type: u8,
+    components: Vec<ComponentsV2Component>,
+    accessory: ComponentsV2LinkButton,
+}
+
+#[derive(Debug, Serialize)]
+struct ComponentsV2Text {
+    #[serde(rename = "type")]
+    component_type: u8,
+    content: String,
+}
+
+#[derive(Debug, Serialize)]
+struct ComponentsV2Separator {
+    #[serde(rename = "type")]
+    component_type: u8,
+    divider: bool,
+    spacing: u8,
+}
+
+#[derive(Debug, Serialize)]
+struct ComponentsV2LinkButton {
+    #[serde(rename = "type")]
+    component_type: u8,
+    style: u8,
+    label: String,
+    url: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct ComponentsV2CreatedMessage {
+    id: String,
+}
+
 fn truncate_chars(value: &str, max: usize) -> String {
     if value.chars().count() <= max {
         return value.to_string();
@@ -900,7 +977,10 @@ fn parse_knowledge_card_envelope(content: &str) -> Option<KnowledgeCardEnvelope>
     let mut lines = content.lines();
     lines.find(|line| line.trim() == KNOWLEDGE_CARDS_PREFIX)?;
     let payload = lines.collect::<Vec<_>>().join("\n");
-    let payload = payload.trim_start().trim_start_matches("```json").trim_start();
+    let payload = payload
+        .trim_start()
+        .trim_start_matches("```json")
+        .trim_start();
     let payload = payload.trim_start_matches("```").trim_start();
     let mut stream =
         serde_json::Deserializer::from_str(payload).into_iter::<KnowledgeCardEnvelope>();
@@ -1006,16 +1086,126 @@ fn knowledge_item_body(item: &KnowledgeCardItem) -> String {
     body
 }
 
+fn components_v2_text(content: impl Into<String>) -> ComponentsV2Component {
+    ComponentsV2Component::Text(ComponentsV2Text {
+        component_type: 10,
+        content: content.into(),
+    })
+}
+
+fn components_v2_separator() -> ComponentsV2Component {
+    ComponentsV2Component::Separator(ComponentsV2Separator {
+        component_type: 14,
+        divider: true,
+        spacing: 1,
+    })
+}
+
+fn knowledge_components_v2_message(
+    content: &str,
+    channel_id: u64,
+    reply_to_message_id: Option<u64>,
+) -> Option<ComponentsV2Message> {
+    let (envelope, _) = parse_and_validate_knowledge_cards(content)?;
+    if !matches!(
+        envelope.kind.as_str(),
+        "search" | "synthesis" | "project_notes"
+    ) {
+        return None;
+    }
+
+    let accent_color = match envelope.kind.as_str() {
+        "project_notes" => 0x57F287,
+        "synthesis" => 0xF2C94C,
+        _ => 0x2F80ED,
+    };
+    let heading = truncate_chars(envelope.heading.trim(), 240);
+    let heading = if heading.is_empty() {
+        "Knowledge".to_string()
+    } else {
+        suppress_mentions(&heading)
+    };
+    let mut card_components = vec![components_v2_text(format!("## {heading}"))];
+
+    if envelope.kind == "synthesis" {
+        card_components.push(components_v2_text(suppress_mentions(&truncate_chars(
+            envelope.overview.trim(),
+            KNOWLEDGE_MESSAGE_CONTENT_MAX,
+        ))));
+    }
+    card_components.push(components_v2_separator());
+
+    for (index, item) in envelope.items.iter().enumerate() {
+        if index > 0 {
+            card_components.push(components_v2_separator());
+        }
+        let title =
+            escape_markdown_link_text(&truncate_chars(item.title.trim(), KNOWLEDGE_CARD_TITLE_MAX));
+        let mut item_content = format!("### {:02} · {}", index + 1, suppress_mentions(&title));
+        let meta = normalize_knowledge_meta(item.meta.trim());
+        if !meta.is_empty() {
+            item_content.push_str("\n-# ");
+            item_content.push_str(&suppress_mentions(&truncate_chars(
+                &meta,
+                KNOWLEDGE_CARD_META_MAX,
+            )));
+        }
+        if !item.summary.trim().is_empty() {
+            item_content.push_str("\n\n");
+            item_content.push_str(&suppress_mentions(&truncate_chars(
+                item.summary.trim(),
+                KNOWLEDGE_CARD_SUMMARY_MAX,
+            )));
+        }
+        if !item.next_step.trim().is_empty() {
+            item_content.push_str("\n\n**下一步**　");
+            item_content.push_str(&suppress_mentions(&truncate_chars(
+                item.next_step.trim(),
+                KNOWLEDGE_CARD_NEXT_STEP_MAX,
+            )));
+        }
+        card_components.push(ComponentsV2Component::Section(ComponentsV2Section {
+            component_type: 9,
+            components: vec![components_v2_text(item_content)],
+            accessory: ComponentsV2LinkButton {
+                component_type: 2,
+                style: 5,
+                label: "開啟 Notion".to_string(),
+                url: item.url.trim().to_string(),
+            },
+        }));
+    }
+
+    card_components.push(components_v2_separator());
+    card_components.push(components_v2_text(format!(
+        "-# Knowledge · {} 筆",
+        envelope.items.len()
+    )));
+
+    Some(ComponentsV2Message {
+        flags: DISCORD_COMPONENTS_V2_FLAG,
+        components: vec![ComponentsV2Component::Container(ComponentsV2Container {
+            component_type: 17,
+            accent_color,
+            components: card_components,
+        })],
+        allowed_mentions: ComponentsV2AllowedMentions { parse: Vec::new() },
+        message_reference: reply_to_message_id.map(|message_id| ComponentsV2MessageReference {
+            message_id: message_id.to_string(),
+            channel_id: channel_id.to_string(),
+            fail_if_not_exists: false,
+        }),
+    })
+}
+
 fn ranked_knowledge_list_embed(kind: &str, items: &[KnowledgeCardItem]) -> Option<CreateEmbed> {
     let mut description = String::new();
     for (index, item) in items.iter().enumerate() {
         if index > 0 {
             description.push_str("\n\n");
         }
-        let title = escape_markdown_link_text(&truncate_chars(
-            item.title.trim(),
-            KNOWLEDGE_CARD_TITLE_MAX,
-        ));
+        let title =
+            escape_markdown_link_text(&truncate_chars(item.title.trim(), KNOWLEDGE_CARD_TITLE_MAX));
         let url = item.url.trim();
         description.push_str(&format!("**{}.** [{}]({})", index + 1, title, url));
         let body = knowledge_item_body(item);
@@ -1043,14 +1233,12 @@ fn ranked_knowledge_list_embed(kind: &str, items: &[KnowledgeCardItem]) -> Optio
     )
 }
 
+#[cfg(test)]
 fn knowledge_cards_message(content: &str) -> Option<CreateMessage> {
     knowledge_cards_message_for(content, None)
 }
 
-fn knowledge_cards_message_for(
-    content: &str,
-    capture_owner: Option<u64>,
-) -> Option<CreateMessage> {
+fn knowledge_cards_message_for(content: &str, capture_owner: Option<u64>) -> Option<CreateMessage> {
     let catalog = knowledge_catalog();
     let (envelope, project) = parse_and_validate_knowledge_cards(content)?;
 
@@ -1066,9 +1254,7 @@ fn knowledge_cards_message_for(
     };
     let mut message = CreateMessage::new().content(message_content);
 
-    if envelope.kind == "search"
-        || envelope.kind == "synthesis"
-        || envelope.kind == "project_notes"
+    if envelope.kind == "search" || envelope.kind == "synthesis" || envelope.kind == "project_notes"
     {
         return Some(message.embeds(vec![ranked_knowledge_list_embed(
             &envelope.kind,
@@ -1847,12 +2033,8 @@ fn development_slash_commands() -> Vec<CreateCommand> {
                 .required(true),
             )
             .add_sub_option(
-                CreateCommandOption::new(
-                    CommandOptionType::String,
-                    "message",
-                    "提醒內容",
-                )
-                .required(true),
+                CreateCommandOption::new(CommandOptionType::String, "message", "提醒內容")
+                    .required(true),
             )
             .add_sub_option(
                 CreateCommandOption::new(
@@ -3447,6 +3629,33 @@ impl DiscordAdapter {
         channel.thread_id.as_deref().unwrap_or(&channel.channel_id)
     }
 
+    async fn send_knowledge_components_v2(
+        &self,
+        channel_id: u64,
+        content: &str,
+        reply_to_message_id: Option<u64>,
+    ) -> anyhow::Result<Option<String>> {
+        let Some(payload) =
+            knowledge_components_v2_message(content, channel_id, reply_to_message_id)
+        else {
+            return Ok(None);
+        };
+        let body = serde_json::to_vec(&payload)?;
+        let created = self
+            .http
+            .fire::<ComponentsV2CreatedMessage>(
+                Request::new(
+                    Route::ChannelMessages {
+                        channel_id: ChannelId::new(channel_id),
+                    },
+                    LightMethod::Post,
+                )
+                .body(Some(body)),
+            )
+            .await?;
+        Ok(Some(created.id))
+    }
+
     pub async fn refresh_task_ui(&self, task: &TaskRecord) -> anyhow::Result<()> {
         if let Some(message_id) = task.status_message_id {
             ChannelId::new(task.thread_id)
@@ -3502,6 +3711,25 @@ impl ChatAdapter for DiscordAdapter {
         content: &str,
     ) -> anyhow::Result<MessageRef> {
         let ch_id: u64 = Self::resolve_channel(channel).parse()?;
+        match self
+            .send_knowledge_components_v2(ch_id, content, None)
+            .await
+        {
+            Ok(Some(message_id)) => {
+                return Ok(MessageRef {
+                    channel: channel.clone(),
+                    message_id,
+                });
+            }
+            Ok(None) => {}
+            Err(error) => {
+                warn!(
+                    channel_id = ch_id,
+                    error = ?error,
+                    "components v2 knowledge card failed; falling back to legacy embed"
+                );
+            }
+        }
         let msg = ChannelId::new(ch_id)
             .send_message(&self.http, knowledge_delivery_message(content, ch_id))
             .await?;
@@ -3544,6 +3772,26 @@ impl ChatAdapter for DiscordAdapter {
         if msg_id == 0 {
             // Invalid message ID, fall back to plain send
             return self.send_message(channel, content).await;
+        }
+        match self
+            .send_knowledge_components_v2(ch_id, content, Some(msg_id))
+            .await
+        {
+            Ok(Some(message_id)) => {
+                return Ok(MessageRef {
+                    channel: channel.clone(),
+                    message_id,
+                });
+            }
+            Ok(None) => {}
+            Err(error) => {
+                warn!(
+                    channel_id = ch_id,
+                    reply_to = reply_to_message_id,
+                    error = ?error,
+                    "components v2 knowledge reply failed; falling back to legacy embed"
+                );
+            }
         }
         let builder = knowledge_delivery_message(content, ch_id)
             .reference_message((ChannelId::new(ch_id), MessageId::new(msg_id)));
@@ -6283,18 +6531,14 @@ impl Handler {
                 .pending_messages("discord", &target_id.to_string())
                 .len();
         let preview = suppress_mentions(&truncate_for_discord(preview.unwrap_or(&title), 1800));
-        let mut request_content =
-            format!("👤 **Request from <@{}>**\n{}", user.id, preview,);
+        let mut request_content = format!("👤 **Request from <@{}>**\n{}", user.id, preview,);
         if ahead > 0 {
             request_content.push_str(&format!(
                 "\n\n⏳ 已排入 Queue（前方還有 {ahead} 則進行中／等待中）"
             ));
         }
         let trigger = ChannelId::new(target_id)
-            .send_message(
-                &ctx.http,
-                CreateMessage::new().content(request_content),
-            )
+            .send_message(&ctx.http, CreateMessage::new().content(request_content))
             .await
             .map_err(|error| format!("Could not post knowledge request: {error}"))?;
         let channel_ref = ChannelRef {
@@ -10135,9 +10379,8 @@ impl Handler {
         } else {
             ("⚠️ Nothing stopped", 0xFEE75C)
         };
-        let response = CreateInteractionResponse::Message(command_feedback_card(
-            title, msg, colour,
-        ));
+        let response =
+            CreateInteractionResponse::Message(command_feedback_card(title, msg, colour));
         if let Err(e) = cmd.create_response(&ctx.http, response).await {
             tracing::error!(error = %e, "failed to respond to /cancel command");
         }
@@ -12055,13 +12298,19 @@ mod tests {
             .collect::<Vec<_>>();
         assert_eq!(
             names,
-            ["help", "session", "workspace", "project", "account", "thread"]
+            [
+                "help",
+                "session",
+                "workspace",
+                "project",
+                "account",
+                "thread"
+            ]
         );
 
         let rendered = value.to_string();
         for grouped in [
-            "model", "agent", "stop", "stop-all", "reset", "usage", "auth", "export",
-            "remind",
+            "model", "agent", "stop", "stop-all", "reset", "usage", "auth", "export", "remind",
         ] {
             assert!(
                 rendered.contains(&format!(r#""name":"{grouped}""#)),
@@ -12075,7 +12324,10 @@ mod tests {
             r#""name":"cancel-all""#,
             r#""name":"export-thread""#,
         ] {
-            assert!(!rendered.contains(removed), "legacy top-level command leaked");
+            assert!(
+                !rendered.contains(removed),
+                "legacy top-level command leaked"
+            );
         }
     }
 
@@ -12141,7 +12393,10 @@ mod tests {
 
         let with_fields = knowledge_request_preview(
             &title,
-            &[("標題包含", "Context Database"), ("週次或時間範圍", "最近 4 期")],
+            &[
+                ("標題包含", "Context Database"),
+                ("週次或時間範圍", "最近 4 期"),
+            ],
         );
         assert!(with_fields.starts_with(&title));
         assert!(with_fields.contains("- 標題包含: Context Database"));
@@ -12245,7 +12500,9 @@ mod tests {
             .unwrap()
             .to_string();
         assert!(rendered.contains("找到 1 篇"));
-        assert!(rendered.contains("[Agent reliability](https://www.notion.so/example-retention-queue)"));
+        assert!(rendered.contains(
+            "[Agent reliability](https://www.notion.so/example-retention-queue)"
+        ));
         assert!(rendered.contains("Production reliability notes"));
         assert!(rendered.contains("Knowledge · 1 筆"));
         assert!(!rendered.contains("retention_keep"));
@@ -12253,6 +12510,57 @@ mod tests {
         assert_eq!(truncate_chars("abcdef", 4), "abc…");
         assert_eq!(truncate_chars("abc", 4), "abc");
         assert_eq!(truncate_chars("abc", 0), "");
+    }
+
+    #[test]
+    fn knowledge_search_contract_renders_components_v2_flex_card() {
+        let payload = concat!(
+            "OPENAB_KNOWLEDGE_CARDS_V1\n",
+            r#"{"kind":"search","heading":"📕 商業類待讀推薦","items":[{"title":"範例商業書 A","url":"https://www.notion.so/example-retention-queue","meta":"Example Author｜Business｜Expect 6.5","summary":"用於驗證卡片排版的範例摘要。","next_step":"先讀第一章"}]}"#,
+        );
+        let rendered =
+            serde_json::to_value(knowledge_components_v2_message(payload, 99, Some(42)).unwrap())
+                .unwrap();
+
+        assert_eq!(rendered["flags"], DISCORD_COMPONENTS_V2_FLAG);
+        assert!(rendered.get("content").is_none());
+        assert!(rendered.get("embeds").is_none());
+        assert_eq!(rendered["allowed_mentions"]["parse"], serde_json::json!([]));
+        assert_eq!(rendered["message_reference"]["message_id"], "42");
+        assert_eq!(rendered["message_reference"]["channel_id"], "99");
+        assert_eq!(rendered["components"][0]["type"], 17);
+        assert_eq!(rendered["components"][0]["accent_color"], 0x2F80ED);
+
+        let serialized = rendered.to_string();
+        assert!(serialized.contains("商業類待讀推薦"));
+        assert!(serialized.contains("01 · 範例商業書 A"));
+        assert!(serialized.contains("Example Author · Business · Expect 6.5"));
+        assert!(serialized.contains("用於驗證卡片排版的範例摘要"));
+        assert!(serialized.contains("先讀第一章"));
+        assert!(serialized.contains("開啟 Notion"));
+        assert!(serialized.contains("https://www.notion.so/example-retention-queue"));
+        assert!(serialized.contains("Knowledge · 1 筆"));
+        assert!(serialized.contains("\"style\":5"));
+    }
+
+    #[test]
+    fn components_v2_is_limited_to_read_only_knowledge_results() {
+        let synthesis = concat!(
+            "OPENAB_KNOWLEDGE_CARDS_V1\n",
+            r#"{"kind":"synthesis","heading":"近期整理","overview":"三篇文章聚焦可靠性。","items":[{"title":"Agent reliability","url":"https://app.notion.com/p/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","summary":"重試與觀測性。"}]}"#,
+        );
+        let synthesis =
+            serde_json::to_value(knowledge_components_v2_message(synthesis, 7, None).unwrap())
+                .unwrap();
+        assert_eq!(synthesis["components"][0]["accent_color"], 0xF2C94C);
+        assert!(synthesis.to_string().contains("三篇文章聚焦可靠性"));
+        assert!(synthesis.get("message_reference").is_none());
+
+        let retention = concat!(
+            "OPENAB_KNOWLEDGE_CARDS_V1\n",
+            r#"{"kind":"retention","heading":"待確認","items":[{"title":"Old article","url":"https://www.notion.so/example-retention-queue","source_id":"weekly_reading_digest","target_page_id":"eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee","queue_page_id":"ffffffffffffffffffffffffffffffff","delete_after":"2026-09-02"}]}"#,
+        );
+        assert!(knowledge_components_v2_message(retention, 7, None).is_none());
     }
 
     #[test]
@@ -12277,7 +12585,9 @@ mod tests {
         assert!(knowledge_cards_payload_is_valid(payload));
 
         assert!(knowledge_cards_message(&format!("{payload}\n多餘未驗證內容")).is_none());
-        assert!(!knowledge_cards_payload_is_valid(&format!("{payload}\n多餘未驗證內容")));
+        assert!(!knowledge_cards_payload_is_valid(&format!(
+            "{payload}\n多餘未驗證內容"
+        )));
     }
 
     #[test]
@@ -12412,9 +12722,10 @@ mod tests {
             r#"{"kind":"capture_preview","heading":"收錄預覽（2 筆）","items":[{"title":"Agent reliability notes","url":"https://example.com/agent-reliability","meta":"Guide · Current · create","summary":"Production reliability patterns"},{"title":"既有 Notion 筆記","url":"https://app.notion.com/p/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","meta":"Article · Current · update","summary":"更新摘要與 tags"}]}"#,
         );
         assert!(knowledge_cards_payload_is_valid(payload));
-        let rendered = serde_json::to_value(knowledge_cards_message_for(payload, Some(42)).unwrap())
-            .unwrap()
-            .to_string();
+        let rendered =
+            serde_json::to_value(knowledge_cards_message_for(payload, Some(42)).unwrap())
+                .unwrap()
+                .to_string();
         assert!(rendered.contains("收錄預覽"));
         assert!(rendered.contains("Agent reliability notes"));
         assert!(rendered.contains("oab_knowledge:capture_confirm:42"));
