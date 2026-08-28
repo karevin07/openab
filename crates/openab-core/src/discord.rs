@@ -12863,14 +12863,14 @@ mod tests {
         let used = HashSet::from(["api".to_string()]);
 
         assert_eq!(
-            project_workspace_choices(&aliases, &used, "vault"),
+            project_workspace_choices(&aliases, &used, "library"),
             vec![("@example-library".to_string(), "example-library".to_string())]
         );
         assert_eq!(
             project_workspace_choices(&aliases, &used, ""),
             vec![
-                ("@frontend".to_string(), "frontend".to_string()),
                 ("@example-library".to_string(), "example-library".to_string()),
+                ("@frontend".to_string(), "frontend".to_string()),
             ]
         );
     }
@@ -13093,7 +13093,7 @@ mod tests {
                 key: "discord:111".into(),
                 snapshot: SessionSnapshot {
                     state: SessionState::Active,
-                    working_dir: Some("/srv/example-bot/openab".into()),
+                    working_dir: Some("/work/example-project".into()),
                     externally_detached: false,
                 },
                 prompt_in_flight: true,
@@ -13328,11 +13328,11 @@ mod tests {
         let (_, recent) = knowledge_side_project_prompt(project, "recent").unwrap();
         assert!(recent.contains("operation_id: recent"));
         assert!(recent.contains("Structured Knowledge Adapter"));
-        assert!(recent.contains("Project Alpha"));
+        assert!(recent.contains("Example Project Alpha"));
 
         let publishing = knowledge_side_project("project_notes_beta").unwrap();
         let (_, publishing_recent) = knowledge_side_project_prompt(publishing, "recent").unwrap();
-        assert!(publishing_recent.contains("Project Beta"));
+        assert!(publishing_recent.contains("Example Project Beta"));
         assert!(publishing_recent.contains("Example Project Beta"));
         assert!(knowledge_side_project_prompt(project, "delete").is_none());
         assert!(knowledge_side_project("unknown").is_none());
@@ -13342,14 +13342,14 @@ mod tests {
     fn knowledge_search_card_contract_renders_notion_embeds() {
         let payload = concat!(
             "OPENAB_KNOWLEDGE_CARDS_V1\n",
-            r#"{"kind":"search","heading":"找到 1 篇","items":[{"title":"Agent reliability","url":"https://www.notion.so/example-retention-queue","meta":"★★★★★ · AI Agent","summary":"Production reliability notes"}]}"#,
+            r#"{"kind":"search","heading":"找到 1 篇","items":[{"title":"Agent reliability","url":"https://app.notion.com/p/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","meta":"★★★★★ · AI Agent","summary":"Production reliability notes"}]}"#,
         );
         let rendered = serde_json::to_value(knowledge_cards_message(payload).unwrap())
             .unwrap()
             .to_string();
         assert!(rendered.contains("找到 1 篇"));
         assert!(rendered.contains(
-            "[Agent reliability](https://www.notion.so/example-retention-queue)"
+            "[Agent reliability](https://app.notion.com/p/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa)"
         ));
         assert!(rendered.contains("Production reliability notes"));
         assert!(rendered.contains("Knowledge · 1 筆"));
@@ -13364,7 +13364,7 @@ mod tests {
     fn knowledge_search_contract_renders_components_v2_flex_card() {
         let payload = concat!(
             "OPENAB_KNOWLEDGE_CARDS_V1\n",
-            r#"{"kind":"search","heading":"📕 商業類待讀推薦","items":[{"title":"範例商業書 A","url":"https://www.notion.so/example-retention-queue","meta":"Example Author｜Business｜Expect 6.5","summary":"用於驗證卡片排版的範例摘要。","next_step":"先讀第一章"}]}"#,
+            r#"{"kind":"search","heading":"📕 商業類待讀推薦","items":[{"title":"範例商業書 A","url":"https://app.notion.com/p/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","meta":"Example Author｜Business｜Expect 6.5","summary":"用於驗證卡片排版的範例摘要。","next_step":"先讀第一章"}]}"#,
         );
         let rendered =
             serde_json::to_value(knowledge_components_v2_message(payload, 99, Some(42)).unwrap())
@@ -13386,7 +13386,7 @@ mod tests {
         assert!(serialized.contains("用於驗證卡片排版的範例摘要"));
         assert!(serialized.contains("先讀第一章"));
         assert!(serialized.contains("開啟 Notion"));
-        assert!(serialized.contains("https://www.notion.so/example-retention-queue"));
+        assert!(serialized.contains("https://app.notion.com/p/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"));
         assert!(serialized.contains("Knowledge · 1 筆"));
         assert!(serialized.contains("\"style\":5"));
     }
@@ -13470,7 +13470,7 @@ mod tests {
 
         let retention = concat!(
             "OPENAB_KNOWLEDGE_CARDS_V1\n",
-            r#"{"kind":"retention","heading":"待確認","items":[{"title":"Old article","url":"https://www.notion.so/example-retention-queue","source_id":"weekly_reading_digest","target_page_id":"eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee","queue_page_id":"ffffffffffffffffffffffffffffffff","delete_after":"2026-09-02"}]}"#,
+            r#"{"kind":"retention","heading":"待確認","items":[{"title":"Old article","url":"https://app.notion.com/p/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","source_id":"weekly_reading_digest","target_page_id":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","queue_page_id":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","delete_after":"2026-09-02"}]}"#,
         );
         assert!(knowledge_components_v2_message(retention, 7, None).is_none());
     }
@@ -13483,7 +13483,7 @@ mod tests {
             "Schema 驗證通過，無漂移。\n",
             "```\n",
             "OPENAB_KNOWLEDGE_CARDS_V1\n",
-            r#"{"kind":"search","heading":"📕 待讀推薦 Top 5","items":[{"title":"範例商業書 A","url":"https://app.notion.com/example-book-a","meta":"Example Author A｜科普｜History｜Expect 7","summary":"以漫畫呈現歷史探索。"}]}"#,
+            r#"{"kind":"search","heading":"📕 待讀推薦 Top 5","items":[{"title":"範例商業書 A","url":"https://app.notion.com/p/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","meta":"Example Author｜Business｜Management｜Expect 7","summary":"用於驗證卡片排版的範例摘要。"}]}"#,
             "\n```",
         );
         let rendered = serde_json::to_value(knowledge_cards_message(payload).unwrap())
@@ -13491,7 +13491,7 @@ mod tests {
             .to_string();
         assert!(rendered.contains("待讀推薦 Top 5"));
         assert!(rendered.contains("範例商業書 A"));
-        assert!(rendered.contains("Example Author A · 科普 · History · Expect 7"));
+        assert!(rendered.contains("Example Author · Business · Management · Expect 7"));
         assert!(!rendered.contains("Loaded skill"));
         assert!(!rendered.contains("OPENAB_KNOWLEDGE_CARDS_V1"));
         assert!(knowledge_cards_payload_is_valid(payload));
@@ -13508,7 +13508,7 @@ mod tests {
             "✅ `notion_notion-query-data-sources`\n\n",
             "```\n",
             "OPENAB_KNOWLEDGE_CARDS_V1\n",
-            r#"{"kind":"search","heading":"📕 待讀推薦 Top 5（Expect 7，共 12 本待讀）","items":[{"title":"範例商業書 A","url":"https://app.notion.com/example-book-a","meta":"Example Author A｜科普｜History｜歐美｜Expect 7","summary":"用於驗證第一張推薦卡片的範例摘要。"},{"title":"範例商業書 B","url":"https://app.notion.com/example-book-b","meta":"Example Author A｜科普｜History｜歐美｜Expect 7","summary":"用於驗證第二張推薦卡片的範例摘要。"},{"title":"範例商業書 C","url":"https://app.notion.com/example-book-c","meta":"Example Author C｜科普｜History｜歐美｜Expect 7","summary":"用於驗證第三張推薦卡片的範例摘要。"},{"title":"範例商業書 D","url":"https://app.notion.com/example-book-d","meta":"Example Author D｜科普｜Economic, Sociology, Psychology｜歐美｜Expect 7","summary":"用於驗證第四張推薦卡片的範例摘要。"},{"title":"範例商業書 E","url":"https://app.notion.com/example-book-e","meta":"Example Author E｜科普｜Economic｜歐美｜Expect 7","summary":"用於驗證第五張推薦卡片的範例摘要。"}]}"#,
+            r#"{"kind":"search","heading":"📕 待讀推薦 Top 5（Expect 7，共 12 本待讀）","items":[{"title":"範例商業書 A","url":"https://app.notion.com/p/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","meta":"Example Author A｜Business｜Management｜Global｜Expect 7","summary":"用於驗證第一張推薦卡片的範例摘要。"},{"title":"範例商業書 B","url":"https://app.notion.com/p/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","meta":"Example Author B｜Business｜Finance｜Global｜Expect 7","summary":"用於驗證第二張推薦卡片的範例摘要。"},{"title":"範例商業書 C","url":"https://app.notion.com/p/cccccccccccccccccccccccccccccccc","meta":"Example Author C｜Business｜Strategy｜Global｜Expect 7","summary":"用於驗證第三張推薦卡片的範例摘要。"},{"title":"範例商業書 D","url":"https://app.notion.com/p/dddddddddddddddddddddddddddddddd","meta":"Example Author D｜Business｜Marketing｜Global｜Expect 7","summary":"用於驗證第四張推薦卡片的範例摘要。"},{"title":"範例商業書 E","url":"https://app.notion.com/p/eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee","meta":"Example Author E｜Business｜Leadership｜Global｜Expect 7","summary":"用於驗證第五張推薦卡片的範例摘要。"}]}"#,
             "\n```",
         );
         assert!(knowledge_cards_payload_is_valid(payload));
@@ -13518,14 +13518,14 @@ mod tests {
         assert!(rendered.contains("**1.** ["));
         assert!(rendered.contains("**5.** ["));
         assert!(rendered.contains("Knowledge · 5 筆"));
-        assert!(rendered.contains("Example Author A · 科普 · History · 歐美 · Expect 7"));
+        assert!(rendered.contains("Example Author A · Business · Management · Global · Expect 7"));
         assert!(!rendered.contains("OPENAB_KNOWLEDGE_CARDS_V1"));
         // One ranked embed, not one embed per item.
         let embeds = rendered.matches("\"description\"").count();
         assert_eq!(embeds, 1);
         assert!(!knowledge_cards_payload_is_valid(&format!(
             "OPENAB_KNOWLEDGE_CARDS_V1\n{}",
-            r#"{"kind":"search","heading":"bad","items":[{"title":"x","url":"https://www.notion.so/example-retention-queue)","meta":"","summary":""}]}"#
+            r#"{"kind":"search","heading":"bad","items":[{"title":"x","url":"https://app.notion.com/p/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa)","meta":"","summary":""}]}"#
         )));
         // Unsplit delivery must keep the contract intact even past Discord's text limit.
         let padded = format!("{payload}\n{}", "x".repeat(2500));
@@ -13575,14 +13575,14 @@ mod tests {
     fn knowledge_retention_cards_validate_ids_and_expose_keep_select() {
         let payload = concat!(
             "OPENAB_KNOWLEDGE_CARDS_V1\n",
-            r#"{"kind":"retention","heading":"待確認","items":[{"title":"Old article","url":"https://www.notion.so/example-retention-queue","meta":"Example User Reading List","summary":"45 days old","source_id":"weekly_reading_digest","target_page_id":"eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee","queue_page_id":"ffffffffffffffffffffffffffffffff","delete_after":"2026-09-02"}]}"#,
+            r#"{"kind":"retention","heading":"待確認","items":[{"title":"Old article","url":"https://app.notion.com/p/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","meta":"Example Weekly Reading Digest","summary":"45 days old","source_id":"weekly_reading_digest","target_page_id":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","queue_page_id":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","delete_after":"2026-09-02"}]}"#,
         );
         let rendered = serde_json::to_value(knowledge_cards_message(payload).unwrap())
             .unwrap()
             .to_string();
         assert!(rendered.contains("oab_knowledge:retention_keep"));
         assert!(rendered.contains(
-            "weekly_reading_digest|eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee|ffffffffffffffffffffffffffffffff"
+            "weekly_reading_digest|aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa|bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
         ));
         assert!(rendered.contains("2026-09-02"));
 
@@ -13607,13 +13607,13 @@ mod tests {
 
         let notes = concat!(
             "OPENAB_KNOWLEDGE_CARDS_V1\n",
-            r#"{"kind":"project_notes","heading":"最近備忘","project_id":"project_notes_alpha","items":[{"title":"新的控制方式","url":"https://www.notion.so/example-retention-queue","meta":"Idea · Draft","summary":"控制方向"},{"title":"電池量測","url":"https://app.notion.com/p/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","meta":"Todo · Draft","summary":"量測電壓"}]}"#,
+            r#"{"kind":"project_notes","heading":"最近備忘","project_id":"project_notes_alpha","items":[{"title":"新的控制方式","url":"https://app.notion.com/p/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","meta":"Idea · Draft","summary":"控制方向"},{"title":"電池量測","url":"https://app.notion.com/p/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","meta":"Todo · Draft","summary":"量測電壓"}]}"#,
         );
         let rendered = serde_json::to_value(knowledge_cards_message(notes).unwrap())
             .unwrap()
             .to_string();
         assert!(rendered.contains(
-            "[新的控制方式](https://www.notion.so/example-retention-queue)"
+            "[新的控制方式](https://app.notion.com/p/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa)"
         ));
         assert!(rendered.contains("**1.** ["));
         assert!(rendered.contains("**2.** ["));

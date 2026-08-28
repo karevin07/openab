@@ -91,6 +91,28 @@ Discord adapter. Requires a Discord bot token.
 | `max_buffered_messages` | u32 | `10` | Per-thread/lane mpsc channel capacity. Only applies to `per-thread` / `per-lane` modes. |
 | `max_batch_tokens` | u32 | `24000` | Soft token cap per ACP turn. Only applies to `per-thread` / `per-lane` modes. |
 
+### `[discord.admin_control]`
+
+The optional Admin Bot client uses a service-to-service bearer token. HTTPS is required by default.
+Set `allow_insecure_http = true` only when the URL is reachable exclusively through a trusted
+private network, such as an isolated Docker network.
+
+```toml
+[discord.admin_control]
+url = "https://discord-admin.example.internal"
+token_env = "DISCORD_ADMIN_CONTROL_TOKEN"
+# allow_insecure_http = true
+```
+
+Set exactly one of `token_env` or `token_file`. URLs containing embedded credentials are rejected.
+
+Session lifecycle reporting is enabled separately when `DISCORD_ADMIN_REPORT_TOKEN` is present.
+It requires `DISCORD_ADMIN_REPORT_URL`; external HTTPS is the safe default. Private HTTP also
+requires `DISCORD_ADMIN_REPORT_ALLOW_INSECURE_HTTP=true`. Use
+`OPENAB_REPORT_SOURCE_ID` for a deployment-specific source label. Task titles and workspace aliases
+are omitted unless `OPENAB_REPORT_INCLUDE_TITLE=true` and
+`OPENAB_REPORT_INCLUDE_WORKSPACE_ALIAS=true` are explicitly set.
+
 ### `[[discord.project_actions]]`
 
 Adds **Quick actions** to managed Discord Project Home cards. Selecting an action opens the normal
@@ -1066,6 +1088,36 @@ bot_token = "${DISCORD_BOT_TOKEN}"
 ```
 
 Undefined variables resolve to an empty string.
+
+### Knowledge source overrides
+
+The built-in knowledge catalog contains neutral example sources. Deployments can keep Notion page
+IDs, data source IDs, display names, project names, and field mappings outside the repository by
+setting `OPENAB_KNOWLEDGE_SOURCES_FILE` to a read-only TOML file.
+
+```toml
+[[sources]]
+source_id = "project_notes_alpha"
+title = "My private project"
+notion_url = "https://www.notion.so/my-private-page"
+data_source_id = "collection://my-private-data-source"
+config_json = '{"notion_project":"My private project"}'
+
+[[sources.fields]]
+logical_name = "project"
+options_json = '["My private project"]'
+```
+
+The file may override `title`, `description`, `notion_url`, `data_source_id`, and `config_json` for
+an existing source. Nested `fields` may override `notion_property`, `semantics`, or `options_json`;
+nested `actions` may override an action `title`. Unknown source, field, action, or malformed JSON
+causes startup to fail before Discord connects. Keep the deployment file out of Git and mount it
+read-only into the worker.
+
+For a private installation that is renaming an existing source key, add
+`previous_source_ids = ["old-private-key"]`. OpenAB adopts the first matching legacy row and its
+field/action children before applying the override. Keep legacy identifiers in the private override
+file rather than in public migrations.
 
 ---
 

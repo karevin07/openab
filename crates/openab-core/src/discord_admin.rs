@@ -5,8 +5,8 @@ use anyhow::{Context, Result};
 use reqwest::StatusCode;
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use std::path::Path;
-use std::time::Duration;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Duration;
 
 static REPORT_EVENT_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 
@@ -16,6 +16,8 @@ pub struct DiscordAdminReporter {
     url: String,
     token: String,
     source_id: String,
+    include_title: bool,
+    include_workspace_alias: bool,
 }
 
 #[derive(Serialize)]
@@ -40,35 +42,106 @@ impl DiscordAdminReporter {
             Ok(value) if !value.trim().is_empty() => value.trim().to_string(),
             _ => return Ok(None),
         };
-        anyhow::ensure!(token.len() >= 32, "Discord Admin report token must contain at least 32 characters");
-        let source_id = std::env::var("OPENAB_REPORT_SOURCE").unwrap_or_else(|_| "coding".into());
-        anyhow::ensure!(matches!(source_id.as_str(), "coding" | "knowledge"), "OPENAB_REPORT_SOURCE must be coding or knowledge");
+        anyhow::ensure!(
+            token.len() >= 32,
+            "Discord Admin report token must contain at least 32 characters"
+        );
+        let source_id = std::env::var("OPENAB_REPORT_SOURCE_ID")
+            .or_else(|_| std::env::var("OPENAB_REPORT_SOURCE"))
+            .unwrap_or_else(|_| "openab".into());
+        anyhow::ensure!(
+            !source_id.is_empty()
+                && source_id.len() <= 64
+                && source_id
+                    .chars()
+                    .all(|character| character.is_ascii_alphanumeric()
+                        || matches!(character, '-' | '_')),
+            "OPENAB_REPORT_SOURCE_ID must contain 1-64 ASCII letters, numbers, '-' or '_'"
+        );
         let base = std::env::var("DISCORD_ADMIN_REPORT_URL")
-            .unwrap_or_else(|_| "http://discord-admin:8787".into());
+            .context("DISCORD_ADMIN_REPORT_URL is required when session reporting is enabled")?;
+        validate_service_url(
+            &base,
+            env_flag("DISCORD_ADMIN_REPORT_ALLOW_INSECURE_HTTP"),
+            "DISCORD_ADMIN_REPORT_URL",
+        )?;
         Ok(Some(Self {
-            http: reqwest::Client::builder().timeout(Duration::from_secs(5)).build()?,
-            url: format!("{}/v1/telemetry/session-events", base.trim_end_matches('/')),
+            http: reqwest::Client::builder()
+                .timeout(Duration::from_secs(5))
+                .build()?,
+            url: format!(
+                "{}/v1/telemetry/session-events",
+                base.trim().trim_end_matches('/')
+            ),
             token,
             source_id,
+            include_title: env_flag("OPENAB_REPORT_INCLUDE_TITLE"),
+            include_workspace_alias: env_flag("OPENAB_REPORT_INCLUDE_WORKSPACE_ALIAS"),
         }))
     }
 
-    pub async fn report(&self, thread_id: u64, event_type: &str, title: &str, workspace_alias: &str) -> Result<()> {
+    pub async fn report(
+        &self,
+        thread_id: u64,
+        event_type: &str,
+        title: &str,
+        workspace_alias: &str,
+    ) -> Result<()> {
         let occurred_at = chrono::Utc::now().to_rfc3339();
         let sequence = REPORT_EVENT_SEQUENCE.fetch_add(1, Ordering::Relaxed);
-        let body = SessionEventEnvelope { events: [SessionEventRequest {
-            source_id: &self.source_id,
-            event_id: format!("{}:{thread_id}:{event_type}:{sequence}", occurred_at),
-            thread_id,
-            event_type,
-            occurred_at,
-            title,
-            workspace_alias,
-        }] };
-        let response = self.http.post(&self.url).bearer_auth(&self.token).json(&body).send().await?;
-        anyhow::ensure!(response.status().is_success(), "Discord Admin report endpoint returned {}", response.status());
+        let body = SessionEventEnvelope {
+            events: [SessionEventRequest {
+                source_id: &self.source_id,
+                event_id: format!("{}:{thread_id}:{event_type}:{sequence}", occurred_at),
+                thread_id,
+                event_type,
+                occurred_at,
+                title: if self.include_title { title } else { "" },
+                workspace_alias: if self.include_workspace_alias {
+                    workspace_alias
+                } else {
+                    ""
+                },
+            }],
+        };
+        let response = self
+            .http
+            .post(&self.url)
+            .bearer_auth(&self.token)
+            .json(&body)
+            .send()
+            .await?;
+        anyhow::ensure!(
+            response.status().is_success(),
+            "Discord Admin report endpoint returned {}",
+            response.status()
+        );
         Ok(())
     }
+}
+
+fn env_flag(name: &str) -> bool {
+    std::env::var(name)
+        .map(|value| {
+            matches!(
+                value.trim().to_ascii_lowercase().as_str(),
+                "1" | "true" | "yes" | "on"
+            )
+        })
+        .unwrap_or(false)
+}
+
+fn validate_service_url(value: &str, allow_insecure_http: bool, name: &str) -> Result<()> {
+    let url = reqwest::Url::parse(value.trim()).with_context(|| format!("invalid {name}"))?;
+    anyhow::ensure!(
+        url.username().is_empty() && url.password().is_none(),
+        "{name} must not contain credentials"
+    );
+    anyhow::ensure!(
+        url.scheme() == "https" || (url.scheme() == "http" && allow_insecure_http),
+        "{name} must use https unless insecure HTTP is explicitly enabled for a trusted private network"
+    );
+    Ok(())
 }
 
 #[derive(Clone)]
@@ -349,15 +422,17 @@ struct StructurePreviewRequest<'a> {
 
 impl DiscordAdminClient {
     pub fn from_config(config: &DiscordAdminControlConfig) -> Result<Self> {
+        validate_service_url(
+            &config.url,
+            config.allow_insecure_http,
+            "discord.admin_control.url",
+        )?;
         let token = match (&config.token_file, &config.token_env) {
             (Some(path), None) => {
                 let token_path = Path::new(path.trim());
                 std::fs::read_to_string(token_path)
                     .with_context(|| {
-                        format!(
-                            "read Discord Admin control token {}",
-                            token_path.display()
-                        )
+                        format!("read Discord Admin control token {}", token_path.display())
                     })?
                     .trim()
                     .to_string()
@@ -366,9 +441,7 @@ impl DiscordAdminClient {
                 .with_context(|| format!("read Discord Admin control token from {name}"))?
                 .trim()
                 .to_string(),
-            _ => anyhow::bail!(
-                "Discord Admin control must configure exactly one token source"
-            ),
+            _ => anyhow::bail!("Discord Admin control must configure exactly one token source"),
         };
         anyhow::ensure!(
             token.len() >= 32,
@@ -434,11 +507,7 @@ impl DiscordAdminClient {
         .await
     }
 
-    pub async fn cleanup(
-        &self,
-        actor_user_id: u64,
-        guild_id: u64,
-    ) -> Result<CleanupCandidates> {
+    pub async fn cleanup(&self, actor_user_id: u64, guild_id: u64) -> Result<CleanupCandidates> {
         self.post(
             "/v1/cleanup",
             &ActorRequest {
@@ -723,6 +792,7 @@ mod tests {
             url: "http://discord-admin:8787".into(),
             token_file: Some(path.display().to_string()),
             token_env: None,
+            allow_insecure_http: true,
         };
 
         let error = DiscordAdminClient::from_config(&config)
@@ -730,5 +800,16 @@ mod tests {
             .expect("short token should fail");
 
         assert!(error.to_string().contains("at least 32"));
+    }
+
+    #[test]
+    fn service_url_requires_https_or_private_network_opt_in() {
+        assert!(validate_service_url("https://admin.example.test", false, "test URL").is_ok());
+        assert!(validate_service_url("http://discord-admin:8787", true, "test URL").is_ok());
+        assert!(validate_service_url("http://admin.example.test", false, "test URL").is_err());
+        assert!(
+            validate_service_url("https://user:secret@admin.example.test", false, "test URL")
+                .is_err()
+        );
     }
 }

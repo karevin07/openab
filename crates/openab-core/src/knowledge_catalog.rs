@@ -4,7 +4,8 @@
 //! schema mappings, UI actions, and form definitions.
 
 use anyhow::{Context, Result};
-use rusqlite::{params, Connection};
+use rusqlite::{params, Connection, OptionalExtension};
+use serde::Deserialize;
 use serde_json::Value;
 use std::path::{Path, PathBuf};
 use std::sync::LazyLock;
@@ -14,10 +15,50 @@ const MIGRATION_0001: &str = include_str!("../migrations/0001_knowledge_catalog.
 const MIGRATION_0002: &str = include_str!("../migrations/0002_knowledge_workflows.sql");
 const MIGRATION_0003: &str = include_str!("../migrations/0003_knowledge_search_cards.sql");
 const MIGRATION_0004: &str = include_str!("../migrations/0004_knowledge_synthesis_cards.sql");
-const MIGRATION_0005: &str = include_str!("../migrations/0005_knowledge_reading_overview_cards.sql");
+const MIGRATION_0005: &str =
+    include_str!("../migrations/0005_knowledge_reading_overview_cards.sql");
 const MIGRATION_0006: &str = include_str!("../migrations/0006_knowledge_capture_preview_cards.sql");
 const MIGRATION_0007: &str = include_str!("../migrations/0007_knowledge_search_prompt_tighten.sql");
 const MIGRATION_0008: &str = include_str!("../migrations/0008_knowledge_result_pagination.sql");
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct KnowledgeSourceOverrides {
+    sources: Vec<KnowledgeSourceOverride>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct KnowledgeSourceOverride {
+    source_id: String,
+    #[serde(default)]
+    previous_source_ids: Vec<String>,
+    title: Option<String>,
+    description: Option<String>,
+    notion_url: Option<String>,
+    data_source_id: Option<String>,
+    config_json: Option<String>,
+    #[serde(default)]
+    fields: Vec<KnowledgeFieldOverride>,
+    #[serde(default)]
+    actions: Vec<KnowledgeActionOverride>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct KnowledgeFieldOverride {
+    logical_name: String,
+    notion_property: Option<String>,
+    semantics: Option<String>,
+    options_json: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct KnowledgeActionOverride {
+    action_id: String,
+    title: Option<String>,
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct KnowledgeField {
@@ -199,6 +240,14 @@ pub struct KnowledgeCatalog {
 
 impl KnowledgeCatalog {
     pub fn open_or_seed(path: Option<&Path>) -> Result<Self> {
+        let source_overrides = source_overrides_path();
+        Self::open_or_seed_with_overrides(path, source_overrides.as_deref())
+    }
+
+    fn open_or_seed_with_overrides(
+        path: Option<&Path>,
+        source_overrides_path: Option<&Path>,
+    ) -> Result<Self> {
         let mut connection = match path {
             Some(path) => {
                 if let Some(parent) = path.parent() {
@@ -252,6 +301,7 @@ impl KnowledgeCatalog {
                 .commit()
                 .context("commit knowledge catalog migration")?;
         }
+        apply_source_overrides(&mut connection, source_overrides_path)?;
         Self::load(&connection)
     }
 
@@ -474,8 +524,159 @@ impl KnowledgeCatalog {
     }
 }
 
+fn apply_source_overrides(connection: &mut Connection, path: Option<&Path>) -> Result<()> {
+    let Some(path) = path else {
+        return Ok(());
+    };
+    let contents = std::fs::read_to_string(&path)
+        .with_context(|| format!("read knowledge source overrides {}", path.display()))?;
+    let overrides: KnowledgeSourceOverrides = toml::from_str(&contents)
+        .with_context(|| format!("parse knowledge source overrides {}", path.display()))?;
+    anyhow::ensure!(
+        !overrides.sources.is_empty(),
+        "knowledge source overrides must contain at least one [[sources]] entry"
+    );
+
+    let transaction = connection
+        .transaction()
+        .context("start knowledge source override transaction")?;
+    transaction.execute_batch("PRAGMA defer_foreign_keys = ON;")?;
+    for source in overrides.sources {
+        if let Some(config_json) = &source.config_json {
+            serde_json::from_str::<Value>(config_json).with_context(|| {
+                format!(
+                    "invalid config_json for knowledge source {}",
+                    source.source_id
+                )
+            })?;
+        }
+        let target_exists = transaction
+            .query_row(
+                "SELECT 1 FROM knowledge_sources WHERE source_id = ?1",
+                params![&source.source_id],
+                |_| Ok(()),
+            )
+            .optional()?
+            .is_some();
+        if !target_exists {
+            let mut matched_previous = None;
+            for previous_source_id in &source.previous_source_ids {
+                let exists = transaction
+                    .query_row(
+                        "SELECT 1 FROM knowledge_sources WHERE source_id = ?1",
+                        params![previous_source_id],
+                        |_| Ok(()),
+                    )
+                    .optional()?
+                    .is_some();
+                if exists {
+                    anyhow::ensure!(
+                        matched_previous.is_none(),
+                        "multiple previous_source_ids exist for knowledge source {}",
+                        source.source_id
+                    );
+                    matched_previous = Some(previous_source_id);
+                }
+            }
+            if let Some(previous_source_id) = matched_previous {
+                transaction.execute(
+                    "UPDATE knowledge_sources SET source_id = ?2 WHERE source_id = ?1",
+                    params![previous_source_id, &source.source_id],
+                )?;
+                for table in [
+                    "knowledge_fields",
+                    "knowledge_actions",
+                    "knowledge_action_inputs",
+                ] {
+                    transaction.execute(
+                        &format!("UPDATE {table} SET source_id = ?2 WHERE source_id = ?1"),
+                        params![previous_source_id, &source.source_id],
+                    )?;
+                }
+            }
+        }
+
+        let updated = transaction.execute(
+            "UPDATE knowledge_sources SET \
+                title = COALESCE(?2, title), \
+                description = COALESCE(?3, description), \
+                notion_url = COALESCE(?4, notion_url), \
+                data_source_id = COALESCE(?5, data_source_id), \
+                config_json = COALESCE(?6, config_json) \
+             WHERE source_id = ?1",
+            params![
+                source.source_id,
+                source.title,
+                source.description,
+                source.notion_url,
+                source.data_source_id,
+                source.config_json,
+            ],
+        )?;
+        anyhow::ensure!(
+            updated == 1,
+            "unknown knowledge source override: {}",
+            source.source_id
+        );
+
+        for field in source.fields {
+            if let Some(options_json) = &field.options_json {
+                serde_json::from_str::<Value>(options_json).with_context(|| {
+                    format!(
+                        "invalid options_json for {}.{}",
+                        source.source_id, field.logical_name
+                    )
+                })?;
+            }
+            let updated = transaction.execute(
+                "UPDATE knowledge_fields SET \
+                    notion_property = COALESCE(?3, notion_property), \
+                    semantics = COALESCE(?4, semantics), \
+                    options_json = COALESCE(?5, options_json) \
+                 WHERE source_id = ?1 AND logical_name = ?2",
+                params![
+                    source.source_id,
+                    field.logical_name,
+                    field.notion_property,
+                    field.semantics,
+                    field.options_json,
+                ],
+            )?;
+            anyhow::ensure!(
+                updated == 1,
+                "unknown knowledge field override: {}.{}",
+                source.source_id,
+                field.logical_name
+            );
+        }
+        for action in source.actions {
+            let updated = transaction.execute(
+                "UPDATE knowledge_actions SET title = COALESCE(?3, title) \
+                 WHERE source_id = ?1 AND action_id = ?2",
+                params![source.source_id, action.action_id, action.title],
+            )?;
+            anyhow::ensure!(
+                updated == 1,
+                "unknown knowledge action override: {}.{}",
+                source.source_id,
+                action.action_id
+            );
+        }
+    }
+    transaction
+        .commit()
+        .context("commit knowledge source overrides")?;
+    Ok(())
+}
+
 fn catalog_path() -> Option<PathBuf> {
     std::env::var_os("OPENAB_KNOWLEDGE_DB")
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+}
+
+fn source_overrides_path() -> Option<PathBuf> {
+    std::env::var_os("OPENAB_KNOWLEDGE_SOURCES_FILE")
         .filter(|value| !value.is_empty())
         .map(PathBuf::from)
 }
@@ -501,10 +702,7 @@ mod tests {
         assert_eq!(catalog.sources_by_kind("scheduled").len(), 3);
         assert_eq!(catalog.sources_by_kind("side_project").len(), 2);
         let reading = catalog.source("personal_reading_list").unwrap();
-        assert_eq!(
-            reading.data_source_id,
-            "collection://example-reading-list"
-        );
+        assert_eq!(reading.data_source_id, "collection://example-reading-list");
         assert!(reading
             .fields
             .iter()
@@ -541,7 +739,9 @@ mod tests {
             .find(|source| source.source_id == "world_stories")
             .unwrap();
         let synthesis = world.action("synthesis").unwrap();
-        assert!(synthesis.prompt_template.contains("synthesis card contract"));
+        assert!(synthesis
+            .prompt_template
+            .contains("synthesis card contract"));
         assert!(synthesis.prompt_template.contains("不要 Markdown table"));
         let reading = catalog.source("personal_reading_list").unwrap();
         let overview = reading.action("overview").unwrap();
@@ -616,5 +816,89 @@ mod tests {
             .contains("capture_preview card contract"));
         assert!(catalog.global_action("capture_confirm").is_some());
         assert!(catalog.global_action("capture_cancel").is_some());
+    }
+
+    #[test]
+    fn source_override_file_supports_legacy_keys_fields_and_actions() {
+        let parsed: KnowledgeSourceOverrides = toml::from_str(
+            r#"
+[[sources]]
+source_id = "project_notes_alpha"
+previous_source_ids = ["private-project-key"]
+title = "Private Project"
+config_json = '{"notion_project":"Private Project"}'
+
+[[sources.fields]]
+logical_name = "project"
+options_json = '["Private Project"]'
+
+[[sources.actions]]
+action_id = "recent"
+title = "Private Project｜Recent"
+"#,
+        )
+        .unwrap();
+
+        assert_eq!(parsed.sources.len(), 1);
+        assert_eq!(
+            parsed.sources[0].previous_source_ids,
+            ["private-project-key"]
+        );
+        assert_eq!(parsed.sources[0].fields[0].logical_name, "project");
+        assert_eq!(parsed.sources[0].actions[0].action_id, "recent");
+    }
+
+    #[test]
+    fn source_override_adopts_a_private_legacy_source_key() {
+        let dir = tempfile::tempdir().unwrap();
+        let database_path = dir.path().join("knowledge.db");
+        let override_path = dir.path().join("knowledge-sources.toml");
+        KnowledgeCatalog::open_or_seed_with_overrides(Some(&database_path), None).unwrap();
+
+        let connection = Connection::open(&database_path).unwrap();
+        connection
+            .execute_batch("PRAGMA foreign_keys = OFF;")
+            .unwrap();
+        for table in [
+            "knowledge_fields",
+            "knowledge_actions",
+            "knowledge_action_inputs",
+        ] {
+            connection
+                .execute(
+                    &format!("UPDATE {table} SET source_id = 'legacy-project-key' WHERE source_id = 'project_notes_alpha'"),
+                    [],
+                )
+                .unwrap();
+        }
+        connection
+            .execute(
+                "UPDATE knowledge_sources SET source_id = 'legacy-project-key' WHERE source_id = 'project_notes_alpha'",
+                [],
+            )
+            .unwrap();
+        drop(connection);
+
+        std::fs::write(
+            &override_path,
+            r#"
+[[sources]]
+source_id = "project_notes_alpha"
+previous_source_ids = ["legacy-project-key"]
+title = "Private Project"
+"#,
+        )
+        .unwrap();
+
+        let catalog = KnowledgeCatalog::open_or_seed_with_overrides(
+            Some(&database_path),
+            Some(&override_path),
+        )
+        .unwrap();
+        let project = catalog.source("project_notes_alpha").unwrap();
+        assert_eq!(project.title, "Private Project");
+        assert!(!project.fields.is_empty());
+        assert!(!project.actions.is_empty());
+        assert!(catalog.source("legacy-project-key").is_none());
     }
 }

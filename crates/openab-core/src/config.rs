@@ -601,6 +601,9 @@ pub struct DiscordAdminControlConfig {
     /// Environment variable read by the broker process. Agent subprocesses
     /// cannot inherit it because ACP spawning uses `env_clear()`.
     pub token_env: Option<String>,
+    /// Permit bearer-token requests over HTTP on an explicitly trusted private network.
+    #[serde(default)]
+    pub allow_insecure_http: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
@@ -962,6 +965,10 @@ fn validate_discord_admin_control(
     anyhow::ensure!(
         matches!(url.scheme(), "http" | "https"),
         "discord.admin_control.url must use http or https"
+    );
+    anyhow::ensure!(
+        url.scheme() == "https" || config.allow_insecure_http,
+        "discord.admin_control.url must use https unless allow_insecure_http=true"
     );
     anyhow::ensure!(
         url.username().is_empty() && url.password().is_none(),
@@ -3144,6 +3151,7 @@ bot_token = "token"
 [discord.admin_control]
 url = "http://discord-admin:8787"
 token_file = "/run/secrets/discord-admin-control-token"
+allow_insecure_http = true
 "#,
             "test",
         )
@@ -3168,6 +3176,7 @@ bot_token = "token"
 [discord.admin_control]
 url = "http://user:password@discord-admin:8787"
 token_file = "/run/secrets/token"
+allow_insecure_http = true
 "#,
             "test",
         )
@@ -3186,6 +3195,7 @@ bot_token = "token"
 [discord.admin_control]
 url = "http://discord-admin:8787"
 token_env = "DISCORD_ADMIN_CONTROL_TOKEN"
+allow_insecure_http = true
 "#,
             "test",
         )
@@ -3197,6 +3207,24 @@ token_env = "DISCORD_ADMIN_CONTROL_TOKEN"
             Some("DISCORD_ADMIN_CONTROL_TOKEN")
         );
         assert!(control.token_file.is_none());
+    }
+
+    #[test]
+    fn discord_admin_control_requires_explicit_insecure_http_opt_in() {
+        let error = parse_config_str(
+            r#"
+[discord]
+bot_token = "token"
+
+[discord.admin_control]
+url = "http://discord-admin:8787"
+token_env = "DISCORD_ADMIN_CONTROL_TOKEN"
+"#,
+            "test",
+        )
+        .expect_err("plain HTTP must require an explicit private-network opt-in");
+
+        assert!(error.to_string().contains("allow_insecure_http=true"));
     }
 
     #[test]
