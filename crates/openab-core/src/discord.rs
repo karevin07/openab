@@ -808,10 +808,25 @@ const KNOWLEDGE_CARD_NEXT_STEP_MAX: usize = 160;
 const KNOWLEDGE_CARD_URL_MAX: usize = 200;
 const KNOWLEDGE_EMBED_DESCRIPTION_MAX: usize = 4096;
 const KNOWLEDGE_MESSAGE_CONTENT_MAX: usize = 1900;
+const KNOWLEDGE_RESULTS_MAX: usize = 25;
+const KNOWLEDGE_RESULTS_PAGE_SIZE: usize = 5;
+const KNOWLEDGE_PAGINATION_TTL: std::time::Duration = std::time::Duration::from_secs(30 * 60);
+const KNOWLEDGE_PAGINATION_CACHE_MAX: usize = 256;
 
 /// Channel → Discord user who last submitted a Knowledge prompt in that thread.
-/// Used to bind `capture_preview` confirm/cancel buttons to the initiator.
+/// Used to bind `capture_preview` and pagination controls to the initiator.
 static KNOWLEDGE_CAPTURE_OWNERS: LazyLock<Mutex<HashMap<u64, u64>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
+#[derive(Clone)]
+struct KnowledgePaginationEntry {
+    envelope: KnowledgeCardEnvelope,
+    channel_id: u64,
+    owner_id: Option<u64>,
+    created_at: std::time::Instant,
+}
+
+static KNOWLEDGE_PAGINATION: LazyLock<Mutex<HashMap<u64, KnowledgePaginationEntry>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 
 fn remember_knowledge_capture_owner(channel_id: u64, user_id: u64) {
@@ -843,13 +858,53 @@ fn clear_knowledge_capture_owner(channel_id: u64) {
     }
 }
 
+fn remember_knowledge_pagination(
+    message_id: u64,
+    channel_id: u64,
+    owner_id: Option<u64>,
+    envelope: KnowledgeCardEnvelope,
+) {
+    let now = std::time::Instant::now();
+    let mut entries = KNOWLEDGE_PAGINATION
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    entries.retain(|_, entry| now.duration_since(entry.created_at) < KNOWLEDGE_PAGINATION_TTL);
+    if entries.len() >= KNOWLEDGE_PAGINATION_CACHE_MAX {
+        if let Some(oldest) = entries
+            .iter()
+            .min_by_key(|(_, entry)| entry.created_at)
+            .map(|(message_id, _)| *message_id)
+        {
+            entries.remove(&oldest);
+        }
+    }
+    entries.insert(
+        message_id,
+        KnowledgePaginationEntry {
+            envelope,
+            channel_id,
+            owner_id,
+            created_at: now,
+        },
+    );
+}
+
+fn knowledge_pagination(message_id: u64) -> Option<KnowledgePaginationEntry> {
+    let now = std::time::Instant::now();
+    let mut entries = KNOWLEDGE_PAGINATION
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    entries.retain(|_, entry| now.duration_since(entry.created_at) < KNOWLEDGE_PAGINATION_TTL);
+    entries.get(&message_id).cloned()
+}
+
 fn knowledge_cards_marker_present(content: &str) -> bool {
     content
         .lines()
         .any(|line| line.trim() == KNOWLEDGE_CARDS_PREFIX)
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize)]
 struct KnowledgeCardEnvelope {
     kind: String,
     heading: String,
@@ -860,7 +915,7 @@ struct KnowledgeCardEnvelope {
     items: Vec<KnowledgeCardItem>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize)]
 struct KnowledgeCardItem {
     title: String,
     url: String,
@@ -906,10 +961,28 @@ struct ComponentsV2MessageReference {
 #[derive(Debug, Serialize)]
 #[serde(untagged)]
 enum ComponentsV2Component {
+    ActionRow(ComponentsV2ActionRow),
     Container(ComponentsV2Container),
     Section(ComponentsV2Section),
     Text(ComponentsV2Text),
     Separator(ComponentsV2Separator),
+}
+
+#[derive(Debug, Serialize)]
+struct ComponentsV2ActionRow {
+    #[serde(rename = "type")]
+    component_type: u8,
+    components: Vec<ComponentsV2Button>,
+}
+
+#[derive(Debug, Serialize)]
+struct ComponentsV2Button {
+    #[serde(rename = "type")]
+    component_type: u8,
+    style: u8,
+    label: String,
+    custom_id: String,
+    disabled: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -1022,7 +1095,15 @@ fn parse_and_validate_knowledge_cards(
     content: &str,
 ) -> Option<(KnowledgeCardEnvelope, Option<&'static KnowledgeSource>)> {
     let envelope = parse_knowledge_card_envelope(content)?;
-    if envelope.items.is_empty() || envelope.items.len() > 5 {
+    let max_items = if matches!(
+        envelope.kind.as_str(),
+        "search" | "synthesis" | "project_notes"
+    ) {
+        KNOWLEDGE_RESULTS_MAX
+    } else {
+        KNOWLEDGE_RESULTS_PAGE_SIZE
+    };
+    if envelope.items.is_empty() || envelope.items.len() > max_items {
         return None;
     }
     if envelope.kind != "search"
@@ -1127,12 +1208,27 @@ fn knowledge_components_v2_message(
     reply_to_message_id: Option<u64>,
 ) -> Option<ComponentsV2Message> {
     let (envelope, _) = parse_and_validate_knowledge_cards(content)?;
+    knowledge_components_v2_page_message(&envelope, channel_id, reply_to_message_id, 0)
+}
+
+fn knowledge_components_v2_page_message(
+    envelope: &KnowledgeCardEnvelope,
+    channel_id: u64,
+    reply_to_message_id: Option<u64>,
+    page: usize,
+) -> Option<ComponentsV2Message> {
     if !matches!(
         envelope.kind.as_str(),
         "search" | "synthesis" | "project_notes"
     ) {
         return None;
     }
+    let page_count = envelope.items.len().div_ceil(KNOWLEDGE_RESULTS_PAGE_SIZE);
+    if page >= page_count {
+        return None;
+    }
+    let page_start = page * KNOWLEDGE_RESULTS_PAGE_SIZE;
+    let page_end = (page_start + KNOWLEDGE_RESULTS_PAGE_SIZE).min(envelope.items.len());
 
     let accent_color = match envelope.kind.as_str() {
         "project_notes" => 0x57F287,
@@ -1155,10 +1251,11 @@ fn knowledge_components_v2_message(
     }
     card_components.push(components_v2_separator());
 
-    for (index, item) in envelope.items.iter().enumerate() {
-        if index > 0 {
+    for (page_index, item) in envelope.items[page_start..page_end].iter().enumerate() {
+        if page_index > 0 {
             card_components.push(components_v2_separator());
         }
+        let index = page_start + page_index;
         let title =
             escape_markdown_link_text(&truncate_chars(item.title.trim(), KNOWLEDGE_CARD_TITLE_MAX));
         let mut item_content = format!("### {:02} · {}", index + 1, suppress_mentions(&title));
@@ -1197,10 +1294,45 @@ fn knowledge_components_v2_message(
     }
 
     card_components.push(components_v2_separator());
-    card_components.push(components_v2_text(format!(
-        "-# Knowledge · {} 筆",
-        envelope.items.len()
-    )));
+    let footer = if page_count > 1 {
+        format!(
+            "-# Knowledge · 共 {} 筆 · 第 {} / {} 頁",
+            envelope.items.len(),
+            page + 1,
+            page_count
+        )
+    } else {
+        format!("-# Knowledge · {} 筆", envelope.items.len())
+    };
+    card_components.push(components_v2_text(footer));
+    if page_count > 1 {
+        card_components.push(ComponentsV2Component::ActionRow(ComponentsV2ActionRow {
+            component_type: 1,
+            components: vec![
+                ComponentsV2Button {
+                    component_type: 2,
+                    style: 2,
+                    label: "◀ 上一頁".to_string(),
+                    custom_id: format!("oab_knowledge_page:{}", page.saturating_sub(1)),
+                    disabled: page == 0,
+                },
+                ComponentsV2Button {
+                    component_type: 2,
+                    style: 2,
+                    label: format!("{} / {}", page + 1, page_count),
+                    custom_id: format!("oab_knowledge_page:status:{page}"),
+                    disabled: true,
+                },
+                ComponentsV2Button {
+                    component_type: 2,
+                    style: 2,
+                    label: "下一頁 ▶".to_string(),
+                    custom_id: format!("oab_knowledge_page:{}", (page + 1).min(page_count - 1)),
+                    disabled: page + 1 == page_count,
+                },
+            ],
+        }));
+    }
 
     Some(ComponentsV2Message {
         flags: DISCORD_COMPONENTS_V2_FLAG,
@@ -3879,6 +4011,22 @@ impl DiscordAdapter {
                 .body(Some(body)),
             )
             .await?;
+        if let Some(envelope) = validated.filter(|envelope| {
+            envelope.items.len() > KNOWLEDGE_RESULTS_PAGE_SIZE
+                && matches!(
+                    envelope.kind.as_str(),
+                    "search" | "synthesis" | "project_notes"
+                )
+        }) {
+            if let Ok(message_id) = created.id.parse::<u64>() {
+                remember_knowledge_pagination(
+                    message_id,
+                    channel_id,
+                    knowledge_capture_owner(channel_id),
+                    envelope,
+                );
+            }
+        }
         Ok(Some(created.id))
     }
 
@@ -4931,6 +5079,10 @@ impl EventHandler for Handler {
             return;
         }
 
+        if agent_presentation().knowledge_ui_enabled && !msg.author.bot {
+            remember_knowledge_capture_owner(msg.channel_id.get(), msg.author.id.get());
+        }
+
         let adapter = self.discord_adapter(&ctx);
 
         let channel_id = msg.channel_id.get();
@@ -5747,6 +5899,11 @@ impl EventHandler for Handler {
             }
             Interaction::Component(comp) if comp.data.custom_id.starts_with("oab_task:") => {
                 self.handle_task_control(&ctx, &comp).await;
+            }
+            Interaction::Component(comp)
+                if comp.data.custom_id.starts_with("oab_knowledge_page:") =>
+            {
+                self.handle_knowledge_page_component(&ctx, &comp).await;
             }
             Interaction::Component(comp) if comp.data.custom_id.starts_with("oab_knowledge:") => {
                 self.handle_knowledge_component(&ctx, &comp).await;
@@ -6900,7 +7057,7 @@ impl Handler {
         title: &str,
         prompt: String,
         preview: Option<&str>,
-        bind_capture_owner: bool,
+        _bind_capture_owner: bool,
     ) -> Result<u64, String> {
         let title = truncate_for_discord(title.trim(), 100);
         let parent_id = scope
@@ -6953,9 +7110,9 @@ impl Handler {
 
         // Keep the agent prompt out of Discord; show only the short action label
         // (plus optional modal fields passed via `preview`).
-        if bind_capture_owner {
-            remember_knowledge_capture_owner(target_id, user.id.get());
-        }
+        // Bind both write-confirmation and read-only pagination controls to the
+        // user who launched the Knowledge request.
+        remember_knowledge_capture_owner(target_id, user.id.get());
         let ahead = self
             .dispatcher
             .active_messages("discord", &target_id.to_string())
@@ -7027,6 +7184,127 @@ impl Handler {
             }
         });
         Ok(target_id)
+    }
+
+    async fn handle_knowledge_page_component(
+        &self,
+        ctx: &Context,
+        comp: &serenity::model::application::ComponentInteraction,
+    ) {
+        let page = comp
+            .data
+            .custom_id
+            .strip_prefix("oab_knowledge_page:")
+            .and_then(|value| value.parse::<usize>().ok());
+        let Some(page) = page else {
+            let _ = comp
+                .create_response(
+                    &ctx.http,
+                    CreateInteractionResponse::Message(
+                        CreateInteractionResponseMessage::new()
+                            .content("⚠️ 這個分頁操作已失效，請重新查詢。")
+                            .ephemeral(true),
+                    ),
+                )
+                .await;
+            return;
+        };
+
+        let Some(entry) = knowledge_pagination(comp.message.id.get()) else {
+            let _ = comp
+                .create_response(
+                    &ctx.http,
+                    CreateInteractionResponse::Message(
+                        CreateInteractionResponseMessage::new()
+                            .content("⌛ 這份查詢結果已逾時，請重新查詢以取得最新資料。")
+                            .ephemeral(true),
+                    ),
+                )
+                .await;
+            return;
+        };
+        if entry.channel_id != comp.channel_id.get() {
+            let _ = comp
+                .create_response(
+                    &ctx.http,
+                    CreateInteractionResponse::Message(
+                        CreateInteractionResponseMessage::new()
+                            .content("⚠️ 這個分頁操作不屬於目前頻道。")
+                            .ephemeral(true),
+                    ),
+                )
+                .await;
+            return;
+        }
+        if entry
+            .owner_id
+            .is_some_and(|owner_id| owner_id != comp.user.id.get())
+        {
+            let _ = comp
+                .create_response(
+                    &ctx.http,
+                    CreateInteractionResponse::Message(
+                        CreateInteractionResponseMessage::new()
+                            .content("🔒 只有這次查詢的發起人可以切換頁面。")
+                            .ephemeral(true),
+                    ),
+                )
+                .await;
+            return;
+        }
+        let Some(payload) = knowledge_components_v2_page_message(
+            &entry.envelope,
+            entry.channel_id,
+            None,
+            page,
+        ) else {
+            let _ = comp
+                .create_response(
+                    &ctx.http,
+                    CreateInteractionResponse::Message(
+                        CreateInteractionResponseMessage::new()
+                            .content("⚠️ 找不到這一頁，請重新查詢。")
+                            .ephemeral(true),
+                    ),
+                )
+                .await;
+            return;
+        };
+
+        if let Err(error) = comp.defer(&ctx.http).await {
+            tracing::error!(%error, "failed to acknowledge knowledge pagination");
+            return;
+        }
+        let result = match serde_json::to_vec(&payload) {
+            Ok(body) => {
+                ctx.http
+                    .fire::<ComponentsV2CreatedMessage>(
+                        Request::new(
+                            Route::ChannelMessage {
+                                channel_id: comp.channel_id,
+                                message_id: comp.message.id,
+                            },
+                            LightMethod::Patch,
+                        )
+                        .body(Some(body)),
+                    )
+                    .await
+                    .map(|_| ())
+                    .map_err(anyhow::Error::from)
+            }
+            Err(error) => Err(anyhow::Error::from(error)),
+        };
+        if let Err(error) = result {
+            tracing::error!(%error, page, message_id = %comp.message.id, "failed to update knowledge result page");
+            let _ = comp
+                .create_followup(
+                    &ctx.http,
+                    CreateInteractionResponseFollowup::new()
+                        .content("⚠️ 無法切換頁面，請稍後再試。")
+                        .ephemeral(true),
+                )
+                .await;
+        }
     }
 
     async fn handle_knowledge_component(
@@ -13031,6 +13309,70 @@ mod tests {
         assert!(serialized.contains("https://www.notion.so/example-retention-queue"));
         assert!(serialized.contains("Knowledge · 1 筆"));
         assert!(serialized.contains("\"style\":5"));
+    }
+
+    #[test]
+    fn knowledge_result_cards_paginate_five_items_per_page() {
+        let items = (1..=12)
+            .map(|index| {
+                serde_json::json!({
+                    "title": format!("Book {index}"),
+                    "url": format!("https://app.notion.com/p/{index:032x}"),
+                    "meta": "Business｜To Read",
+                    "summary": format!("Reason {index}")
+                })
+            })
+            .collect::<Vec<_>>();
+        let payload = format!(
+            "{KNOWLEDGE_CARDS_PREFIX}\n{}",
+            serde_json::json!({
+                "kind": "search",
+                "heading": "Reading List｜商業類推薦",
+                "items": items
+            })
+        );
+        assert!(knowledge_cards_payload_is_valid(&payload));
+        let (envelope, _) = parse_and_validate_knowledge_cards(&payload).unwrap();
+
+        let first = serde_json::to_value(
+            knowledge_components_v2_page_message(&envelope, 99, None, 0).unwrap(),
+        )
+        .unwrap()
+        .to_string();
+        assert!(first.contains("01 · Book 1"));
+        assert!(first.contains("05 · Book 5"));
+        assert!(!first.contains("06 · Book 6"));
+        assert!(first.contains("共 12 筆 · 第 1 / 3 頁"));
+        assert!(first.contains("oab_knowledge_page:1"));
+        assert!(first.contains("下一頁 ▶"));
+
+        let second = serde_json::to_value(
+            knowledge_components_v2_page_message(&envelope, 99, None, 1).unwrap(),
+        )
+        .unwrap()
+        .to_string();
+        assert!(second.contains("06 · Book 6"));
+        assert!(second.contains("10 · Book 10"));
+        assert!(!second.contains("11 · Book 11"));
+        assert!(second.contains("共 12 筆 · 第 2 / 3 頁"));
+        assert!(second.contains("oab_knowledge_page:0"));
+        assert!(second.contains("oab_knowledge_page:2"));
+
+        assert!(knowledge_components_v2_page_message(&envelope, 99, None, 3).is_none());
+
+        let too_many = (1..=26)
+            .map(|index| {
+                serde_json::json!({
+                    "title": format!("Book {index}"),
+                    "url": format!("https://app.notion.com/p/{index:032x}")
+                })
+            })
+            .collect::<Vec<_>>();
+        let invalid = format!(
+            "{KNOWLEDGE_CARDS_PREFIX}\n{}",
+            serde_json::json!({"kind": "search", "heading": "Too many", "items": too_many})
+        );
+        assert!(!knowledge_cards_payload_is_valid(&invalid));
     }
 
     #[test]

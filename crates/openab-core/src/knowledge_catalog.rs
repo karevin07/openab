@@ -17,6 +17,7 @@ const MIGRATION_0004: &str = include_str!("../migrations/0004_knowledge_synthesi
 const MIGRATION_0005: &str = include_str!("../migrations/0005_knowledge_reading_overview_cards.sql");
 const MIGRATION_0006: &str = include_str!("../migrations/0006_knowledge_capture_preview_cards.sql");
 const MIGRATION_0007: &str = include_str!("../migrations/0007_knowledge_search_prompt_tighten.sql");
+const MIGRATION_0008: &str = include_str!("../migrations/0008_knowledge_result_pagination.sql");
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct KnowledgeField {
@@ -229,6 +230,7 @@ impl KnowledgeCatalog {
             (5, MIGRATION_0005),
             (6, MIGRATION_0006),
             (7, MIGRATION_0007),
+            (8, MIGRATION_0008),
         ] {
             let applied = connection
                 .query_row(
@@ -528,7 +530,8 @@ mod tests {
         assert!(recent.contains("search card contract"));
         assert!(recent.contains("不要輸出 Markdown table"));
         let search = catalog.global_prompt("search").unwrap();
-        assert!(search.contains("1 至 5 筆搜尋結果"));
+        assert!(search.contains("1 至 25 筆搜尋結果"));
+        assert!(search.contains("自動分頁"));
         assert!(search.contains("必須嚴格以 search card contract"));
         assert!(search.contains("不要編號清單文字"));
         assert!(search.contains("跨頁推論或長篇綜合分析"));
@@ -585,7 +588,7 @@ mod tests {
                 row.get(0)
             })
             .unwrap();
-        assert_eq!(version, 7);
+        assert_eq!(version, 8);
         let world = catalog
             .sources
             .iter()
