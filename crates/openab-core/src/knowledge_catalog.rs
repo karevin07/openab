@@ -21,6 +21,7 @@ const MIGRATION_0006: &str = include_str!("../migrations/0006_knowledge_capture_
 const MIGRATION_0007: &str = include_str!("../migrations/0007_knowledge_search_prompt_tighten.sql");
 const MIGRATION_0008: &str = include_str!("../migrations/0008_knowledge_result_pagination.sql");
 const MIGRATION_0009: &str = include_str!("../migrations/0009_knowledge_weekly_audit.sql");
+const MIGRATION_0010: &str = include_str!("../migrations/0010_retention_job_reporting.sql");
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -282,6 +283,7 @@ impl KnowledgeCatalog {
             (7, MIGRATION_0007),
             (8, MIGRATION_0008),
             (9, MIGRATION_0009),
+            (10, MIGRATION_0010),
         ] {
             let applied = connection
                 .query_row(
@@ -725,6 +727,10 @@ mod tests {
             .global_prompt("retention_scan")
             .unwrap()
             .contains("grace_days: 7"));
+        assert!(catalog
+            .global_prompt("retention_scan")
+            .unwrap()
+            .contains("opencode-scheduled-source-retention"));
         let recent = catalog.global_prompt("recent").unwrap();
         assert!(recent.contains("discord-cards.md"));
         assert!(recent.contains("search card contract"));
@@ -790,7 +796,7 @@ mod tests {
                 row.get(0)
             })
             .unwrap();
-        assert_eq!(version, 9);
+        assert_eq!(version, 10);
         let world = catalog
             .sources
             .iter()

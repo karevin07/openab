@@ -1998,6 +1998,7 @@ async fn main() -> anyhow::Result<()> {
             cron_sticky_path: Some(cron_sticky_path.clone()),
             admin_control,
             admin_reporter,
+            inventory_reporter_started: std::sync::atomic::AtomicBool::new(false),
             git_push_broker,
         };
 

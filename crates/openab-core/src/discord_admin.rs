@@ -63,6 +63,66 @@ pub struct KnowledgeWeeklyItem {
     pub created_at: String,
 }
 
+#[derive(Debug, Clone, Serialize)]
+pub struct SessionInventoryItem {
+    pub thread_id: u64,
+    pub state: String,
+    pub last_activity_at: String,
+    pub queued_messages: usize,
+    pub prompt_in_flight: bool,
+    pub externally_detached: bool,
+    pub title: String,
+    pub workspace_alias: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ScheduledJobRun {
+    pub job_id: String,
+    pub run_id: String,
+    pub started_at: String,
+    pub finished_at: String,
+    pub status: String,
+    pub metrics: RetentionJobMetrics,
+    #[serde(default)]
+    pub note: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RetentionJobMetrics {
+    pub sources_scanned: u32,
+    pub items_scanned: u32,
+    pub protected_items: u32,
+    pub enqueued_items: u32,
+    pub pending_items: u32,
+    pub trash_due_items: u32,
+    pub trashed_items: u32,
+    pub failed_items: u32,
+}
+
+#[derive(Serialize)]
+struct ScheduledJobRunRequest<'a> {
+    source_id: &'a str,
+    job_id: &'a str,
+    run_id: &'a str,
+    started_at: &'a str,
+    finished_at: &'a str,
+    status: &'a str,
+    metrics: &'a RetentionJobMetrics,
+    note: &'a str,
+}
+
+#[derive(Serialize)]
+struct SessionInventoryRequest {
+    source_id: String,
+    snapshot_id: String,
+    generated_at: String,
+    complete: bool,
+    error: String,
+    sessions: Vec<SessionInventoryItem>,
+}
+
 #[derive(Serialize)]
 struct KnowledgeWeeklyRequest<'a> {
     reporter_source_id: &'a str,
@@ -89,6 +149,10 @@ struct SessionEventRequest<'a> {
 }
 
 impl DiscordAdminReporter {
+    pub fn source_id(&self) -> &str {
+        &self.source_id
+    }
+
     pub fn from_env() -> Result<Option<Self>> {
         let token = match std::env::var("DISCORD_ADMIN_REPORT_TOKEN") {
             Ok(value) if !value.trim().is_empty() => value.trim().to_string(),
@@ -194,6 +258,129 @@ impl DiscordAdminReporter {
         );
         Ok(())
     }
+
+    pub async fn report_session_inventory(
+        &self,
+        mut sessions: Vec<SessionInventoryItem>,
+        complete: bool,
+        error: &str,
+    ) -> Result<()> {
+        anyhow::ensure!(
+            matches!(self.source_id.as_str(), "coding" | "knowledge"),
+            "session inventory source must be coding or knowledge"
+        );
+        anyhow::ensure!(sessions.len() <= 500, "session inventory is too large");
+        anyhow::ensure!(
+            (complete && error.trim().is_empty()) || (!complete && !error.trim().is_empty()),
+            "session inventory completeness and error are inconsistent"
+        );
+        for session in &mut sessions {
+            if !self.include_title {
+                session.title.clear();
+            }
+            if !self.include_workspace_alias {
+                session.workspace_alias.clear();
+            }
+        }
+        let generated_at = chrono::Utc::now().to_rfc3339();
+        let sequence = REPORT_EVENT_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+        let body = SessionInventoryRequest {
+            source_id: self.source_id.clone(),
+            snapshot_id: format!("{}:{generated_at}:{sequence}", self.source_id),
+            generated_at,
+            complete,
+            error: error.trim().chars().take(300).collect(),
+            sessions,
+        };
+        let response = self
+            .http
+            .post(format!("{}/v1/telemetry/session-inventory", self.base_url))
+            .bearer_auth(&self.token)
+            .json(&body)
+            .send()
+            .await?;
+        anyhow::ensure!(
+            response.status().is_success(),
+            "Discord Admin session inventory endpoint returned {}",
+            response.status()
+        );
+        Ok(())
+    }
+
+    pub async fn report_scheduled_job_run(&self, run: &ScheduledJobRun) -> Result<()> {
+        anyhow::ensure!(
+            self.source_id == "knowledge",
+            "only the knowledge reporter may submit scheduled job runs"
+        );
+        validate_scheduled_job_run(run)?;
+        let body = ScheduledJobRunRequest {
+            source_id: &self.source_id,
+            job_id: &run.job_id,
+            run_id: &run.run_id,
+            started_at: &run.started_at,
+            finished_at: &run.finished_at,
+            status: &run.status,
+            metrics: &run.metrics,
+            note: &run.note,
+        };
+        let response = self
+            .http
+            .post(format!("{}/v1/telemetry/scheduled-job-runs", self.base_url))
+            .bearer_auth(&self.token)
+            .json(&body)
+            .send()
+            .await?;
+        anyhow::ensure!(
+            response.status().is_success(),
+            "Discord Admin scheduled job endpoint returned {}",
+            response.status()
+        );
+        Ok(())
+    }
+}
+
+pub fn validate_scheduled_job_run(run: &ScheduledJobRun) -> Result<()> {
+    anyhow::ensure!(
+        run.job_id == "opencode-scheduled-source-retention",
+        "unsupported scheduled job ID"
+    );
+    anyhow::ensure!(
+        !run.run_id.trim().is_empty() && run.run_id.len() <= 160,
+        "invalid scheduled job run ID"
+    );
+    let started = chrono::DateTime::parse_from_rfc3339(&run.started_at)
+        .context("invalid scheduled job started_at")?;
+    let finished = chrono::DateTime::parse_from_rfc3339(&run.finished_at)
+        .context("invalid scheduled job finished_at")?;
+    anyhow::ensure!(
+        finished >= started && finished.signed_duration_since(started) <= chrono::Duration::hours(6),
+        "invalid scheduled job duration"
+    );
+    anyhow::ensure!(
+        matches!(run.status.as_str(), "success" | "partial" | "failed"),
+        "invalid scheduled job status"
+    );
+    anyhow::ensure!(
+        run.note.chars().count() <= 300,
+        "scheduled job note is too long"
+    );
+    anyhow::ensure!(
+        run.metrics.sources_scanned <= 3,
+        "scheduled retention job supports exactly three sources"
+    );
+    anyhow::ensure!(
+        run.status != "success" || run.metrics.sources_scanned == 3,
+        "successful retention job must scan all three sources"
+    );
+    anyhow::ensure!(
+        run.status != "success" || run.metrics.failed_items == 0,
+        "successful scheduled job cannot contain failed items"
+    );
+    anyhow::ensure!(
+        run.status == "success" || !run.note.trim().is_empty(),
+        "partial or failed scheduled job requires a note"
+    );
+    Ok(())
 }
 
 pub fn knowledge_weekly_marker_present(content: &str) -> bool {
@@ -1038,5 +1225,40 @@ OPENAB_KNOWLEDGE_WEEKLY_V1
 "#;
 
         assert!(parse_knowledge_weekly_audit(payload).is_err());
+    }
+
+    #[test]
+    fn scheduled_job_contract_requires_truthful_status_and_note() {
+        let mut run = ScheduledJobRun {
+            job_id: "opencode-scheduled-source-retention".into(),
+            run_id: "retention-2026-08-30".into(),
+            started_at: "2026-08-30T03:00:00+08:00".into(),
+            finished_at: "2026-08-30T03:12:00+08:00".into(),
+            status: "success".into(),
+            metrics: RetentionJobMetrics {
+                sources_scanned: 3,
+                items_scanned: 120,
+                protected_items: 4,
+                enqueued_items: 5,
+                pending_items: 8,
+                trash_due_items: 2,
+                trashed_items: 0,
+                failed_items: 0,
+            },
+            note: "Trash API unavailable; due targets were left unchanged.".into(),
+        };
+        assert!(validate_scheduled_job_run(&run).is_ok());
+
+        run.metrics.failed_items = 1;
+        assert!(validate_scheduled_job_run(&run).is_err());
+        run.status = "partial".into();
+        run.note.clear();
+        assert!(validate_scheduled_job_run(&run).is_err());
+
+        run.status = "success".into();
+        run.metrics.failed_items = 0;
+        run.metrics.sources_scanned = 2;
+        run.note = "one source was skipped".into();
+        assert!(validate_scheduled_job_run(&run).is_err());
     }
 }

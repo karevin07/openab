@@ -113,12 +113,24 @@ requires `DISCORD_ADMIN_REPORT_ALLOW_INSECURE_HTTP=true`. Use
 are omitted unless `OPENAB_REPORT_INCLUDE_TITLE=true` and
 `OPENAB_REPORT_INCLUDE_WORKSPACE_ALIAS=true` are explicitly set.
 
+When reporting is enabled, each Discord worker submits a complete retained-session inventory after
+Discord becomes ready and every six hours thereafter. The payload contains only thread ID, bounded
+state/activity metadata, queue/in-flight/handoff flags, and the optional privacy-gated labels above.
+Admin Bot uses fresh, complete snapshots for read-only stale-session suggestions; the reporting
+client cannot close sessions.
+
 When `OPENAB_REPORT_SOURCE_ID=knowledge`, a cron-backed knowledge action may return the
 `OPENAB_KNOWLEDGE_WEEKLY_V1` contract. The Discord adapter validates its seven-day window, exact
 configured scheduled-source set, status semantics, URLs, unique page IDs, and item `created_at`
 timestamps before forwarding it to `/v1/telemetry/knowledge-weekly`. The raw JSON is never posted to
 Discord; the knowledge channel receives only a delivery acknowledgement. Mentioning report owners
 remains the Admin Bot's responsibility.
+
+The Knowledge retention cron may additionally include a validated `job_run` object in an
+`OPENAB_KNOWLEDGE_CARDS_V1` retention envelope. OpenAB forwards its fixed counters to
+`/v1/telemetry/scheduled-job-runs`. `trash_due_items` means the grace period elapsed, while
+`trashed_items` means the source page was actually moved to trash; these values must not be merged.
+An empty retention result remains reportable with `items: []` when `job_run` is present.
 
 ### `[[discord.project_actions]]`
 

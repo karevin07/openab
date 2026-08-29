@@ -14,8 +14,9 @@ use crate::cron::{job_applies_to_project, next_run_unix, sticky_thread_id_for, C
 // Only the client stays here; every admin card, modal and handler now lives in
 // `discord_admin_ui`, which owns the wire types it renders.
 use crate::discord_admin::{
-    knowledge_weekly_marker_present, parse_knowledge_weekly_audit, DiscordAdminClient,
-    DiscordAdminReporter, KnowledgeWeeklyAudit,
+    knowledge_weekly_marker_present, parse_knowledge_weekly_audit, validate_scheduled_job_run,
+    DiscordAdminClient, DiscordAdminReporter, KnowledgeWeeklyAudit, ScheduledJobRun,
+    SessionInventoryItem,
 };
 // Help and the session-control card both render the Session Manager; the card
 // itself and the handoff-state rule live with the rest of that flow.
@@ -61,7 +62,7 @@ use serenity::model::application::{
     InputTextStyle, Interaction,
 };
 use serenity::model::channel::{
-    AutoArchiveDuration, ChannelType, Message, MessageType, PermissionOverwrite,
+    AutoArchiveDuration, Channel, ChannelType, Message, MessageType, PermissionOverwrite,
     PermissionOverwriteType, Reaction, ReactionType,
 };
 use serenity::model::gateway::Ready;
@@ -70,6 +71,7 @@ use serenity::model::permissions::Permissions;
 use serenity::prelude::*;
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::LazyLock;
 use std::sync::{Arc, Mutex, OnceLock};
 use tracing::{debug, error, info, warn};
@@ -915,6 +917,8 @@ struct KnowledgeCardEnvelope {
     overview: String,
     #[serde(default)]
     project_id: String,
+    #[serde(default)]
+    job_run: Option<ScheduledJobRun>,
     items: Vec<KnowledgeCardItem>,
 }
 
@@ -1106,7 +1110,10 @@ fn parse_and_validate_knowledge_cards(
     } else {
         KNOWLEDGE_RESULTS_PAGE_SIZE
     };
-    if envelope.items.is_empty() || envelope.items.len() > max_items {
+    let empty_retention_run = envelope.kind == "retention"
+        && envelope.items.is_empty()
+        && envelope.job_run.is_some();
+    if (!empty_retention_run && envelope.items.is_empty()) || envelope.items.len() > max_items {
         return None;
     }
     if envelope.kind != "search"
@@ -1129,6 +1136,12 @@ fn parse_and_validate_knowledge_cards(
     }
     if envelope.kind == "synthesis" && envelope.overview.trim().is_empty() {
         return None;
+    }
+    if envelope.job_run.is_some() && envelope.kind != "retention" {
+        return None;
+    }
+    if let Some(run) = &envelope.job_run {
+        validate_scheduled_job_run(run).ok()?;
     }
 
     for item in &envelope.items {
@@ -1408,6 +1421,10 @@ fn knowledge_cards_message_for(content: &str, capture_owner: Option<u64>) -> Opt
         suppress_mentions(&heading)
     };
     let mut message = CreateMessage::new().content(message_content);
+
+    if envelope.kind == "retention" && envelope.items.is_empty() {
+        return Some(message);
+    }
 
     if envelope.kind == "search" || envelope.kind == "synthesis" || envelope.kind == "project_notes"
     {
@@ -4110,6 +4127,21 @@ impl DiscordAdapter {
         Ok(Some(created.id))
     }
 
+    async fn report_scheduled_job_run(&self, content: &str) {
+        let Some(run) = parse_and_validate_knowledge_cards(content)
+            .and_then(|(envelope, _)| envelope.job_run)
+        else {
+            return;
+        };
+        let Some(reporter) = &self.reporter else {
+            warn!("scheduled job result produced without an Admin Bot reporter");
+            return;
+        };
+        if let Err(error) = reporter.report_scheduled_job_run(&run).await {
+            warn!(%error, job_id = %run.job_id, "failed to report scheduled job result");
+        }
+    }
+
     pub async fn refresh_task_ui(&self, task: &TaskRecord) -> anyhow::Result<()> {
         if let Some(message_id) = task.status_message_id {
             ChannelId::new(task.thread_id)
@@ -4174,6 +4206,7 @@ impl ChatAdapter for DiscordAdapter {
                 message_id,
             });
         }
+        self.report_scheduled_job_run(content).await;
         match self
             .send_knowledge_components_v2(ch_id, content, None)
             .await
@@ -4245,6 +4278,7 @@ impl ChatAdapter for DiscordAdapter {
                 message_id,
             });
         }
+        self.report_scheduled_job_run(content).await;
         match self
             .send_knowledge_components_v2(ch_id, content, Some(msg_id))
             .await
@@ -4441,6 +4475,123 @@ impl ChatAdapter for DiscordAdapter {
 
 // --- Handler: serenity EventHandler that delegates to AdapterRouter ---
 
+fn inventory_pool_state(state: SessionState) -> &'static str {
+    match state {
+        SessionState::Active => "active",
+        SessionState::Suspended => "suspended",
+        SessionState::Persisted => "persisted",
+        SessionState::None => "persisted",
+    }
+}
+
+fn inventory_task_state(state: TaskState) -> &'static str {
+    match state {
+        TaskState::Queued => "queued",
+        TaskState::Running => "running",
+        TaskState::Ready => "ready",
+        TaskState::Cursor => "cursor",
+        TaskState::Failed => "failed",
+        TaskState::Closed => "persisted",
+    }
+}
+
+async fn inventory_thread_metadata(http: &Http, thread_id: u64) -> anyhow::Result<(String, String)> {
+    let channel = ChannelId::new(thread_id).to_channel(http).await?;
+    let Channel::Guild(channel) = channel else {
+        anyhow::bail!("session channel is not a guild channel");
+    };
+    let last_activity = channel
+        .last_message_id
+        .map(|message_id| message_id.created_at())
+        .unwrap_or_else(|| channel.id.created_at())
+        .to_string();
+    Ok((last_activity, channel.name))
+}
+
+async fn collect_session_inventory(
+    source_id: &str,
+    http: &Http,
+    router: &Arc<AdapterRouter>,
+    task_registry: &TaskRegistry,
+    dispatcher: &Arc<crate::dispatch::Dispatcher>,
+) -> (Vec<SessionInventoryItem>, bool, String) {
+    let entries = router.pool().session_entries("discord:").await;
+    let mut sessions = Vec::new();
+    let mut unresolved = 0usize;
+    for entry in entries {
+        let Some(thread_id) = discord_thread_id_from_session_key(&entry.key) else {
+            unresolved += 1;
+            continue;
+        };
+        let task = task_registry.task_for_thread(thread_id);
+        let needs_discord_metadata = source_id == "knowledge" || task.is_none();
+        let discord_metadata = if needs_discord_metadata {
+            match inventory_thread_metadata(http, thread_id).await {
+                Ok(metadata) => Some(metadata),
+                Err(error) => {
+                    unresolved += 1;
+                    warn!(%error, thread_id, "failed to resolve session inventory thread metadata");
+                    None
+                }
+            }
+        } else {
+            None
+        };
+        let last_activity_at = task
+            .as_ref()
+            .filter(|_| source_id == "coding")
+            .map(|task| task.updated_at.to_rfc3339())
+            .or_else(|| discord_metadata.as_ref().map(|value| value.0.clone()))
+            .unwrap_or_else(|| ChannelId::new(thread_id).created_at().to_string());
+        let state = task
+            .as_ref()
+            .filter(|_| source_id == "coding")
+            .map(|task| inventory_task_state(task.state))
+            .unwrap_or_else(|| inventory_pool_state(entry.snapshot.state))
+            .to_string();
+        let queued_messages = task
+            .as_ref()
+            .filter(|_| source_id == "coding")
+            .map(|task| task.queued_messages)
+            .unwrap_or_else(|| {
+                dispatcher
+                    .pending_messages("discord", &thread_id.to_string())
+                    .len()
+            });
+        let title = task
+            .as_ref()
+            .map(|task| task.title.clone())
+            .or_else(|| discord_metadata.as_ref().map(|value| value.1.clone()))
+            .unwrap_or_default();
+        let workspace_alias = task
+            .as_ref()
+            .map(|task| task.workspace_alias.clone())
+            .unwrap_or_default();
+        sessions.push(SessionInventoryItem {
+            thread_id,
+            state,
+            last_activity_at,
+            queued_messages,
+            prompt_in_flight: entry.prompt_in_flight,
+            externally_detached: entry.snapshot.externally_detached,
+            title,
+            workspace_alias,
+        });
+    }
+    sessions.sort_by_key(|session| session.thread_id);
+    if sessions.len() > 500 {
+        unresolved += sessions.len() - 500;
+        sessions.truncate(500);
+    }
+    let complete = unresolved == 0;
+    let error = if complete {
+        String::new()
+    } else {
+        format!("{unresolved} retained session(s) could not be represented completely")
+    };
+    (sessions, complete, error)
+}
+
 pub struct Handler {
     pub router: Arc<AdapterRouter>,
     pub allow_all_channels: bool,
@@ -4508,6 +4659,8 @@ pub struct Handler {
     pub admin_control: Option<DiscordAdminClient>,
     /// Write-only structured telemetry client for the Admin Bot report store.
     pub admin_reporter: Option<DiscordAdminReporter>,
+    /// Prevent duplicate inventory loops when Discord reconnects and emits ready again.
+    pub inventory_reporter_started: AtomicBool,
     /// Optional client for the isolated Git push broker.
     pub git_push_broker: Option<GitPushBrokerClient>,
 }
@@ -4518,6 +4671,44 @@ pub(crate) struct DiscordCommandScope {
 }
 
 impl Handler {
+    fn start_session_inventory_reporter(&self, http: Arc<Http>) {
+        let Some(reporter) = self.admin_reporter.clone() else {
+            return;
+        };
+        if !matches!(reporter.source_id(), "coding" | "knowledge") {
+            return;
+        }
+        if self
+            .inventory_reporter_started
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            return;
+        }
+        let router = self.router.clone();
+        let task_registry = self.task_registry.clone();
+        let dispatcher = self.dispatcher.clone();
+        tokio::spawn(async move {
+            loop {
+                let (sessions, complete, error) = collect_session_inventory(
+                    reporter.source_id(),
+                    &http,
+                    &router,
+                    &task_registry,
+                    &dispatcher,
+                )
+                .await;
+                if let Err(report_error) = reporter
+                    .report_session_inventory(sessions, complete, &error)
+                    .await
+                {
+                    warn!(%report_error, "failed to report session inventory");
+                }
+                tokio::time::sleep(std::time::Duration::from_secs(6 * 60 * 60)).await;
+            }
+        });
+    }
+
     async fn report_session_event(&self, thread_id: u64, event_type: &str) {
         let Some(reporter) = &self.admin_reporter else {
             return;
@@ -5911,6 +6102,7 @@ impl EventHandler for Handler {
         }
 
         self.reconcile_project_channels(&ctx).await;
+        self.start_session_inventory_reporter(ctx.http.clone());
 
         // Running jobs are restored as Waiting during load. Resume one FIFO
         // worker per repository only after Discord and project routing are ready.
@@ -13683,6 +13875,26 @@ mod tests {
             "OPENAB_KNOWLEDGE_CARDS_V1\n{\"kind\":\"retention\",\"heading\":\"bad\",\"items\":[{\"title\":\"x\",\"url\":\"https://evil.example/x\",\"source_id\":\"world_stories\",\"target_page_id\":\"bad\",\"queue_page_id\":\"bad\",\"delete_after\":\"2026-09-02\"}]}"
         )
         .is_none());
+    }
+
+    #[test]
+    fn knowledge_retention_job_run_accepts_empty_items_and_rejects_false_success() {
+        let payload = concat!(
+            "OPENAB_KNOWLEDGE_CARDS_V1\n",
+            r#"{"kind":"retention","heading":"本週保留檢查完成","items":[],"job_run":{"job_id":"opencode-scheduled-source-retention","run_id":"retention-2026-08-30","started_at":"2026-08-30T03:00:00+08:00","finished_at":"2026-08-30T03:12:00+08:00","status":"success","metrics":{"sources_scanned":3,"items_scanned":120,"protected_items":4,"enqueued_items":5,"pending_items":8,"trash_due_items":2,"trashed_items":0,"failed_items":0},"note":"Trash API unavailable; due targets were left unchanged."}}"#,
+        );
+        assert!(knowledge_cards_payload_is_valid(payload));
+        let rendered = serde_json::to_value(knowledge_cards_message(payload).unwrap())
+            .unwrap()
+            .to_string();
+        assert!(rendered.contains("本週保留檢查完成"));
+        assert!(!rendered.contains("OPENAB_KNOWLEDGE_CARDS_V1"));
+
+        let false_success = payload.replace(
+            r#""failed_items":0"#,
+            r#""failed_items":1"#,
+        );
+        assert!(!knowledge_cards_payload_is_valid(&false_success));
     }
 
     #[test]
