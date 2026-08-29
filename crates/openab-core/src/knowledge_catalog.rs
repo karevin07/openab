@@ -22,6 +22,7 @@ const MIGRATION_0007: &str = include_str!("../migrations/0007_knowledge_search_p
 const MIGRATION_0008: &str = include_str!("../migrations/0008_knowledge_result_pagination.sql");
 const MIGRATION_0009: &str = include_str!("../migrations/0009_knowledge_weekly_audit.sql");
 const MIGRATION_0010: &str = include_str!("../migrations/0010_retention_job_reporting.sql");
+const MIGRATION_0011: &str = include_str!("../migrations/0011_scheduled_article_mirror.sql");
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -284,6 +285,7 @@ impl KnowledgeCatalog {
             (8, MIGRATION_0008),
             (9, MIGRATION_0009),
             (10, MIGRATION_0010),
+            (11, MIGRATION_0011),
         ] {
             let applied = connection
                 .query_row(
@@ -796,7 +798,7 @@ mod tests {
                 row.get(0)
             })
             .unwrap();
-        assert_eq!(version, 10);
+        assert_eq!(version, 11);
         let world = catalog
             .sources
             .iter()

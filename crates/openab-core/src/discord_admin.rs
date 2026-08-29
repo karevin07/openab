@@ -101,6 +101,35 @@ pub struct RetentionJobMetrics {
     pub failed_items: u32,
 }
 
+/// The three fixed scheduled sources whose articles may be mirrored.
+const SCHEDULED_ARTICLE_SOURCE_IDS: [&str; 3] = [
+    "github_ai_data_weekly",
+    "world_stories",
+    "weekly_reading_digest",
+];
+const SCHEDULED_ARTICLE_BATCH_MAX: usize = 500;
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ScheduledArticle {
+    pub source_id: String,
+    pub page_id: String,
+    pub title: String,
+    pub url: String,
+    #[serde(default)]
+    pub published_at: String,
+    #[serde(default)]
+    pub summary: String,
+}
+
+#[derive(Serialize)]
+struct ScheduledArticlesRequest<'a> {
+    source_id: &'a str,
+    job_id: &'a str,
+    run_id: &'a str,
+    articles: &'a [ScheduledArticle],
+}
+
 #[derive(Serialize)]
 struct ScheduledJobRunRequest<'a> {
     source_id: &'a str,
@@ -337,6 +366,38 @@ impl DiscordAdminReporter {
         );
         Ok(())
     }
+
+    pub async fn report_scheduled_articles(
+        &self,
+        job_id: &str,
+        run_id: &str,
+        articles: &[ScheduledArticle],
+    ) -> Result<()> {
+        anyhow::ensure!(
+            self.source_id == "knowledge",
+            "only the knowledge reporter may submit scheduled articles"
+        );
+        validate_scheduled_articles(articles)?;
+        let body = ScheduledArticlesRequest {
+            source_id: &self.source_id,
+            job_id,
+            run_id,
+            articles,
+        };
+        let response = self
+            .http
+            .post(format!("{}/v1/telemetry/scheduled-articles", self.base_url))
+            .bearer_auth(&self.token)
+            .json(&body)
+            .send()
+            .await?;
+        anyhow::ensure!(
+            response.status().is_success(),
+            "Discord Admin scheduled articles endpoint returned {}",
+            response.status()
+        );
+        Ok(())
+    }
 }
 
 pub fn validate_scheduled_job_run(run: &ScheduledJobRun) -> Result<()> {
@@ -380,6 +441,55 @@ pub fn validate_scheduled_job_run(run: &ScheduledJobRun) -> Result<()> {
         run.status == "success" || !run.note.trim().is_empty(),
         "partial or failed scheduled job requires a note"
     );
+    Ok(())
+}
+
+pub fn validate_scheduled_articles(articles: &[ScheduledArticle]) -> Result<()> {
+    anyhow::ensure!(!articles.is_empty(), "scheduled article batch is empty");
+    anyhow::ensure!(
+        articles.len() <= SCHEDULED_ARTICLE_BATCH_MAX,
+        "scheduled article batch is too large"
+    );
+    let mut seen: HashSet<(&str, &str)> = HashSet::new();
+    for article in articles {
+        anyhow::ensure!(
+            SCHEDULED_ARTICLE_SOURCE_IDS.contains(&article.source_id.as_str()),
+            "scheduled article source_id is not a scheduled source"
+        );
+        let page_id = article.page_id.trim();
+        anyhow::ensure!(
+            (8..=64).contains(&page_id.len())
+                && page_id
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || c == '-'),
+            "invalid scheduled article page ID"
+        );
+        anyhow::ensure!(
+            seen.insert((article.source_id.as_str(), page_id)),
+            "duplicate scheduled article in batch"
+        );
+        let title = article.title.trim();
+        anyhow::ensure!(
+            !title.is_empty() && title.chars().count() <= 300,
+            "invalid scheduled article title"
+        );
+        let url = article.url.trim();
+        anyhow::ensure!(
+            url.starts_with("https://")
+                && url.len() <= 1000
+                && !url.chars().any(char::is_whitespace),
+            "scheduled article URL must be https"
+        );
+        let published_at = article.published_at.trim();
+        if !published_at.is_empty() {
+            chrono::DateTime::parse_from_rfc3339(published_at)
+                .context("invalid scheduled article published_at")?;
+        }
+        anyhow::ensure!(
+            article.summary.chars().count() <= 1000,
+            "scheduled article summary is too long"
+        );
+    }
     Ok(())
 }
 

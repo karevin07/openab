@@ -14,9 +14,9 @@ use crate::cron::{job_applies_to_project, next_run_unix, sticky_thread_id_for, C
 // Only the client stays here; every admin card, modal and handler now lives in
 // `discord_admin_ui`, which owns the wire types it renders.
 use crate::discord_admin::{
-    knowledge_weekly_marker_present, parse_knowledge_weekly_audit, validate_scheduled_job_run,
-    DiscordAdminClient, DiscordAdminReporter, KnowledgeWeeklyAudit, ScheduledJobRun,
-    SessionInventoryItem,
+    knowledge_weekly_marker_present, parse_knowledge_weekly_audit, validate_scheduled_articles,
+    validate_scheduled_job_run, DiscordAdminClient, DiscordAdminReporter, KnowledgeWeeklyAudit,
+    ScheduledArticle, ScheduledJobRun, SessionInventoryItem,
 };
 // Help and the session-control card both render the Session Manager; the card
 // itself and the handoff-state rule live with the rest of that flow.
@@ -919,6 +919,10 @@ struct KnowledgeCardEnvelope {
     project_id: String,
     #[serde(default)]
     job_run: Option<ScheduledJobRun>,
+    /// Bulk article mirror for the retention cron run. Never rendered into
+    /// the Discord card; it travels to the Admin Bot telemetry API instead.
+    #[serde(default)]
+    articles: Vec<ScheduledArticle>,
     items: Vec<KnowledgeCardItem>,
 }
 
@@ -1142,6 +1146,12 @@ fn parse_and_validate_knowledge_cards(
     }
     if let Some(run) = &envelope.job_run {
         validate_scheduled_job_run(run).ok()?;
+    }
+    if !envelope.articles.is_empty() {
+        if envelope.kind != "retention" || envelope.job_run.is_none() {
+            return None;
+        }
+        validate_scheduled_articles(&envelope.articles).ok()?;
     }
 
     for item in &envelope.items {
@@ -4128,9 +4138,10 @@ impl DiscordAdapter {
     }
 
     async fn report_scheduled_job_run(&self, content: &str) {
-        let Some(run) = parse_and_validate_knowledge_cards(content)
-            .and_then(|(envelope, _)| envelope.job_run)
-        else {
+        let Some((envelope, _)) = parse_and_validate_knowledge_cards(content) else {
+            return;
+        };
+        let Some(run) = envelope.job_run else {
             return;
         };
         let Some(reporter) = &self.reporter else {
@@ -4139,6 +4150,15 @@ impl DiscordAdapter {
         };
         if let Err(error) = reporter.report_scheduled_job_run(&run).await {
             warn!(%error, job_id = %run.job_id, "failed to report scheduled job result");
+        }
+        if envelope.articles.is_empty() {
+            return;
+        }
+        if let Err(error) = reporter
+            .report_scheduled_articles(&run.job_id, &run.run_id, &envelope.articles)
+            .await
+        {
+            warn!(%error, job_id = %run.job_id, "failed to report scheduled articles");
         }
     }
 
@@ -13895,6 +13915,56 @@ mod tests {
             r#""failed_items":1"#,
         );
         assert!(!knowledge_cards_payload_is_valid(&false_success));
+    }
+
+    #[test]
+    fn knowledge_retention_articles_ride_along_without_rendering() {
+        let payload = concat!(
+            "OPENAB_KNOWLEDGE_CARDS_V1\n",
+            r#"{"kind":"retention","heading":"本週保留檢查完成","items":[],"job_run":{"job_id":"opencode-scheduled-source-retention","run_id":"retention-2026-08-30","started_at":"2026-08-30T03:00:00+08:00","finished_at":"2026-08-30T03:12:00+08:00","status":"success","metrics":{"sources_scanned":3,"items_scanned":120,"protected_items":4,"enqueued_items":5,"pending_items":8,"trash_due_items":2,"trashed_items":0,"failed_items":0},"note":""},"articles":[{"source_id":"world_stories","page_id":"aaaa-bbbb-cccc","title":"範例文章","url":"https://app.notion.com/p/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","published_at":"2026-08-20T10:00:00+08:00","summary":"範例摘要"}]}"#,
+        );
+        assert!(knowledge_cards_payload_is_valid(payload));
+        let rendered = serde_json::to_value(knowledge_cards_message(payload).unwrap())
+            .unwrap()
+            .to_string();
+        // The mirror payload is telemetry, not card content.
+        assert!(!rendered.contains("範例文章"));
+        assert!(!rendered.contains("範例摘要"));
+        assert!(rendered.contains("本週保留檢查完成"));
+    }
+
+    #[test]
+    fn knowledge_articles_require_a_retention_job_run() {
+        let orphan = concat!(
+            "OPENAB_KNOWLEDGE_CARDS_V1\n",
+            r#"{"kind":"search","heading":"找到 1 篇","items":[{"title":"x","url":"https://app.notion.com/p/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","meta":"","summary":""}],"articles":[{"source_id":"world_stories","page_id":"aaaa-bbbb-cccc","title":"範例文章","url":"https://app.notion.com/p/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}]}"#,
+        );
+        assert!(!knowledge_cards_payload_is_valid(orphan));
+    }
+
+    #[test]
+    fn knowledge_articles_reject_unknown_sources_and_duplicates() {
+        let base = concat!(
+            "OPENAB_KNOWLEDGE_CARDS_V1\n",
+            r#"{"kind":"retention","heading":"完成","items":[],"job_run":{"job_id":"opencode-scheduled-source-retention","run_id":"r-1","started_at":"2026-08-30T03:00:00+08:00","finished_at":"2026-08-30T03:12:00+08:00","status":"success","metrics":{"sources_scanned":3,"items_scanned":1,"protected_items":0,"enqueued_items":0,"pending_items":0,"trash_due_items":0,"trashed_items":0,"failed_items":0},"note":""},"articles":[ARTICLES]}"#,
+        );
+        let good = r#"{"source_id":"world_stories","page_id":"aaaa-bbbb-cccc","title":"t","url":"https://app.notion.com/p/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}"#;
+        assert!(knowledge_cards_payload_is_valid(&base.replace("ARTICLES", good)));
+
+        let unknown_source = good.replace("world_stories", "personal_reading_list");
+        assert!(!knowledge_cards_payload_is_valid(
+            &base.replace("ARTICLES", &unknown_source)
+        ));
+
+        let duplicated = format!("{good},{good}");
+        assert!(!knowledge_cards_payload_is_valid(
+            &base.replace("ARTICLES", &duplicated)
+        ));
+
+        let insecure = good.replace("https://", "http://");
+        assert!(!knowledge_cards_payload_is_valid(
+            &base.replace("ARTICLES", &insecure)
+        ));
     }
 
     #[test]
