@@ -23,11 +23,20 @@ const MIGRATION_0008: &str = include_str!("../migrations/0008_knowledge_result_p
 const MIGRATION_0009: &str = include_str!("../migrations/0009_knowledge_weekly_audit.sql");
 const MIGRATION_0010: &str = include_str!("../migrations/0010_retention_job_reporting.sql");
 const MIGRATION_0011: &str = include_str!("../migrations/0011_scheduled_article_mirror.sql");
+const MIGRATION_0012: &str = include_str!("../migrations/0012_knowledge_hub_navigation.sql");
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct KnowledgeSourceOverrides {
+    hub: Option<KnowledgeHubOverride>,
     sources: Vec<KnowledgeSourceOverride>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct KnowledgeHubOverride {
+    label: Option<String>,
+    notion_url: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -286,6 +295,7 @@ impl KnowledgeCatalog {
             (9, MIGRATION_0009),
             (10, MIGRATION_0010),
             (11, MIGRATION_0011),
+            (12, MIGRATION_0012),
         ] {
             let applied = connection
                 .query_row(
@@ -547,6 +557,34 @@ fn apply_source_overrides(connection: &mut Connection, path: Option<&Path>) -> R
         .transaction()
         .context("start knowledge source override transaction")?;
     transaction.execute_batch("PRAGMA defer_foreign_keys = ON;")?;
+    if let Some(hub) = overrides.hub {
+        anyhow::ensure!(
+            hub.notion_url.starts_with("https://app.notion.com/"),
+            "knowledge hub notion_url must use https://app.notion.com/"
+        );
+        let current: String = transaction.query_row(
+            "SELECT config_json FROM knowledge_ui_views WHERE view_id = 'home'",
+            [],
+            |row| row.get(0),
+        )?;
+        let mut config =
+            serde_json::from_str::<Value>(&current).context("parse Knowledge Home config_json")?;
+        let object = config
+            .as_object_mut()
+            .context("Knowledge Home config_json must be an object")?;
+        object.insert("hub_url".into(), Value::String(hub.notion_url));
+        if let Some(label) = hub.label {
+            anyhow::ensure!(
+                !label.trim().is_empty(),
+                "knowledge hub label cannot be empty"
+            );
+            object.insert("hub_label".into(), Value::String(label));
+        }
+        transaction.execute(
+            "UPDATE knowledge_ui_views SET config_json = ?1 WHERE view_id = 'home'",
+            params![serde_json::to_string(&config)?],
+        )?;
+    }
     for source in overrides.sources {
         if let Some(config_json) = &source.config_json {
             serde_json::from_str::<Value>(config_json).with_context(|| {
@@ -717,6 +755,11 @@ mod tests {
         assert_eq!(search.inputs.len(), 5);
         assert_eq!(catalog.views.len(), 6);
         assert_eq!(catalog.global_actions_for("home").len(), 6);
+        let home = catalog.view("home").unwrap();
+        assert_eq!(
+            home.config_string("hub_url").as_deref(),
+            Some("https://app.notion.com/p/example-knowledge-hub")
+        );
         assert_eq!(catalog.global_action("capture").unwrap().inputs.len(), 3);
         assert_eq!(
             catalog
@@ -798,7 +841,7 @@ mod tests {
                 row.get(0)
             })
             .unwrap();
-        assert_eq!(version, 11);
+        assert_eq!(version, 12);
         let world = catalog
             .sources
             .iter()
@@ -856,6 +899,37 @@ title = "Private Project｜Recent"
         );
         assert_eq!(parsed.sources[0].fields[0].logical_name, "project");
         assert_eq!(parsed.sources[0].actions[0].action_id, "recent");
+    }
+
+    #[test]
+    fn source_override_file_updates_knowledge_hub_navigation() {
+        let dir = tempfile::tempdir().unwrap();
+        let override_path = dir.path().join("knowledge-sources.toml");
+        std::fs::write(
+            &override_path,
+            r#"
+[hub]
+label = "Open private hub"
+notion_url = "https://app.notion.com/p/private-knowledge-hub"
+
+[[sources]]
+source_id = "github_ai_data_weekly"
+"#,
+        )
+        .unwrap();
+
+        let catalog =
+            KnowledgeCatalog::open_or_seed_with_overrides(None, Some(&override_path)).unwrap();
+        let home = catalog.view("home").unwrap();
+        assert_eq!(
+            home.config_string("hub_label").as_deref(),
+            Some("Open private hub")
+        );
+        assert_eq!(
+            home.config_string("hub_url").as_deref(),
+            Some("https://app.notion.com/p/private-knowledge-hub")
+        );
+        assert_eq!(catalog.sources_by_kind("scheduled").len(), 3);
     }
 
     #[test]

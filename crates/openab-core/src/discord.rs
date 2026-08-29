@@ -1618,6 +1618,19 @@ fn knowledge_global_buttons(actions: &[&KnowledgeGlobalAction]) -> CreateActionR
     )
 }
 
+fn knowledge_hub_button(view: &crate::knowledge_catalog::KnowledgeView) -> Option<CreateButton> {
+    let url = view.config_string("hub_url")?;
+    if !url.starts_with("https://app.notion.com/") || url.len() > KNOWLEDGE_CARD_URL_MAX {
+        warn!("ignoring invalid Knowledge Hub URL from catalog");
+        return None;
+    }
+    let label = view
+        .config_string("hub_label")
+        .filter(|label| !label.trim().is_empty())
+        .unwrap_or_else(|| "🏠 開啟 Knowledge Hub".to_string());
+    Some(CreateButton::new_link(url).label(truncate_for_discord(&label, 80)))
+}
+
 fn knowledge_action_modal(
     source: &KnowledgeSource,
     action_id: &str,
@@ -2311,6 +2324,9 @@ fn knowledge_home_message() -> CreateInteractionResponseMessage {
             )
         })
         .collect::<Vec<_>>();
+    if let Some(button) = knowledge_hub_button(view) {
+        components.push(CreateActionRow::Buttons(vec![button]));
+    }
     components.push(knowledge_scheduled_source_select());
     let mut embed = CreateEmbed::new()
         .title(view.title.clone())
@@ -13349,6 +13365,8 @@ mod tests {
         assert!(rendered.contains("oab_knowledge:reading_list"));
         assert!(rendered.contains("oab_knowledge:recent"));
         assert!(rendered.contains("oab_knowledge:help"));
+        assert!(rendered.contains("開啟 Knowledge Hub"));
+        assert!(rendered.contains("https://app.notion.com/p/example-knowledge-hub"));
         assert!(rendered.contains("oab_knowledge:scheduled_source"));
         assert!(rendered.contains("github_ai_data_weekly"));
         assert!(rendered.contains("world_stories"));
