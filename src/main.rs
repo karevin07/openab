@@ -1001,10 +1001,19 @@ async fn main() -> anyhow::Result<()> {
 
     // Pre-build shared adapters for cron scheduler
     #[cfg(feature = "discord")]
+    let admin_reporter = if cfg.discord.is_some() {
+        openab_core::discord_admin::DiscordAdminReporter::from_env()?
+    } else {
+        None
+    };
+    #[cfg(feature = "discord")]
     let shared_discord_adapter: Option<Arc<dyn adapter::ChatAdapter>> =
         cfg.discord.as_ref().map(|dc| {
             let http = Arc::new(serenity::http::Http::new(&dc.bot_token));
-            Arc::new(discord::DiscordAdapter::new(http)) as Arc<dyn adapter::ChatAdapter>
+            Arc::new(discord::DiscordAdapter::with_reporter(
+                http,
+                admin_reporter.clone(),
+            )) as Arc<dyn adapter::ChatAdapter>
         });
     #[cfg(not(feature = "discord"))]
     let shared_discord_adapter: Option<Arc<dyn adapter::ChatAdapter>> = None;
@@ -1988,7 +1997,7 @@ async fn main() -> anyhow::Result<()> {
             cron_run_now: has_cron_work.then_some(cron_run_now_tx),
             cron_sticky_path: Some(cron_sticky_path.clone()),
             admin_control,
-            admin_reporter: openab_core::discord_admin::DiscordAdminReporter::from_env()?,
+            admin_reporter,
             git_push_broker,
         };
 

@@ -20,6 +20,7 @@ const MIGRATION_0005: &str =
 const MIGRATION_0006: &str = include_str!("../migrations/0006_knowledge_capture_preview_cards.sql");
 const MIGRATION_0007: &str = include_str!("../migrations/0007_knowledge_search_prompt_tighten.sql");
 const MIGRATION_0008: &str = include_str!("../migrations/0008_knowledge_result_pagination.sql");
+const MIGRATION_0009: &str = include_str!("../migrations/0009_knowledge_weekly_audit.sql");
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -280,6 +281,7 @@ impl KnowledgeCatalog {
             (6, MIGRATION_0006),
             (7, MIGRATION_0007),
             (8, MIGRATION_0008),
+            (9, MIGRATION_0009),
         ] {
             let applied = connection
                 .query_row(
@@ -788,7 +790,7 @@ mod tests {
                 row.get(0)
             })
             .unwrap();
-        assert_eq!(version, 8);
+        assert_eq!(version, 9);
         let world = catalog
             .sources
             .iter()
@@ -900,5 +902,16 @@ title = "Private Project"
         assert!(!project.fields.is_empty());
         assert!(!project.actions.is_empty());
         assert!(catalog.source("legacy-project-key").is_none());
+    }
+
+    #[test]
+    fn weekly_source_audit_prompt_includes_every_scheduled_adapter() {
+        let catalog = KnowledgeCatalog::open_or_seed_with_overrides(None, None).unwrap();
+        let prompt = catalog.global_prompt("weekly_source_audit").unwrap();
+
+        assert!(prompt.contains("OPENAB_KNOWLEDGE_WEEKLY_V1"));
+        for source in catalog.sources_by_kind("scheduled") {
+            assert!(prompt.contains(&format!("source_id: {}", source.source_id)));
+        }
     }
 }

@@ -113,6 +113,13 @@ requires `DISCORD_ADMIN_REPORT_ALLOW_INSECURE_HTTP=true`. Use
 are omitted unless `OPENAB_REPORT_INCLUDE_TITLE=true` and
 `OPENAB_REPORT_INCLUDE_WORKSPACE_ALIAS=true` are explicitly set.
 
+When `OPENAB_REPORT_SOURCE_ID=knowledge`, a cron-backed knowledge action may return the
+`OPENAB_KNOWLEDGE_WEEKLY_V1` contract. The Discord adapter validates its seven-day window, exact
+configured scheduled-source set, status semantics, URLs, unique page IDs, and item `created_at`
+timestamps before forwarding it to `/v1/telemetry/knowledge-weekly`. The raw JSON is never posted to
+Discord; the knowledge channel receives only a delivery acknowledgement. Mentioning report owners
+remains the Admin Bot's responsibility.
+
 ### `[[discord.project_actions]]`
 
 Adds **Quick actions** to managed Discord Project Home cards. Selecting an action opens the normal

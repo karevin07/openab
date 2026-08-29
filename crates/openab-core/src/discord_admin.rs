@@ -2,22 +2,74 @@
 
 use crate::config::DiscordAdminControlConfig;
 use anyhow::{Context, Result};
+use chrono::{Datelike, Timelike, Weekday};
 use reqwest::StatusCode;
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
+use std::collections::HashSet;
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 static REPORT_EVENT_SEQUENCE: AtomicU64 = AtomicU64::new(1);
+pub const KNOWLEDGE_WEEKLY_MARKER: &str = "OPENAB_KNOWLEDGE_WEEKLY_V1";
 
 #[derive(Clone)]
 pub struct DiscordAdminReporter {
     http: reqwest::Client,
-    url: String,
+    base_url: String,
     token: String,
     source_id: String,
     include_title: bool,
     include_workspace_alias: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct KnowledgeWeeklyAudit {
+    pub window_start: String,
+    pub window_end: String,
+    pub queried_at: String,
+    pub sources: Vec<KnowledgeWeeklySource>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct KnowledgeWeeklySource {
+    pub source_id: String,
+    pub title: String,
+    pub url: String,
+    pub status: KnowledgeWeeklyStatus,
+    #[serde(default)]
+    pub error: String,
+    #[serde(default)]
+    pub items: Vec<KnowledgeWeeklyItem>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum KnowledgeWeeklyStatus {
+    Updated,
+    NoUpdates,
+    Partial,
+    Failed,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct KnowledgeWeeklyItem {
+    pub page_id: String,
+    pub title: String,
+    pub url: String,
+    pub created_at: String,
+}
+
+#[derive(Serialize)]
+struct KnowledgeWeeklyRequest<'a> {
+    reporter_source_id: &'a str,
+    window_start: &'a str,
+    window_end: &'a str,
+    queried_at: &'a str,
+    sources: &'a [KnowledgeWeeklySource],
 }
 
 #[derive(Serialize)]
@@ -69,10 +121,7 @@ impl DiscordAdminReporter {
             http: reqwest::Client::builder()
                 .timeout(Duration::from_secs(5))
                 .build()?,
-            url: format!(
-                "{}/v1/telemetry/session-events",
-                base.trim().trim_end_matches('/')
-            ),
+            base_url: base.trim().trim_end_matches('/').to_string(),
             token,
             source_id,
             include_title: env_flag("OPENAB_REPORT_INCLUDE_TITLE"),
@@ -106,7 +155,7 @@ impl DiscordAdminReporter {
         };
         let response = self
             .http
-            .post(&self.url)
+            .post(format!("{}/v1/telemetry/session-events", self.base_url))
             .bearer_auth(&self.token)
             .json(&body)
             .send()
@@ -118,6 +167,161 @@ impl DiscordAdminReporter {
         );
         Ok(())
     }
+
+    pub async fn report_knowledge_weekly(&self, audit: &KnowledgeWeeklyAudit) -> Result<()> {
+        anyhow::ensure!(
+            self.source_id == "knowledge",
+            "only the knowledge reporter may submit weekly source audits"
+        );
+        let body = KnowledgeWeeklyRequest {
+            reporter_source_id: &self.source_id,
+            window_start: &audit.window_start,
+            window_end: &audit.window_end,
+            queried_at: &audit.queried_at,
+            sources: &audit.sources,
+        };
+        let response = self
+            .http
+            .post(format!("{}/v1/telemetry/knowledge-weekly", self.base_url))
+            .bearer_auth(&self.token)
+            .json(&body)
+            .send()
+            .await?;
+        anyhow::ensure!(
+            response.status().is_success(),
+            "Discord Admin knowledge report endpoint returned {}",
+            response.status()
+        );
+        Ok(())
+    }
+}
+
+pub fn knowledge_weekly_marker_present(content: &str) -> bool {
+    content.contains(KNOWLEDGE_WEEKLY_MARKER)
+}
+
+pub fn parse_knowledge_weekly_audit(content: &str) -> Result<Option<KnowledgeWeeklyAudit>> {
+    let Some((_, payload)) = content.split_once(KNOWLEDGE_WEEKLY_MARKER) else {
+        return Ok(None);
+    };
+    anyhow::ensure!(
+        content.len() <= 128 * 1024,
+        "knowledge weekly payload is too large"
+    );
+    let mut payload = payload.trim();
+    if let Some(stripped) = payload.strip_suffix("```") {
+        payload = stripped.trim_end();
+    }
+    let audit: KnowledgeWeeklyAudit =
+        serde_json::from_str(payload).context("parse knowledge weekly payload")?;
+    validate_knowledge_weekly_audit(&audit)?;
+    Ok(Some(audit))
+}
+
+fn validate_knowledge_weekly_audit(audit: &KnowledgeWeeklyAudit) -> Result<()> {
+    let start = chrono::DateTime::parse_from_rfc3339(&audit.window_start)
+        .context("invalid knowledge weekly window_start")?;
+    let end = chrono::DateTime::parse_from_rfc3339(&audit.window_end)
+        .context("invalid knowledge weekly window_end")?;
+    let queried_at = chrono::DateTime::parse_from_rfc3339(&audit.queried_at)
+        .context("invalid knowledge weekly queried_at")?;
+    let span = end.signed_duration_since(start);
+    anyhow::ensure!(
+        start.offset().local_minus_utc() == 8 * 60 * 60
+            && end.offset().local_minus_utc() == 8 * 60 * 60
+            && start.weekday() == Weekday::Tue
+            && start.hour() == 0
+            && start.minute() == 0
+            && start.second() == 0
+            && start.nanosecond() == 0
+            && span == chrono::Duration::days(7),
+        "knowledge weekly window must be Tuesday 00:00 to Tuesday 00:00 in Asia/Taipei"
+    );
+    anyhow::ensure!(queried_at >= end, "queried_at must not precede window_end");
+    anyhow::ensure!(
+        audit.sources.len() == 3,
+        "knowledge weekly payload must contain exactly three sources"
+    );
+    let mut source_ids = HashSet::new();
+    for source in &audit.sources {
+        anyhow::ensure!(
+            !source.source_id.is_empty()
+                && source.source_id.len() <= 64
+                && source
+                    .source_id
+                    .chars()
+                    .all(|value| value.is_ascii_alphanumeric() || matches!(value, '-' | '_')),
+            "invalid knowledge weekly source_id"
+        );
+        anyhow::ensure!(
+            source_ids.insert(source.source_id.as_str()),
+            "knowledge weekly source IDs must be unique"
+        );
+        anyhow::ensure!(
+            !source.title.trim().is_empty() && source.title.chars().count() <= 100,
+            "invalid knowledge weekly source title"
+        );
+        validate_public_url(&source.url, "knowledge weekly source URL")?;
+        anyhow::ensure!(source.items.len() <= 200, "too many knowledge weekly items");
+        match source.status {
+            KnowledgeWeeklyStatus::Updated => anyhow::ensure!(
+                !source.items.is_empty() && source.error.trim().is_empty(),
+                "updated sources require items and no error"
+            ),
+            KnowledgeWeeklyStatus::NoUpdates => anyhow::ensure!(
+                source.items.is_empty() && source.error.trim().is_empty(),
+                "no_updates sources cannot contain items or errors"
+            ),
+            KnowledgeWeeklyStatus::Partial => anyhow::ensure!(
+                !source.error.trim().is_empty(),
+                "partial sources require an error"
+            ),
+            KnowledgeWeeklyStatus::Failed => anyhow::ensure!(
+                source.items.is_empty() && !source.error.trim().is_empty(),
+                "failed sources require an error and no items"
+            ),
+        }
+        anyhow::ensure!(
+            source.error.chars().count() <= 300,
+            "knowledge weekly error is too long"
+        );
+        let mut page_ids = HashSet::new();
+        for item in &source.items {
+            anyhow::ensure!(
+                !item.page_id.trim().is_empty() && item.page_id.len() <= 128,
+                "invalid knowledge weekly page_id"
+            );
+            anyhow::ensure!(
+                page_ids.insert(item.page_id.as_str()),
+                "knowledge weekly page IDs must be unique per source"
+            );
+            anyhow::ensure!(
+                !item.title.trim().is_empty() && item.title.chars().count() <= 200,
+                "invalid knowledge weekly item title"
+            );
+            validate_public_url(&item.url, "knowledge weekly item URL")?;
+            let created = chrono::DateTime::parse_from_rfc3339(&item.created_at)
+                .context("invalid knowledge weekly item created_at")?;
+            anyhow::ensure!(
+                created >= start && created < end,
+                "knowledge weekly item created_at is outside the report window"
+            );
+        }
+    }
+    Ok(())
+}
+
+fn validate_public_url(value: &str, name: &str) -> Result<()> {
+    let url = reqwest::Url::parse(value.trim()).with_context(|| format!("invalid {name}"))?;
+    anyhow::ensure!(
+        matches!(url.scheme(), "http" | "https") && url.host_str().is_some(),
+        "{name} must use http or https"
+    );
+    anyhow::ensure!(
+        url.username().is_empty() && url.password().is_none(),
+        "{name} must not contain credentials"
+    );
+    Ok(())
 }
 
 fn env_flag(name: &str) -> bool {
@@ -811,5 +1015,28 @@ mod tests {
             validate_service_url("https://user:secret@admin.example.test", false, "test URL")
                 .is_err()
         );
+    }
+
+    #[test]
+    fn knowledge_weekly_contract_validates_three_sources_and_window() {
+        let payload = r#"
+OPENAB_KNOWLEDGE_WEEKLY_V1
+{"window_start":"2026-08-18T00:00:00+08:00","window_end":"2026-08-25T00:00:00+08:00","queried_at":"2026-08-25T08:40:00+08:00","sources":[{"source_id":"source_a","title":"Source A","url":"https://www.notion.so/source-a","status":"updated","items":[{"page_id":"page-a","title":"Article A","url":"https://www.notion.so/article-a","created_at":"2026-08-20T12:00:00+08:00"}]},{"source_id":"source_b","title":"Source B","url":"https://www.notion.so/source-b","status":"no_updates","items":[]},{"source_id":"source_c","title":"Source C","url":"https://www.notion.so/source-c","status":"failed","error":"connector unavailable","items":[]}]}
+"#;
+        let audit = parse_knowledge_weekly_audit(payload).unwrap().unwrap();
+
+        assert_eq!(audit.sources.len(), 3);
+        assert_eq!(audit.sources[0].items.len(), 1);
+        assert_eq!(audit.sources[2].status, KnowledgeWeeklyStatus::Failed);
+    }
+
+    #[test]
+    fn knowledge_weekly_contract_rejects_out_of_window_item() {
+        let payload = r#"
+OPENAB_KNOWLEDGE_WEEKLY_V1
+{"window_start":"2026-08-18T00:00:00+08:00","window_end":"2026-08-25T00:00:00+08:00","queried_at":"2026-08-25T08:40:00+08:00","sources":[{"source_id":"source_a","title":"Source A","url":"https://www.notion.so/source-a","status":"updated","items":[{"page_id":"page-a","title":"Article A","url":"https://www.notion.so/article-a","created_at":"2026-08-25T00:00:00+08:00"}]},{"source_id":"source_b","title":"Source B","url":"https://www.notion.so/source-b","status":"no_updates","items":[]},{"source_id":"source_c","title":"Source C","url":"https://www.notion.so/source-c","status":"no_updates","items":[]}]}
+"#;
+
+        assert!(parse_knowledge_weekly_audit(payload).is_err());
     }
 }

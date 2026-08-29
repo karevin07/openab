@@ -13,7 +13,10 @@ use crate::control_db::UiSurface;
 use crate::cron::{job_applies_to_project, next_run_unix, sticky_thread_id_for, CronToggleStore};
 // Only the client stays here; every admin card, modal and handler now lives in
 // `discord_admin_ui`, which owns the wire types it renders.
-use crate::discord_admin::{DiscordAdminClient, DiscordAdminReporter};
+use crate::discord_admin::{
+    knowledge_weekly_marker_present, parse_knowledge_weekly_audit, DiscordAdminClient,
+    DiscordAdminReporter, KnowledgeWeeklyAudit,
+};
 // Help and the session-control card both render the Session Manager; the card
 // itself and the handoff-state rule live with the rest of that flow.
 use crate::directives::resolve_workspace;
@@ -3971,6 +3974,15 @@ impl DiscordAdapter {
         }
     }
 
+    pub fn with_reporter(http: Arc<Http>, reporter: Option<DiscordAdminReporter>) -> Self {
+        Self {
+            http,
+            task_registry: None,
+            project_registry: None,
+            reporter,
+        }
+    }
+
     pub fn with_task_ui(
         http: Arc<Http>,
         task_registry: TaskRegistry,
@@ -3989,6 +4001,69 @@ impl DiscordAdapter {
     /// Discord threads are channels, so prefer thread_id when set.
     fn resolve_channel(channel: &ChannelRef) -> &str {
         channel.thread_id.as_deref().unwrap_or(&channel.channel_id)
+    }
+
+    fn validate_knowledge_weekly_sources(audit: &KnowledgeWeeklyAudit) -> anyhow::Result<()> {
+        let expected = knowledge_catalog()
+            .sources_by_kind("scheduled")
+            .into_iter()
+            .map(|source| source.source_id.as_str())
+            .collect::<HashSet<_>>();
+        let actual = audit
+            .sources
+            .iter()
+            .map(|source| source.source_id.as_str())
+            .collect::<HashSet<_>>();
+        anyhow::ensure!(
+            actual == expected,
+            "knowledge weekly payload must contain every configured scheduled source exactly once"
+        );
+        Ok(())
+    }
+
+    async fn send_knowledge_weekly_audit(
+        &self,
+        channel_id: u64,
+        content: &str,
+        reply_to_message_id: Option<u64>,
+    ) -> anyhow::Result<Option<String>> {
+        if !knowledge_weekly_marker_present(content) {
+            return Ok(None);
+        }
+        let result = match parse_knowledge_weekly_audit(content) {
+            Ok(Some(audit)) => {
+                if let Err(error) = Self::validate_knowledge_weekly_sources(&audit) {
+                    warn!(%error, "knowledge weekly payload source validation failed");
+                    "⚠️ 每週知識來源統計格式不完整，未送交 Admin Bot。".to_string()
+                } else if let Some(reporter) = &self.reporter {
+                    match reporter.report_knowledge_weekly(&audit).await {
+                        Ok(()) => "✅ 每週知識來源統計已送交 Admin Bot，將由 Admin Bot 發布公告。"
+                            .to_string(),
+                        Err(error) => {
+                            warn!(%error, "failed to report knowledge weekly audit");
+                            "⚠️ 每週知識來源統計上報失敗，請檢查 Admin Bot report API。".to_string()
+                        }
+                    }
+                } else {
+                    warn!("knowledge weekly payload produced without an Admin Bot reporter");
+                    "⚠️ 尚未設定 Admin Bot report API，無法發布每週知識來源公告。".to_string()
+                }
+            }
+            Ok(None) => return Ok(None),
+            Err(error) => {
+                warn!(%error, "knowledge weekly payload validation failed");
+                "⚠️ 每週知識來源統計格式無效，未送交 Admin Bot。".to_string()
+            }
+        };
+        let mut builder = CreateMessage::new().content(result);
+        if let Some(message_id) = reply_to_message_id {
+            builder =
+                builder.reference_message((ChannelId::new(channel_id), MessageId::new(message_id)));
+        }
+        let message = ChannelId::new(channel_id)
+            .send_message(&self.http, builder)
+            .await?;
+        Ok(Some(message.id.to_string()))
     }
 
     async fn send_knowledge_components_v2(
@@ -4081,7 +4156,7 @@ impl ChatAdapter for DiscordAdapter {
     fn prefers_unsplit_delivery(&self, content: &str) -> bool {
         // Keep marker+JSON together even when validation fails, so we can
         // replace the whole payload with a clear fallback instead of leaking JSON.
-        knowledge_cards_marker_present(content)
+        knowledge_cards_marker_present(content) || knowledge_weekly_marker_present(content)
     }
 
     async fn send_message(
@@ -4090,6 +4165,15 @@ impl ChatAdapter for DiscordAdapter {
         content: &str,
     ) -> anyhow::Result<MessageRef> {
         let ch_id: u64 = Self::resolve_channel(channel).parse()?;
+        if let Some(message_id) = self
+            .send_knowledge_weekly_audit(ch_id, content, None)
+            .await?
+        {
+            return Ok(MessageRef {
+                channel: channel.clone(),
+                message_id,
+            });
+        }
         match self
             .send_knowledge_components_v2(ch_id, content, None)
             .await
@@ -4151,6 +4235,15 @@ impl ChatAdapter for DiscordAdapter {
         if msg_id == 0 {
             // Invalid message ID, fall back to plain send
             return self.send_message(channel, content).await;
+        }
+        if let Some(message_id) = self
+            .send_knowledge_weekly_audit(ch_id, content, Some(msg_id))
+            .await?
+        {
+            return Ok(MessageRef {
+                channel: channel.clone(),
+                message_id,
+            });
         }
         match self
             .send_knowledge_components_v2(ch_id, content, Some(msg_id))
