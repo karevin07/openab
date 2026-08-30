@@ -1082,9 +1082,14 @@ fn knowledge_source_is_known(source_id: &str) -> bool {
 }
 
 fn parse_knowledge_card_envelope(content: &str) -> Option<KnowledgeCardEnvelope> {
-    let mut lines = content.lines();
-    lines.find(|line| line.trim() == KNOWLEDGE_CARDS_PREFIX)?;
-    let payload = lines.collect::<Vec<_>>().join("\n");
+    let lines = content.lines().collect::<Vec<_>>();
+    // Agents occasionally explain or quote the card contract before emitting the
+    // actual envelope. Prefer the final marker so a valid final payload is not
+    // rejected because an earlier example left trailing content behind it.
+    let marker = lines
+        .iter()
+        .rposition(|line| line.trim() == KNOWLEDGE_CARDS_PREFIX)?;
+    let payload = lines.get(marker + 1..)?.join("\n");
     let payload = payload
         .trim_start()
         .trim_start_matches("```json")
@@ -14298,6 +14303,22 @@ mod tests {
             "short",
         );
         assert!(!knowledge_cards_payload_is_valid(&invalid_sha));
+    }
+
+    #[test]
+    fn knowledge_cards_use_final_marker_after_an_explained_example() {
+        let payload = concat!(
+            "The preview card:\n\n```\nOPENAB_KNOWLEDGE_CARDS_V1\n",
+            r#"{"kind":"epub_intake_preview","heading":"example","items":[{"title":"Example","url":"https://app.notion.com/p/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","intake_id":"11111111-2222-4333-8444-555555555555","sha256":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}]}"#,
+            "\n```\n\nOPENAB_KNOWLEDGE_CARDS_V1\n",
+            r#"{"kind":"epub_intake_preview","heading":"EPUB 收件預覽","items":[{"title":"反穀","url":"https://app.notion.com/1d05b452cea5440b907deb5a7260f40b","meta":"James C. Scott · book.epub · 1.5 MB","summary":"等待確認上傳","intake_id":"59607a54-e4f1-40f4-8311-33f48cbcff49","sha256":"79a232f19358b868507741d7464a73b224afeea948e6e18e40da01bc3112c53a"}]}"#,
+        );
+        assert!(knowledge_cards_payload_is_valid(payload));
+        let rendered = serde_json::to_value(knowledge_cards_message(payload).unwrap())
+            .unwrap()
+            .to_string();
+        assert!(rendered.contains("反穀"));
+        assert!(!rendered.contains("Example"));
     }
 
     #[test]
