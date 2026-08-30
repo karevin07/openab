@@ -24,6 +24,8 @@ const MIGRATION_0009: &str = include_str!("../migrations/0009_knowledge_weekly_a
 const MIGRATION_0010: &str = include_str!("../migrations/0010_retention_job_reporting.sql");
 const MIGRATION_0011: &str = include_str!("../migrations/0011_scheduled_article_mirror.sql");
 const MIGRATION_0012: &str = include_str!("../migrations/0012_knowledge_hub_navigation.sql");
+const MIGRATION_0013: &str = include_str!("../migrations/0013_reading_list_epub.sql");
+const MIGRATION_0014: &str = include_str!("../migrations/0014_reading_list_epub_intake.sql");
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -296,6 +298,8 @@ impl KnowledgeCatalog {
             (10, MIGRATION_0010),
             (11, MIGRATION_0011),
             (12, MIGRATION_0012),
+            (13, MIGRATION_0013),
+            (14, MIGRATION_0014),
         ] {
             let applied = connection
                 .query_row(
@@ -746,6 +750,15 @@ mod tests {
         assert_eq!(catalog.sources_by_kind("scheduled").len(), 3);
         assert_eq!(catalog.sources_by_kind("side_project").len(), 2);
         let reading = catalog.source("personal_reading_list").unwrap();
+        assert!(reading
+            .fields
+            .iter()
+            .any(|field| field.logical_name == "epub_link" && field.notion_property == "EPUB Link"));
+        assert!(reading
+            .fields
+            .iter()
+            .any(|field| field.logical_name == "recommended_at"));
+        assert!(reading.action("recent_finance").is_some());
         assert_eq!(reading.data_source_id, "collection://example-reading-list");
         assert!(reading
             .fields
@@ -841,7 +854,7 @@ mod tests {
                 row.get(0)
             })
             .unwrap();
-        assert_eq!(version, 12);
+        assert_eq!(version, 14);
         let world = catalog
             .sources
             .iter()
@@ -853,6 +866,12 @@ mod tests {
             .prompt_template
             .contains("synthesis card contract"));
         let reading = catalog.source("personal_reading_list").unwrap();
+        assert!(reading.action("recent_finance").is_some());
+        assert!(reading.action("intake").is_some());
+        assert!(reading
+            .fields
+            .iter()
+            .any(|field| field.logical_name == "epub_status"));
         assert!(reading
             .action("overview")
             .unwrap()
@@ -863,6 +882,15 @@ mod tests {
             .unwrap()
             .prompt_template
             .contains("不要 Markdown table"));
+        assert!(catalog
+            .global_action("epub_intake_confirm")
+            .unwrap()
+            .prompt_template
+            .contains("reading_list_epub_commit"));
+        assert_eq!(
+            catalog.global_action("epub_intake_cancel").unwrap().behavior,
+            "local"
+        );
         assert!(catalog
             .global_prompt("capture")
             .unwrap()

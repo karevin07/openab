@@ -944,6 +944,10 @@ struct KnowledgeCardItem {
     delete_after: String,
     #[serde(default)]
     next_step: String,
+    #[serde(default)]
+    intake_id: String,
+    #[serde(default)]
+    sha256: String,
 }
 
 const DISCORD_COMPONENTS_V2_FLAG: u64 = 1 << 15;
@@ -1126,6 +1130,7 @@ fn parse_and_validate_knowledge_cards(
         && envelope.kind != "project_notes"
         && envelope.kind != "project_note_preview"
         && envelope.kind != "capture_preview"
+        && envelope.kind != "epub_intake_preview"
     {
         return None;
     }
@@ -1136,6 +1141,9 @@ fn parse_and_validate_knowledge_cards(
         None
     };
     if envelope.kind == "project_note_preview" && envelope.items.len() != 1 {
+        return None;
+    }
+    if envelope.kind == "epub_intake_preview" && envelope.items.len() != 1 {
         return None;
     }
     if envelope.kind == "synthesis" && envelope.overview.trim().is_empty() {
@@ -1169,6 +1177,13 @@ fn parse_and_validate_knowledge_cards(
             }
             compact_notion_page_id(&item.target_page_id)?;
             compact_notion_page_id(&item.queue_page_id)?;
+        }
+        if envelope.kind == "epub_intake_preview"
+            && (uuid::Uuid::parse_str(item.intake_id.trim()).is_err()
+                || item.sha256.len() != 64
+                || !item.sha256.chars().all(|ch| ch.is_ascii_hexdigit()))
+        {
+            return None;
         }
     }
 
@@ -1473,6 +1488,7 @@ fn knowledge_cards_message_for(content: &str, capture_owner: Option<u64>) -> Opt
             "retention" => 0xE67E22,
             "project_note_preview" => 0x57F287,
             "capture_preview" => 0x5865F2,
+            "epub_intake_preview" => 0x9B59B6,
             _ => 0x2F80ED,
         };
         let mut embed = CreateEmbed::new()
@@ -1537,6 +1553,28 @@ fn knowledge_cards_message_for(content: &str, capture_owner: Option<u64>) -> Opt
             .label(cancel_action.label.clone())
             .style(knowledge_button_style(&cancel_action.button_style)),
         ])]);
+    } else if envelope.kind == "epub_intake_preview" {
+        let confirm_action = catalog.global_action("epub_intake_confirm")?;
+        let cancel_action = catalog.global_action("epub_intake_cancel")?;
+        let Some(owner_id) = capture_owner else {
+            warn!("epub_intake_preview card missing owner; posting embed without confirm buttons");
+            return Some(message);
+        };
+        let intake_id = envelope.items.first()?.intake_id.trim();
+        message = message.components(vec![CreateActionRow::Buttons(vec![
+            CreateButton::new(format!(
+                "oab_knowledge:{}:{}:{}",
+                confirm_action.action_id, owner_id, intake_id
+            ))
+            .label(confirm_action.label.clone())
+            .style(knowledge_button_style(&confirm_action.button_style)),
+            CreateButton::new(format!(
+                "oab_knowledge:{}:{}:{}",
+                cancel_action.action_id, owner_id, intake_id
+            ))
+            .label(cancel_action.label.clone())
+            .style(knowledge_button_style(&cancel_action.button_style)),
+        ])]);
     }
     Some(message)
 }
@@ -1586,22 +1624,26 @@ fn knowledge_button_style(style: &str) -> ButtonStyle {
     }
 }
 
-fn knowledge_action_buttons(
+fn knowledge_action_button_rows(
     source: &KnowledgeSource,
     custom_id: impl Fn(&KnowledgeAction) -> String,
-) -> CreateActionRow {
-    CreateActionRow::Buttons(
-        source
-            .actions
-            .iter()
-            .take(5)
-            .map(|action| {
-                CreateButton::new(custom_id(action))
-                    .label(action.label.clone())
-                    .style(knowledge_button_style(&action.button_style))
-            })
-            .collect(),
-    )
+) -> Vec<CreateActionRow> {
+    source
+        .actions
+        .chunks(5)
+        .map(|actions| {
+            CreateActionRow::Buttons(
+                actions
+                    .iter()
+                    .map(|action| {
+                        CreateButton::new(custom_id(action))
+                            .label(action.label.clone())
+                            .style(knowledge_button_style(&action.button_style))
+                    })
+                    .collect(),
+            )
+        })
+        .collect()
 }
 
 fn knowledge_global_buttons(actions: &[&KnowledgeGlobalAction]) -> CreateActionRow {
@@ -1844,12 +1886,12 @@ fn knowledge_scheduled_source_message(
                 .description(view.description.clone())
                 .colour(view.colour),
         )
-        .components(vec![knowledge_action_buttons(source, |action| {
+        .components(knowledge_action_button_rows(source, |action| {
             format!(
                 "oab_knowledge:source_{}:{}",
                 action.action_id, source.source_id
             )
-        })])
+        }))
         .ephemeral(true)
 }
 
@@ -1881,9 +1923,9 @@ fn knowledge_reading_list_message() -> CreateInteractionResponseMessage {
                 .description(view.description.clone())
                 .colour(view.colour),
         )
-        .components(vec![knowledge_action_buttons(source, |action| {
+        .components(knowledge_action_button_rows(source, |action| {
             format!("oab_knowledge:reading_list_{}", action.action_id)
-        })])
+        }))
         .ephemeral(true)
 }
 
@@ -1953,12 +1995,12 @@ fn knowledge_side_project_message(project: &KnowledgeSource) -> CreateInteractio
                 )
                 .colour(view.colour),
         )
-        .components(vec![knowledge_action_buttons(project, |action| {
+        .components(knowledge_action_button_rows(project, |action| {
             format!(
                 "oab_knowledge:project_note_{}:{}",
                 action.action_id, project.source_id
             )
-        })])
+        }))
         .ephemeral(true)
 }
 
@@ -5275,6 +5317,14 @@ impl Handler {
                     let msg_ref = discord_msg_ref(&msg);
                     let _ = adapter.add_reaction(&msg_ref, "🎤").await;
                 }
+            } else if attachment.filename.to_ascii_lowercase().ends_with(".epub") {
+                debug!(url = %attachment.url, filename = %attachment.filename, "adding EPUB attachment metadata");
+                extra_blocks.push(epub_attachment_block(
+                    &attachment.filename,
+                    attachment.content_type.as_deref(),
+                    u64::from(attachment.size),
+                    &attachment.url,
+                ));
             } else if media::is_text_file(&attachment.filename, attachment.content_type.as_deref())
             {
                 if text_file_count >= TEXT_FILE_COUNT_CAP {
@@ -7856,6 +7906,134 @@ impl Handler {
             );
             let _ = comp
                 .edit_response(&ctx.http, EditInteractionResponse::new().content(content))
+                .await;
+            return;
+        }
+        if let Some(bound) = action.strip_prefix("epub_intake_confirm:") {
+            let mut parts = bound.split(':');
+            let owner_id = parts.next().and_then(|value| value.parse::<u64>().ok());
+            let intake_id = parts.next().filter(|value| uuid::Uuid::parse_str(value).is_ok());
+            if parts.next().is_some() || owner_id.is_none() || intake_id.is_none() {
+                let _ = comp
+                    .create_response(
+                        &ctx.http,
+                        CreateInteractionResponse::Message(
+                            CreateInteractionResponseMessage::new()
+                                .content("⚠️ 這份 EPUB 預覽已失效，請重新附上檔案。")
+                                .ephemeral(true),
+                        ),
+                    )
+                    .await;
+                return;
+            }
+            let owner_id = owner_id.expect("validated owner");
+            let intake_id = intake_id.expect("validated intake id");
+            if comp.user.id.get() != owner_id {
+                let _ = comp
+                    .create_response(
+                        &ctx.http,
+                        CreateInteractionResponse::Message(
+                            CreateInteractionResponseMessage::new()
+                                .content("🔒 只有這次 EPUB Intake 的發起人可以確認上傳。")
+                                .ephemeral(true),
+                        ),
+                    )
+                    .await;
+                return;
+            }
+            if let Err(error) = comp
+                .create_response(
+                    &ctx.http,
+                    CreateInteractionResponse::UpdateMessage(
+                        CreateInteractionResponseMessage::new()
+                            .content("⏳ 正在上傳 Drive、同步 Forum 並更新 Reading List……")
+                            .embeds(Vec::new())
+                            .components(Vec::new()),
+                    ),
+                )
+                .await
+            {
+                tracing::error!(%error, %intake_id, "failed to acknowledge EPUB intake confirm");
+                return;
+            }
+            clear_knowledge_capture_owner(comp.channel_id.get());
+            let preview_message_id = comp.message.id.to_string();
+            let user_id = comp.user.id.get().to_string();
+            let submitted = [
+                ("intake_id", intake_id),
+                ("Discord preview message ID", preview_message_id.as_str()),
+                ("Discord user ID", user_id.as_str()),
+            ];
+            let Some((action_title, prompt)) =
+                knowledge_global_prompt("epub_intake_confirm", &submitted, knowledge_reading_list())
+            else {
+                let _ = comp
+                    .edit_response(
+                        &ctx.http,
+                        EditInteractionResponse::new().content("⚠️ EPUB Intake 確認流程設定已失效。"),
+                    )
+                    .await;
+                return;
+            };
+            if let Err(error) = self
+                .submit_knowledge_prompt(ctx, scope, &comp.user, &action_title, prompt, None, false)
+                .await
+            {
+                let _ = comp
+                    .edit_response(
+                        &ctx.http,
+                        EditInteractionResponse::new()
+                            .content(format!("⚠️ 無法開始 EPUB 上傳：{error}")),
+                    )
+                    .await;
+            }
+            return;
+        }
+        if let Some(bound) = action.strip_prefix("epub_intake_cancel:") {
+            let mut parts = bound.split(':');
+            let owner_id = parts.next().and_then(|value| value.parse::<u64>().ok());
+            let intake_id_valid = parts.next().is_some_and(|value| uuid::Uuid::parse_str(value).is_ok());
+            if parts.next().is_some() || owner_id.is_none() || !intake_id_valid {
+                let _ = comp
+                    .create_response(
+                        &ctx.http,
+                        CreateInteractionResponse::Message(
+                            CreateInteractionResponseMessage::new()
+                                .content("⚠️ 這份 EPUB 預覽已失效。")
+                                .ephemeral(true),
+                        ),
+                    )
+                    .await;
+                return;
+            }
+            if comp.user.id.get() != owner_id.expect("validated owner") {
+                let _ = comp
+                    .create_response(
+                        &ctx.http,
+                        CreateInteractionResponse::Message(
+                            CreateInteractionResponseMessage::new()
+                                .content("🔒 只有這次 EPUB Intake 的發起人可以取消。")
+                                .ephemeral(true),
+                        ),
+                    )
+                    .await;
+                return;
+            }
+            clear_knowledge_capture_owner(comp.channel_id.get());
+            let content = knowledge_catalog()
+                .global_action("epub_intake_cancel")
+                .and_then(|value| value.config_string("message_template"))
+                .unwrap_or_else(|| "已取消 EPUB Intake；未執行外部寫入。".to_string());
+            let _ = comp
+                .create_response(
+                    &ctx.http,
+                    CreateInteractionResponse::UpdateMessage(
+                        CreateInteractionResponseMessage::new()
+                            .content(content)
+                            .embeds(Vec::new())
+                            .components(Vec::new()),
+                    ),
+                )
                 .await;
             return;
         }
@@ -12844,6 +13022,23 @@ fn video_attachment_block(
     }
 }
 
+fn epub_attachment_block(
+    filename: &str,
+    content_type: Option<&str>,
+    size: u64,
+    url: &str,
+) -> ContentBlock {
+    ContentBlock::Text {
+        text: format!(
+            "[EPUB attachment]\nfilename: {}\ncontent_type: {}\nsize_bytes: {}\nurl: {} (Discord CDN URL expires; call reading_list_epub_preview now)",
+            filename,
+            content_type.unwrap_or("application/epub+zip"),
+            size,
+            url,
+        ),
+    }
+}
+
 /// Build a `SenderContext` for Discord messages.
 ///
 /// Pure function extracted from `EventHandler::message` for testability.
@@ -13528,10 +13723,15 @@ mod tests {
             .unwrap()
             .to_string();
         assert!(rendered.contains("oab_knowledge:reading_list_recommend"));
+        assert!(rendered.contains("oab_knowledge:reading_list_intake"));
+        assert!(rendered.contains("oab_knowledge:reading_list_recent_finance"));
         assert!(rendered.contains("oab_knowledge:reading_list_current"));
         assert!(rendered.contains("oab_knowledge:reading_list_search"));
         assert!(rendered.contains("oab_knowledge:reading_list_overview"));
         assert!(rendered.contains("不會變更閱讀狀態或評分"));
+
+        let components = serde_json::to_value(knowledge_reading_list_message()).unwrap();
+        assert_eq!(components["components"].as_array().unwrap().len(), 2);
 
         let modal = serde_json::to_value(knowledge_reading_list_search_modal())
             .unwrap()
@@ -13545,6 +13745,13 @@ mod tests {
         assert!(recommend.contains("Expect"));
         assert!(recommend.contains(&knowledge_reading_list().unwrap().notion_url));
         assert!(recommend.contains("Structured Knowledge Adapter"));
+        let (_, finance) = knowledge_reading_list_prompt("recent_finance").unwrap();
+        assert!(finance.contains("Tags 包含 Finance"));
+        assert!(finance.contains("Recommended At DESC"));
+        assert!(finance.contains("EPUB Link"));
+        let (_, intake) = knowledge_reading_list_prompt("intake").unwrap();
+        assert!(intake.contains("恰好一個 .epub"));
+        assert!(intake.contains("reading_list_epub_preview"));
         assert!(knowledge_reading_list_prompt("delete").is_none());
     }
 
@@ -14060,6 +14267,37 @@ mod tests {
             "OPENAB_KNOWLEDGE_CARDS_V1\n{}",
             r#"{"kind":"search","heading":"bad","items":[{"title":"x","url":"https://example.com/x","meta":"","summary":""}]}"#
         )));
+    }
+
+    #[test]
+    fn knowledge_epub_intake_preview_is_bound_to_owner_and_intake_id() {
+        let payload = concat!(
+            "OPENAB_KNOWLEDGE_CARDS_V1\n",
+            r#"{"kind":"epub_intake_preview","heading":"EPUB 收件預覽","items":[{"title":"The Psychology of Money","url":"https://app.notion.com/p/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","meta":"Morgan Housel · 1.2 MiB","summary":"等待確認上傳","intake_id":"11111111-2222-4333-8444-555555555555","sha256":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}]}"#,
+        );
+        assert!(knowledge_cards_payload_is_valid(payload));
+        let rendered =
+            serde_json::to_value(knowledge_cards_message_for(payload, Some(42)).unwrap())
+                .unwrap()
+                .to_string();
+        assert!(rendered.contains(
+            "oab_knowledge:epub_intake_confirm:42:11111111-2222-4333-8444-555555555555"
+        ));
+        assert!(rendered.contains(
+            "oab_knowledge:epub_intake_cancel:42:11111111-2222-4333-8444-555555555555"
+        ));
+        assert!(rendered.contains("The Psychology of Money"));
+
+        let invalid_id = payload.replace(
+            "11111111-2222-4333-8444-555555555555",
+            "not-an-intake-id",
+        );
+        assert!(!knowledge_cards_payload_is_valid(&invalid_id));
+        let invalid_sha = payload.replace(
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "short",
+        );
+        assert!(!knowledge_cards_payload_is_valid(&invalid_sha));
     }
 
     #[test]
@@ -15172,6 +15410,26 @@ mod tests {
         assert!(text.contains("content_type: video/mp4"));
         assert!(text.contains("size_bytes: 12345"));
         assert!(text.contains("url: https://cdn.discordapp.com/attachments/demo.mp4"));
+    }
+
+    #[test]
+    fn epub_attachment_block_includes_preview_metadata() {
+        let block = epub_attachment_block(
+            "book.epub",
+            Some("application/epub+zip"),
+            54321,
+            "https://cdn.discordapp.com/attachments/123/456/book.epub",
+        );
+
+        let ContentBlock::Text { text } = block else {
+            panic!("EPUB attachments must be forwarded as text metadata");
+        };
+
+        assert!(text.contains("[EPUB attachment]"));
+        assert!(text.contains("filename: book.epub"));
+        assert!(text.contains("content_type: application/epub+zip"));
+        assert!(text.contains("size_bytes: 54321"));
+        assert!(text.contains("reading_list_epub_preview"));
     }
 
     #[test]
