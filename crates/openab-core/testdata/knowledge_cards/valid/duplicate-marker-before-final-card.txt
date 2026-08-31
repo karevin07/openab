@@ -1,0 +1,9 @@
+The preview card:
+
+```
+OPENAB_KNOWLEDGE_CARDS_V1
+{"kind":"epub_intake_preview","heading":"Example","items":[{"title":"DO_NOT_RENDER fixture example","url":"https://app.notion.com/p/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","intake_id":"11111111-2222-4333-8444-555555555555","sha256":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}]}
+```
+
+OPENAB_KNOWLEDGE_CARDS_V1
+{"kind":"epub_intake_preview","heading":"EPUB intake preview","items":[{"title":"EXPECT_RENDER fixture final","url":"https://app.notion.com/p/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","meta":"Example Author · example.epub · 1.5 MB","summary":"Waiting for confirmation","intake_id":"22222222-3333-4444-8555-666666666666","sha256":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"}]}

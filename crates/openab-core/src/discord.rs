@@ -14305,20 +14305,122 @@ mod tests {
         assert!(!knowledge_cards_payload_is_valid(&invalid_sha));
     }
 
-    #[test]
-    fn knowledge_cards_use_final_marker_after_an_explained_example() {
-        let payload = concat!(
-            "The preview card:\n\n```\nOPENAB_KNOWLEDGE_CARDS_V1\n",
-            r#"{"kind":"epub_intake_preview","heading":"example","items":[{"title":"Example","url":"https://app.notion.com/p/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","intake_id":"11111111-2222-4333-8444-555555555555","sha256":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}]}"#,
-            "\n```\n\nOPENAB_KNOWLEDGE_CARDS_V1\n",
-            r#"{"kind":"epub_intake_preview","heading":"EPUB 收件預覽","items":[{"title":"反穀","url":"https://app.notion.com/1d05b452cea5440b907deb5a7260f40b","meta":"James C. Scott · book.epub · 1.5 MB","summary":"等待確認上傳","intake_id":"59607a54-e4f1-40f4-8311-33f48cbcff49","sha256":"79a232f19358b868507741d7464a73b224afeea948e6e18e40da01bc3112c53a"}]}"#,
+    fn knowledge_card_fixtures(kind: &str) -> Vec<(std::path::PathBuf, String)> {
+        let directory = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("testdata/knowledge_cards")
+            .join(kind);
+        let mut fixtures = std::fs::read_dir(&directory)
+            .unwrap_or_else(|error| panic!("could not read {}: {error}", directory.display()))
+            .map(|entry| {
+                let path = entry
+                    .expect("fixture directory entry should be readable")
+                    .path();
+                assert_eq!(
+                    path.extension().and_then(|value| value.to_str()),
+                    Some("txt"),
+                    "knowledge card fixture must be a .txt file: {}",
+                    path.display()
+                );
+                let content = std::fs::read_to_string(&path)
+                    .unwrap_or_else(|error| panic!("could not read {}: {error}", path.display()));
+                (path, content)
+            })
+            .collect::<Vec<_>>();
+        fixtures.sort_by(|left, right| left.0.cmp(&right.0));
+        assert!(
+            !fixtures.is_empty(),
+            "{kind} fixture directory must not be empty"
         );
-        assert!(knowledge_cards_payload_is_valid(payload));
-        let rendered = serde_json::to_value(knowledge_cards_message(payload).unwrap())
-            .unwrap()
+        fixtures
+    }
+
+    fn assert_fixture_is_sanitized(path: &std::path::Path, content: &str) {
+        let lower = content.to_ascii_lowercase();
+        for forbidden in [
+            "access_token",
+            "refresh_token",
+            "authorization:",
+            "client_secret",
+            "cookie:",
+            "code=",
+        ] {
+            assert!(
+                !lower.contains(forbidden),
+                "fixture {} contains forbidden credential-shaped text: {forbidden}",
+                path.display()
+            );
+        }
+    }
+
+    #[test]
+    fn knowledge_card_fixtures_preserve_valid_incidents() {
+        for (path, content) in knowledge_card_fixtures("valid") {
+            assert_fixture_is_sanitized(&path, &content);
+            assert!(
+                knowledge_cards_marker_present(&content),
+                "valid fixture has no marker: {}",
+                path.display()
+            );
+            assert!(
+                knowledge_cards_payload_is_valid(&content),
+                "valid fixture was rejected: {}",
+                path.display()
+            );
+            let rendered = serde_json::to_value(
+                knowledge_cards_message(&content)
+                    .unwrap_or_else(|| panic!("valid fixture did not render: {}", path.display())),
+            )
+            .expect("knowledge card message should serialize")
             .to_string();
-        assert!(rendered.contains("反穀"));
-        assert!(!rendered.contains("Example"));
+            assert!(rendered.contains("EXPECT_RENDER"), "{}", path.display());
+            assert!(!rendered.contains("DO_NOT_RENDER"), "{}", path.display());
+            assert!(
+                !rendered.contains(KNOWLEDGE_CARDS_PREFIX),
+                "{}",
+                path.display()
+            );
+            assert!(
+                !rendered.contains(KNOWLEDGE_CARDS_INVALID_FALLBACK),
+                "{}",
+                path.display()
+            );
+        }
+    }
+
+    #[test]
+    fn knowledge_card_fixtures_fail_closed_for_invalid_incidents() {
+        for (path, content) in knowledge_card_fixtures("invalid") {
+            assert_fixture_is_sanitized(&path, &content);
+            assert!(
+                knowledge_cards_marker_present(&content),
+                "invalid fixture has no marker: {}",
+                path.display()
+            );
+            assert!(
+                !knowledge_cards_payload_is_valid(&content),
+                "invalid fixture was unexpectedly accepted: {}",
+                path.display()
+            );
+            assert!(
+                knowledge_cards_message(&content).is_none(),
+                "{}",
+                path.display()
+            );
+            let fallback = serde_json::to_value(knowledge_delivery_message(&content, 99))
+                .expect("knowledge fallback should serialize")
+                .to_string();
+            assert!(
+                fallback.contains(KNOWLEDGE_CARDS_INVALID_FALLBACK),
+                "{}",
+                path.display()
+            );
+            assert!(!fallback.contains("DO_NOT_RENDER"), "{}", path.display());
+            assert!(
+                !fallback.contains(KNOWLEDGE_CARDS_PREFIX),
+                "{}",
+                path.display()
+            );
+        }
     }
 
     #[test]

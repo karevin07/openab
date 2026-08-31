@@ -1,0 +1,3 @@
+OPENAB_KNOWLEDGE_CARDS_V1
+{"kind":"search","heading":"Example results","items":[{"title":"DO_NOT_RENDER untrusted result","url":"https://app.notion.com/p/cccccccccccccccccccccccccccccccc","meta":"Example","summary":"Example summary"}]}
+DO_NOT_RENDER unverified trailing content
