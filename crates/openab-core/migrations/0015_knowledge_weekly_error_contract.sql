@@ -1,0 +1,5 @@
+UPDATE knowledge_global_actions
+SET prompt_template = '使用 notion-knowledge Skill 執行 Scheduled Source Audit。以 Asia/Taipei 計算前一個星期二 00:00（含）到本星期二 00:00（不含）的七天區間，逐一查詢 Structured Knowledge Adapter 中全部 scheduled sources。只計算 Notion page created_time 落在區間內的實際文章或 edition 子頁；collection home、database、view 與 hub 本身都不是文章。必須完成 pagination，依 source_id + page_id 去重，不可用搜尋結果數量或原生內容日期冒充新增數。若來源無新增，status 使用 no_updates；完整查詢且有新增使用 updated；無法完成 pagination 或部分結果不可靠使用 partial 並填 error；來源完全無法查詢或 schema drift 使用 failed 並填 error。每個來源都必須出現一次。最後只能輸出 OPENAB_KNOWLEDGE_WEEKLY_V1 換行後的一個 JSON object，不要 Markdown fence、前言、摘要或其他文字。JSON 必須包含 window_start、window_end、queried_at（皆為含 timezone 的 ISO-8601）與 sources。每個 source 必須包含 source_id、title、url、status、error、items；error 一律是 JSON string，updated 與 no_updates 使用空字串 ""，partial 與 failed 使用非空字串，禁止使用 null。每個 item 必須包含 page_id、title、url、created_at。items 只包含區間內新增頁面，最多 200 筆；若超過或工具限制導致不完整，使用 partial。這份統計只表示有沒有偵測到新增內容，不可聲稱已直接驗證外部排程執行紀錄。'
+WHERE action_id = 'weekly_source_audit';
+
+INSERT INTO schema_migrations(version) VALUES (15);

@@ -4,7 +4,7 @@ use crate::config::DiscordAdminControlConfig;
 use anyhow::{Context, Result};
 use chrono::{Datelike, Timelike, Weekday};
 use reqwest::StatusCode;
-use serde::{de::DeserializeOwned, Deserialize, Serialize};
+use serde::{de::DeserializeOwned, Deserialize, Deserializer, Serialize};
 use std::collections::HashSet;
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -39,10 +39,17 @@ pub struct KnowledgeWeeklySource {
     pub title: String,
     pub url: String,
     pub status: KnowledgeWeeklyStatus,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_nullable_string")]
     pub error: String,
     #[serde(default)]
     pub items: Vec<KnowledgeWeeklyItem>,
+}
+
+fn deserialize_nullable_string<'de, D>(deserializer: D) -> Result<String, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    Ok(Option::<String>::deserialize(deserializer)?.unwrap_or_default())
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -494,11 +501,11 @@ pub fn validate_scheduled_articles(articles: &[ScheduledArticle]) -> Result<()> 
 }
 
 pub fn knowledge_weekly_marker_present(content: &str) -> bool {
-    content.contains(KNOWLEDGE_WEEKLY_MARKER)
+    knowledge_weekly_payload(content).is_some()
 }
 
 pub fn parse_knowledge_weekly_audit(content: &str) -> Result<Option<KnowledgeWeeklyAudit>> {
-    let Some((_, payload)) = content.split_once(KNOWLEDGE_WEEKLY_MARKER) else {
+    let Some(payload) = knowledge_weekly_payload(content) else {
         return Ok(None);
     };
     anyhow::ensure!(
@@ -513,6 +520,18 @@ pub fn parse_knowledge_weekly_audit(content: &str) -> Result<Option<KnowledgeWee
         serde_json::from_str(payload).context("parse knowledge weekly payload")?;
     validate_knowledge_weekly_audit(&audit)?;
     Ok(Some(audit))
+}
+
+fn knowledge_weekly_payload(content: &str) -> Option<&str> {
+    let mut offset = 0;
+    for line in content.split_inclusive('\n') {
+        let marker = line.trim_end_matches(['\r', '\n']).trim();
+        if marker == KNOWLEDGE_WEEKLY_MARKER {
+            return Some(&content[offset + line.len()..]);
+        }
+        offset += line.len();
+    }
+    None
 }
 
 fn validate_knowledge_weekly_audit(audit: &KnowledgeWeeklyAudit) -> Result<()> {
@@ -1325,6 +1344,27 @@ OPENAB_KNOWLEDGE_WEEKLY_V1
         assert_eq!(audit.sources.len(), 3);
         assert_eq!(audit.sources[0].items.len(), 1);
         assert_eq!(audit.sources[2].status, KnowledgeWeeklyStatus::Failed);
+    }
+
+    #[test]
+    fn knowledge_weekly_contract_normalizes_null_error_for_success() {
+        let payload = r#"
+OPENAB_KNOWLEDGE_WEEKLY_V1
+{"window_start":"2026-08-18T00:00:00+08:00","window_end":"2026-08-25T00:00:00+08:00","queried_at":"2026-08-25T08:40:00+08:00","sources":[{"source_id":"source_a","title":"Source A","url":"https://www.notion.so/source-a","status":"updated","error":null,"items":[{"page_id":"page-a","title":"Article A","url":"https://www.notion.so/article-a","created_at":"2026-08-20T12:00:00+08:00"}]},{"source_id":"source_b","title":"Source B","url":"https://www.notion.so/source-b","status":"no_updates","error":null,"items":[]},{"source_id":"source_c","title":"Source C","url":"https://www.notion.so/source-c","status":"failed","error":"connector unavailable","items":[]}]}
+"#;
+
+        let audit = parse_knowledge_weekly_audit(payload).unwrap().unwrap();
+
+        assert!(audit.sources[0].error.is_empty());
+        assert!(audit.sources[1].error.is_empty());
+    }
+
+    #[test]
+    fn knowledge_weekly_marker_must_be_on_its_own_line() {
+        let prompt = "最後只能輸出 OPENAB_KNOWLEDGE_WEEKLY_V1 換行後的一個 JSON object";
+
+        assert!(!knowledge_weekly_marker_present(prompt));
+        assert!(parse_knowledge_weekly_audit(prompt).unwrap().is_none());
     }
 
     #[test]

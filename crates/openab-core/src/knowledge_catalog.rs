@@ -26,6 +26,7 @@ const MIGRATION_0011: &str = include_str!("../migrations/0011_scheduled_article_
 const MIGRATION_0012: &str = include_str!("../migrations/0012_knowledge_hub_navigation.sql");
 const MIGRATION_0013: &str = include_str!("../migrations/0013_reading_list_epub.sql");
 const MIGRATION_0014: &str = include_str!("../migrations/0014_reading_list_epub_intake.sql");
+const MIGRATION_0015: &str = include_str!("../migrations/0015_knowledge_weekly_error_contract.sql");
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -300,6 +301,7 @@ impl KnowledgeCatalog {
             (12, MIGRATION_0012),
             (13, MIGRATION_0013),
             (14, MIGRATION_0014),
+            (15, MIGRATION_0015),
         ] {
             let applied = connection
                 .query_row(
@@ -854,7 +856,9 @@ mod tests {
                 row.get(0)
             })
             .unwrap();
-        assert_eq!(version, 14);
+        assert_eq!(version, 15);
+        let weekly = catalog.global_action("weekly_source_audit").unwrap();
+        assert!(weekly.prompt_template.contains("禁止使用 null"));
         let world = catalog
             .sources
             .iter()
