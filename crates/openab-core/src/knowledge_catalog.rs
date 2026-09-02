@@ -27,6 +27,7 @@ const MIGRATION_0012: &str = include_str!("../migrations/0012_knowledge_hub_navi
 const MIGRATION_0013: &str = include_str!("../migrations/0013_reading_list_epub.sql");
 const MIGRATION_0014: &str = include_str!("../migrations/0014_reading_list_epub_intake.sql");
 const MIGRATION_0015: &str = include_str!("../migrations/0015_knowledge_weekly_error_contract.sql");
+const MIGRATION_0016: &str = include_str!("../migrations/0016_reading_list_epub_audit.sql");
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -302,6 +303,7 @@ impl KnowledgeCatalog {
             (13, MIGRATION_0013),
             (14, MIGRATION_0014),
             (15, MIGRATION_0015),
+            (16, MIGRATION_0016),
         ] {
             let applied = connection
                 .query_row(
@@ -856,7 +858,7 @@ mod tests {
                 row.get(0)
             })
             .unwrap();
-        assert_eq!(version, 15);
+        assert_eq!(version, 16);
         let weekly = catalog.global_action("weekly_source_audit").unwrap();
         assert!(weekly.prompt_template.contains("禁止使用 null"));
         let world = catalog
@@ -872,6 +874,7 @@ mod tests {
         let reading = catalog.source("personal_reading_list").unwrap();
         assert!(reading.action("recent_finance").is_some());
         assert!(reading.action("intake").is_some());
+        assert!(reading.action("audit").is_some());
         assert!(reading
             .fields
             .iter()

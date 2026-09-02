@@ -1117,7 +1117,7 @@ fn parse_and_validate_knowledge_cards(
     let envelope = parse_knowledge_card_envelope(content)?;
     let max_items = if matches!(
         envelope.kind.as_str(),
-        "search" | "synthesis" | "project_notes"
+        "search" | "synthesis" | "project_notes" | "epub_audit"
     ) {
         KNOWLEDGE_RESULTS_MAX
     } else {
@@ -1136,6 +1136,7 @@ fn parse_and_validate_knowledge_cards(
         && envelope.kind != "project_note_preview"
         && envelope.kind != "capture_preview"
         && envelope.kind != "epub_intake_preview"
+        && envelope.kind != "epub_audit"
     {
         return None;
     }
@@ -1151,7 +1152,9 @@ fn parse_and_validate_knowledge_cards(
     if envelope.kind == "epub_intake_preview" && envelope.items.len() != 1 {
         return None;
     }
-    if envelope.kind == "synthesis" && envelope.overview.trim().is_empty() {
+    if matches!(envelope.kind.as_str(), "synthesis" | "epub_audit")
+        && envelope.overview.trim().is_empty()
+    {
         return None;
     }
     if envelope.job_run.is_some() && envelope.kind != "retention" {
@@ -1169,7 +1172,7 @@ fn parse_and_validate_knowledge_cards(
 
     for item in &envelope.items {
         let requires_url = envelope.kind != "project_note_preview";
-        let notion_only = envelope.kind != "capture_preview";
+        let notion_only = envelope.kind != "capture_preview" && envelope.kind != "epub_audit";
         let url = item.url.trim();
         if (requires_url && !knowledge_card_url_is_valid(url, notion_only))
             || item.title.trim().is_empty()
@@ -1203,6 +1206,18 @@ fn knowledge_card_url_is_valid(url: &str, notion_only: bool) -> bool {
         url.starts_with("https://app.notion.com/")
     } else {
         url.starts_with("https://")
+    }
+}
+
+fn knowledge_card_link_label(kind: &str, url: &str) -> &'static str {
+    if kind != "epub_audit" || url.starts_with("https://app.notion.com/") {
+        "開啟 Notion"
+    } else if url.starts_with("https://drive.google.com/") {
+        "開啟 Drive"
+    } else if url.starts_with("https://discord.com/") {
+        "開啟 Discord"
+    } else {
+        "開啟連結"
     }
 }
 
@@ -1265,7 +1280,7 @@ fn knowledge_components_v2_page_message(
 ) -> Option<ComponentsV2Message> {
     if !matches!(
         envelope.kind.as_str(),
-        "search" | "synthesis" | "project_notes"
+        "search" | "synthesis" | "project_notes" | "epub_audit"
     ) {
         return None;
     }
@@ -1279,6 +1294,7 @@ fn knowledge_components_v2_page_message(
     let accent_color = match envelope.kind.as_str() {
         "project_notes" => 0x57F287,
         "synthesis" => 0xF2C94C,
+        "epub_audit" => 0x5865F2,
         _ => 0x2F80ED,
     };
     let heading = truncate_chars(envelope.heading.trim(), 240);
@@ -1289,7 +1305,7 @@ fn knowledge_components_v2_page_message(
     };
     let mut card_components = vec![components_v2_text(format!("## {heading}"))];
 
-    if envelope.kind == "synthesis" {
+    if matches!(envelope.kind.as_str(), "synthesis" | "epub_audit") {
         card_components.push(components_v2_text(suppress_mentions(&truncate_chars(
             envelope.overview.trim(),
             KNOWLEDGE_MESSAGE_CONTENT_MAX,
@@ -1333,7 +1349,7 @@ fn knowledge_components_v2_page_message(
             accessory: ComponentsV2LinkButton {
                 component_type: 2,
                 style: 5,
-                label: "開啟 Notion".to_string(),
+                label: knowledge_card_link_label(&envelope.kind, item.url.trim()).to_string(),
                 url: item.url.trim().to_string(),
             },
         }));
@@ -1441,7 +1457,7 @@ fn knowledge_cards_message_for(content: &str, capture_owner: Option<u64>) -> Opt
     let (envelope, project) = parse_and_validate_knowledge_cards(content)?;
 
     let heading = truncate_chars(envelope.heading.trim(), 240);
-    let message_content = if envelope.kind == "synthesis" {
+    let message_content = if matches!(envelope.kind.as_str(), "synthesis" | "epub_audit") {
         let overview = truncate_chars(
             envelope.overview.trim(),
             KNOWLEDGE_MESSAGE_CONTENT_MAX.saturating_sub(heading.chars().count() + 2),
@@ -1456,7 +1472,10 @@ fn knowledge_cards_message_for(content: &str, capture_owner: Option<u64>) -> Opt
         return Some(message);
     }
 
-    if envelope.kind == "search" || envelope.kind == "synthesis" || envelope.kind == "project_notes"
+    if envelope.kind == "search"
+        || envelope.kind == "synthesis"
+        || envelope.kind == "project_notes"
+        || envelope.kind == "epub_audit"
     {
         return Some(message.embeds(vec![ranked_knowledge_list_embed(
             &envelope.kind,
@@ -13733,6 +13752,7 @@ mod tests {
         assert!(rendered.contains("oab_knowledge:reading_list_current"));
         assert!(rendered.contains("oab_knowledge:reading_list_search"));
         assert!(rendered.contains("oab_knowledge:reading_list_overview"));
+        assert!(rendered.contains("oab_knowledge:reading_list_audit"));
         assert!(rendered.contains("不會變更閱讀狀態或評分"));
 
         let components = serde_json::to_value(knowledge_reading_list_message()).unwrap();
@@ -13757,6 +13777,9 @@ mod tests {
         let (_, intake) = knowledge_reading_list_prompt("intake").unwrap();
         assert!(intake.contains("恰好一個 .epub"));
         assert!(intake.contains("reading_list_epub_preview"));
+        let (_, audit) = knowledge_reading_list_prompt("audit").unwrap();
+        assert!(audit.contains("完整 pagination"));
+        assert!(audit.contains("reading_list_epub_audit"));
         assert!(knowledge_reading_list_prompt("delete").is_none());
     }
 
@@ -14008,6 +14031,23 @@ mod tests {
             r#"{"kind":"retention","heading":"待確認","items":[{"title":"Old article","url":"https://app.notion.com/p/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","source_id":"weekly_reading_digest","target_page_id":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","queue_page_id":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","delete_after":"2026-09-02"}]}"#,
         );
         assert!(knowledge_components_v2_message(retention, 7, None).is_none());
+    }
+
+    #[test]
+    fn epub_audit_cards_accept_drive_links_without_repair_controls() {
+        let audit = concat!(
+            "OPENAB_KNOWLEDGE_CARDS_V1\n",
+            r#"{"kind":"epub_audit","heading":"Reading List｜EPUB 健檢","overview":"Partial · Notion 10 · Drive 8 · Errors 1 · Warnings 1","items":[{"title":"Unmapped.epub","url":"https://drive.google.com/file/d/abcdefghijk/view","meta":"⚠️ warning · drive_file_unmapped","summary":"Drive 有 EPUB，但 Notion 未配對。","next_step":"確認書目後再處理。"}]}"#,
+        );
+        assert!(knowledge_cards_payload_is_valid(audit));
+        let rendered =
+            serde_json::to_value(knowledge_components_v2_message(audit, 7, None).unwrap())
+                .unwrap()
+                .to_string();
+        assert!(rendered.contains("開啟 Drive"));
+        assert!(rendered.contains("Partial · Notion 10"));
+        assert!(!rendered.contains("確認收錄"));
+        assert!(!rendered.contains("確認上傳"));
     }
 
     #[test]
