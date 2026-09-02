@@ -2660,8 +2660,24 @@ fn knowledge_capture_modal() -> CreateModal {
     knowledge_global_modal("capture").expect("seeded capture workflow")
 }
 
+fn knowledge_capture_inbox_modal() -> CreateModal {
+    knowledge_global_modal("capture_inbox").expect("seeded capture inbox workflow")
+}
+
 fn knowledge_search_modal() -> CreateModal {
     knowledge_global_modal("search").expect("seeded search workflow")
+}
+
+/// Maps a Knowledge Home button to the modal it opens. Every visible home
+/// action whose behavior is `modal` must resolve here, or pressing its button
+/// falls through to the "operation expired" reply.
+fn knowledge_home_modal(action: &str) -> Option<CreateModal> {
+    match action {
+        "capture" => Some(knowledge_capture_modal()),
+        "capture_inbox" => Some(knowledge_capture_inbox_modal()),
+        "search" => Some(knowledge_search_modal()),
+        _ => None,
+    }
 }
 
 fn project_welcome_components(tasks: &[TaskRecord]) -> Vec<CreateActionRow> {
@@ -8687,12 +8703,7 @@ impl Handler {
                 .await;
             return;
         }
-        let modal = match action {
-            "capture" => Some(knowledge_capture_modal()),
-            "search" => Some(knowledge_search_modal()),
-            _ => None,
-        };
-        if let Some(modal) = modal {
+        if let Some(modal) = knowledge_home_modal(action) {
             if let Err(error) = comp
                 .create_response(&ctx.http, CreateInteractionResponse::Modal(modal))
                 .await
@@ -14103,6 +14114,24 @@ mod tests {
         let skips_empty = knowledge_request_preview("查詢知識", &filtered);
         assert_eq!(skips_empty, "查詢知識\n- 問題: 什麼是 Agent");
         assert!(!skips_empty.contains("未提供"));
+    }
+
+    #[test]
+    fn every_modal_home_action_opens_a_modal() {
+        let catalog = knowledge_catalog();
+        let modal_actions: Vec<&str> = catalog
+            .global_actions_for("home")
+            .iter()
+            .filter(|action| action.behavior == "modal")
+            .map(|action| action.action_id.as_str())
+            .collect();
+        assert!(modal_actions.contains(&"capture_inbox"));
+        for action_id in modal_actions {
+            assert!(
+                knowledge_home_modal(action_id).is_some(),
+                "Knowledge Home action {action_id} has no modal; its button would report the operation as expired"
+            );
+        }
     }
 
     #[test]
