@@ -918,6 +918,10 @@ struct KnowledgeCardEnvelope {
     #[serde(default)]
     project_id: String,
     #[serde(default)]
+    inbox_id: String,
+    #[serde(default)]
+    item_index: u8,
+    #[serde(default)]
     job_run: Option<ScheduledJobRun>,
     /// Bulk article mirror for the retention cron run. Never rendered into
     /// the Discord card; it travels to the Admin Bot telemetry API instead.
@@ -1135,6 +1139,7 @@ fn parse_and_validate_knowledge_cards(
         && envelope.kind != "project_notes"
         && envelope.kind != "project_note_preview"
         && envelope.kind != "capture_preview"
+        && envelope.kind != "capture_inbox_preview"
         && envelope.kind != "epub_intake_preview"
         && envelope.kind != "epub_audit"
     {
@@ -1150,6 +1155,13 @@ fn parse_and_validate_knowledge_cards(
         return None;
     }
     if envelope.kind == "epub_intake_preview" && envelope.items.len() != 1 {
+        return None;
+    }
+    if envelope.kind == "capture_inbox_preview"
+        && (envelope.items.len() != 1
+            || uuid::Uuid::parse_str(envelope.inbox_id.trim()).is_err()
+            || !(1..=10).contains(&envelope.item_index))
+    {
         return None;
     }
     if matches!(envelope.kind.as_str(), "synthesis" | "epub_audit")
@@ -1172,7 +1184,9 @@ fn parse_and_validate_knowledge_cards(
 
     for item in &envelope.items {
         let requires_url = envelope.kind != "project_note_preview";
-        let notion_only = envelope.kind != "capture_preview" && envelope.kind != "epub_audit";
+        let notion_only = envelope.kind != "capture_preview"
+            && envelope.kind != "capture_inbox_preview"
+            && envelope.kind != "epub_audit";
         let url = item.url.trim();
         if (requires_url && !knowledge_card_url_is_valid(url, notion_only))
             || item.title.trim().is_empty()
@@ -1512,6 +1526,7 @@ fn knowledge_cards_message_for(content: &str, capture_owner: Option<u64>) -> Opt
             "retention" => 0xE67E22,
             "project_note_preview" => 0x57F287,
             "capture_preview" => 0x5865F2,
+            "capture_inbox_preview" => 0x3498DB,
             "epub_intake_preview" => 0x9B59B6,
             _ => 0x2F80ED,
         };
@@ -1576,6 +1591,33 @@ fn knowledge_cards_message_for(content: &str, capture_owner: Option<u64>) -> Opt
             ))
             .label(cancel_action.label.clone())
             .style(knowledge_button_style(&cancel_action.button_style)),
+        ])]);
+    } else if envelope.kind == "capture_inbox_preview" {
+        let accept_action = catalog.global_action("capture_inbox_accept")?;
+        let skip_action = catalog.global_action("capture_inbox_skip")?;
+        let modify_action = catalog.global_action("capture_inbox_modify")?;
+        let Some(owner_id) = capture_owner else {
+            warn!("capture_inbox_preview card missing owner; posting embed without controls");
+            return Some(message);
+        };
+        let inbox_id = uuid::Uuid::parse_str(envelope.inbox_id.trim()).ok()?;
+        let item_index = envelope.item_index;
+        message = message.components(vec![CreateActionRow::Buttons(vec![
+            CreateButton::new(format!(
+                "oab_knowledge:ci_accept:{owner_id}:{inbox_id}:{item_index}"
+            ))
+            .label(accept_action.label.clone())
+            .style(knowledge_button_style(&accept_action.button_style)),
+            CreateButton::new(format!(
+                "oab_knowledge:ci_skip:{owner_id}:{inbox_id}:{item_index}"
+            ))
+            .label(skip_action.label.clone())
+            .style(knowledge_button_style(&skip_action.button_style)),
+            CreateButton::new(format!(
+                "oab_knowledge:ci_modify:{owner_id}:{inbox_id}:{item_index}"
+            ))
+            .label(modify_action.label.clone())
+            .style(knowledge_button_style(&modify_action.button_style)),
         ])]);
     } else if envelope.kind == "epub_intake_preview" {
         let confirm_action = catalog.global_action("epub_intake_confirm")?;
@@ -1741,6 +1783,30 @@ fn knowledge_global_modal(action_id: &str) -> Option<CreateModal> {
     Some(
         CreateModal::new(
             format!("oab_knowledge_modal:{action_id}"),
+            action.title.clone(),
+        )
+        .components(knowledge_input_rows(&action.inputs)?),
+    )
+}
+
+fn parse_capture_inbox_binding(value: &str) -> Option<(u64, uuid::Uuid, u8)> {
+    let mut parts = value.split(':');
+    let owner_id = parts.next()?.parse::<u64>().ok()?;
+    let inbox_id = uuid::Uuid::parse_str(parts.next()?).ok()?;
+    let item_index = parts.next()?.parse::<u8>().ok()?;
+    (parts.next().is_none() && (1..=10).contains(&item_index))
+        .then_some((owner_id, inbox_id, item_index))
+}
+
+fn knowledge_capture_inbox_modify_modal(
+    owner_id: u64,
+    inbox_id: uuid::Uuid,
+    item_index: u8,
+) -> Option<CreateModal> {
+    let action = knowledge_catalog().global_action("capture_inbox_modify")?;
+    Some(
+        CreateModal::new(
+            format!("oab_kim:{owner_id}:{inbox_id}:{item_index}"),
             action.title.clone(),
         )
         .components(knowledge_input_rows(&action.inputs)?),
@@ -6401,7 +6467,8 @@ impl EventHandler for Handler {
                 self.handle_project_new_task_modal(&ctx, &modal).await;
             }
             Interaction::Modal(modal)
-                if modal.data.custom_id.starts_with("oab_knowledge_modal:") =>
+                if modal.data.custom_id.starts_with("oab_knowledge_modal:")
+                    || modal.data.custom_id.starts_with("oab_kim:") =>
             {
                 self.handle_knowledge_modal(&ctx, &modal).await;
             }
@@ -7801,6 +7868,145 @@ impl Handler {
             .custom_id
             .strip_prefix("oab_knowledge:")
             .unwrap_or("");
+        for (prefix, action_id, progress) in [
+            (
+                "ci_accept:",
+                "capture_inbox_accept",
+                "⏳ 正在重新核對、寫入並驗證這筆 Knowledge Library 項目……",
+            ),
+            (
+                "ci_skip:",
+                "capture_inbox_skip",
+                "⏭️ 正在略過這筆並準備下一筆預覽……",
+            ),
+        ] {
+            if let Some(bound) = action.strip_prefix(prefix) {
+                let Some((owner_id, inbox_id, item_index)) = parse_capture_inbox_binding(bound)
+                else {
+                    let _ = comp
+                        .create_response(
+                            &ctx.http,
+                            CreateInteractionResponse::Message(
+                                CreateInteractionResponseMessage::new()
+                                    .content("⚠️ 這筆 Inbox 預覽已失效，請重新開啟批次 Inbox。")
+                                    .ephemeral(true),
+                            ),
+                        )
+                        .await;
+                    return;
+                };
+                if comp.user.id.get() != owner_id {
+                    let _ = comp
+                        .create_response(
+                            &ctx.http,
+                            CreateInteractionResponse::Message(
+                                CreateInteractionResponseMessage::new()
+                                    .content("🔒 只有這個 Capture Inbox 的發起人可以處理項目。")
+                                    .ephemeral(true),
+                            ),
+                        )
+                        .await;
+                    return;
+                }
+                if let Err(error) = comp
+                    .create_response(
+                        &ctx.http,
+                        CreateInteractionResponse::UpdateMessage(
+                            CreateInteractionResponseMessage::new()
+                                .content(progress)
+                                .embeds(Vec::new())
+                                .components(Vec::new()),
+                        ),
+                    )
+                    .await
+                {
+                    tracing::error!(%error, %inbox_id, item_index, "failed to acknowledge Capture Inbox decision");
+                    return;
+                }
+                let inbox_id = inbox_id.to_string();
+                let item_index = item_index.to_string();
+                let preview_message_id = comp.message.id.to_string();
+                let user_id = comp.user.id.get().to_string();
+                let submitted = [
+                    ("inbox_id", inbox_id.as_str()),
+                    ("item_index", item_index.as_str()),
+                    ("Discord preview message ID", preview_message_id.as_str()),
+                    ("Discord user ID", user_id.as_str()),
+                ];
+                let Some((action_title, prompt)) =
+                    knowledge_global_prompt(action_id, &submitted, None)
+                else {
+                    let _ = comp
+                        .edit_response(
+                            &ctx.http,
+                            EditInteractionResponse::new()
+                                .content("⚠️ Capture Inbox 工作流設定已失效。"),
+                        )
+                        .await;
+                    return;
+                };
+                if let Err(error) = self
+                    .submit_knowledge_prompt(
+                        ctx,
+                        scope,
+                        &comp.user,
+                        &action_title,
+                        prompt,
+                        None,
+                        false,
+                    )
+                    .await
+                {
+                    let _ = comp
+                        .edit_response(
+                            &ctx.http,
+                            EditInteractionResponse::new()
+                                .content(format!("⚠️ 無法處理 Inbox 項目：{error}")),
+                        )
+                        .await;
+                }
+                return;
+            }
+        }
+        if let Some(bound) = action.strip_prefix("ci_modify:") {
+            let Some((owner_id, inbox_id, item_index)) = parse_capture_inbox_binding(bound) else {
+                let _ = comp
+                    .create_response(
+                        &ctx.http,
+                        CreateInteractionResponse::Message(
+                            CreateInteractionResponseMessage::new()
+                                .content("⚠️ 這筆 Inbox 預覽已失效，請重新開啟批次 Inbox。")
+                                .ephemeral(true),
+                        ),
+                    )
+                    .await;
+                return;
+            };
+            if comp.user.id.get() != owner_id {
+                let _ = comp
+                    .create_response(
+                        &ctx.http,
+                        CreateInteractionResponse::Message(
+                            CreateInteractionResponseMessage::new()
+                                .content("🔒 只有這個 Capture Inbox 的發起人可以修改預覽。")
+                                .ephemeral(true),
+                        ),
+                    )
+                    .await;
+                return;
+            }
+            let Some(modal) = knowledge_capture_inbox_modify_modal(owner_id, inbox_id, item_index)
+            else {
+                return;
+            };
+            if let Err(error) = comp
+                .create_response(&ctx.http, CreateInteractionResponse::Modal(modal))
+                .await
+            {
+                tracing::error!(%error, %inbox_id, item_index, "failed to open Capture Inbox modify modal");
+            }
+            return;
+        }
         if action == "side_project" {
             let selected = first_string_select(&comp.data.kind).and_then(knowledge_side_project);
             let Some(project) = selected else {
@@ -8591,6 +8797,85 @@ impl Handler {
                 return;
             }
         };
+        if let Some(bound) = modal.data.custom_id.strip_prefix("oab_kim:") {
+            let Some((owner_id, inbox_id, item_index)) = parse_capture_inbox_binding(bound) else {
+                let _ = modal
+                    .create_response(
+                        &ctx.http,
+                        CreateInteractionResponse::Message(
+                            CreateInteractionResponseMessage::new()
+                                .content("⚠️ 這筆 Inbox 預覽已失效。")
+                                .ephemeral(true),
+                        ),
+                    )
+                    .await;
+                return;
+            };
+            if modal.user.id.get() != owner_id {
+                let _ = modal
+                    .create_response(
+                        &ctx.http,
+                        CreateInteractionResponse::Message(
+                            CreateInteractionResponseMessage::new()
+                                .content("🔒 只有這個 Capture Inbox 的發起人可以修改預覽。")
+                                .ephemeral(true),
+                        ),
+                    )
+                    .await;
+                return;
+            }
+            let Some(instruction) = modal_input_value(modal, "instruction")
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+            else {
+                let _ = modal
+                    .create_response(
+                        &ctx.http,
+                        CreateInteractionResponse::Message(
+                            CreateInteractionResponseMessage::new()
+                                .content("⚠️ 修改指示不可為空。")
+                                .ephemeral(true),
+                        ),
+                    )
+                    .await;
+                return;
+            };
+            if let Err(error) = modal.defer_ephemeral(&ctx.http).await {
+                tracing::error!(%error, %inbox_id, item_index, "failed to defer Capture Inbox modification");
+                return;
+            }
+            let inbox_id = inbox_id.to_string();
+            let item_index = item_index.to_string();
+            let submitted = [
+                ("inbox_id", inbox_id.as_str()),
+                ("item_index", item_index.as_str()),
+                ("instruction", instruction),
+            ];
+            let Some((title, prompt)) =
+                knowledge_global_prompt("capture_inbox_modify", &submitted, None)
+            else {
+                return;
+            };
+            let result = self
+                .submit_knowledge_prompt(
+                    ctx,
+                    scope,
+                    &modal.user,
+                    &title,
+                    prompt,
+                    Some("正在依修改指示更新這筆預覽。"),
+                    false,
+                )
+                .await;
+            let content = result.map_or_else(
+                |error| format!("⚠️ 無法修改 Inbox 預覽：{error}"),
+                |thread_id| format!("✅ 已在 <#{thread_id}> 更新這筆預覽。"),
+            );
+            let _ = modal
+                .edit_response(&ctx.http, EditInteractionResponse::new().content(content))
+                .await;
+            return;
+        }
         let action = modal
             .data
             .custom_id
@@ -13579,6 +13864,7 @@ mod tests {
         let value = serde_json::to_value(knowledge_home_message()).unwrap();
         let rendered = value.to_string();
         assert!(rendered.contains("oab_knowledge:capture"));
+        assert!(rendered.contains("oab_knowledge:capture_inbox"));
         assert!(rendered.contains("oab_knowledge:search"));
         assert!(rendered.contains("oab_knowledge:project"));
         assert!(rendered.contains("oab_knowledge:reading_list"));
@@ -13827,6 +14113,13 @@ mod tests {
         assert!(capture.contains("oab_knowledge_modal:capture"));
         assert!(capture.contains("source"));
         assert!(capture.contains("classification"));
+        let inbox = serde_json::to_value(
+            knowledge_global_modal("capture_inbox").expect("capture inbox modal"),
+        )
+        .unwrap()
+        .to_string();
+        assert!(inbox.contains("oab_knowledge_modal:capture_inbox"));
+        assert!(inbox.contains("urls"));
 
         let search = serde_json::to_value(knowledge_search_modal())
             .unwrap()
@@ -14312,6 +14605,40 @@ mod tests {
             "OPENAB_KNOWLEDGE_CARDS_V1\n{}",
             r#"{"kind":"search","heading":"bad","items":[{"title":"x","url":"https://example.com/x","meta":"","summary":""}]}"#
         )));
+    }
+
+    #[test]
+    fn knowledge_capture_inbox_preview_binds_per_item_controls() {
+        let payload = concat!(
+            "OPENAB_KNOWLEDGE_CARDS_V1\n",
+            r#"{"kind":"capture_inbox_preview","heading":"Capture Inbox｜1 / 3","inbox_id":"11111111-2222-4333-8444-555555555555","item_index":1,"items":[{"title":"Agent reliability notes","url":"https://example.com/agent-reliability","meta":"Guide · AI · create","summary":"Production reliability patterns","next_step":"選擇收錄、略過或修改。"}]}"#,
+        );
+        assert!(knowledge_cards_payload_is_valid(payload));
+        let rendered = serde_json::to_value(
+            knowledge_cards_message_for(payload, Some(42)).expect("capture inbox card"),
+        )
+        .unwrap()
+        .to_string();
+        assert!(
+            rendered.contains("oab_knowledge:ci_accept:42:11111111-2222-4333-8444-555555555555:1")
+        );
+        assert!(
+            rendered.contains("oab_knowledge:ci_skip:42:11111111-2222-4333-8444-555555555555:1")
+        );
+        assert!(
+            rendered.contains("oab_knowledge:ci_modify:42:11111111-2222-4333-8444-555555555555:1")
+        );
+        assert!(rendered.contains("收錄"));
+        assert!(rendered.contains("略過"));
+        assert!(rendered.contains("修改"));
+
+        let missing_binding = payload.replace(
+            r#","inbox_id":"11111111-2222-4333-8444-555555555555","item_index":1"#,
+            "",
+        );
+        assert!(!knowledge_cards_payload_is_valid(&missing_binding));
+        assert!(parse_capture_inbox_binding("42:11111111-2222-4333-8444-555555555555:1").is_some());
+        assert!(parse_capture_inbox_binding("42:not-a-uuid:1").is_none());
     }
 
     #[test]

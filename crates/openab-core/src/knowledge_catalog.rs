@@ -28,6 +28,7 @@ const MIGRATION_0013: &str = include_str!("../migrations/0013_reading_list_epub.
 const MIGRATION_0014: &str = include_str!("../migrations/0014_reading_list_epub_intake.sql");
 const MIGRATION_0015: &str = include_str!("../migrations/0015_knowledge_weekly_error_contract.sql");
 const MIGRATION_0016: &str = include_str!("../migrations/0016_reading_list_epub_audit.sql");
+const MIGRATION_0017: &str = include_str!("../migrations/0017_knowledge_capture_inbox.sql");
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -304,6 +305,7 @@ impl KnowledgeCatalog {
             (14, MIGRATION_0014),
             (15, MIGRATION_0015),
             (16, MIGRATION_0016),
+            (17, MIGRATION_0017),
         ] {
             let applied = connection
                 .query_row(
@@ -771,7 +773,7 @@ mod tests {
         let search = reading.action("search").unwrap();
         assert_eq!(search.inputs.len(), 5);
         assert_eq!(catalog.views.len(), 6);
-        assert_eq!(catalog.global_actions_for("home").len(), 6);
+        assert_eq!(catalog.global_actions_for("home").len(), 7);
         let home = catalog.view("home").unwrap();
         assert_eq!(
             home.config_string("hub_url").as_deref(),
@@ -858,7 +860,7 @@ mod tests {
                 row.get(0)
             })
             .unwrap();
-        assert_eq!(version, 16);
+        assert_eq!(version, 17);
         let weekly = catalog.global_action("weekly_source_audit").unwrap();
         assert!(weekly.prompt_template.contains("禁止使用 null"));
         let world = catalog
@@ -904,6 +906,12 @@ mod tests {
             .contains("capture_preview card contract"));
         assert!(catalog.global_action("capture_confirm").is_some());
         assert!(catalog.global_action("capture_cancel").is_some());
+        let inbox = catalog.global_action("capture_inbox").unwrap();
+        assert_eq!(inbox.inputs.len(), 3);
+        assert!(inbox.prompt_template.contains("knowledge_capture_inbox"));
+        assert!(catalog.global_action("capture_inbox_accept").is_some());
+        assert!(catalog.global_action("capture_inbox_skip").is_some());
+        assert!(catalog.global_action("capture_inbox_modify").is_some());
     }
 
     #[test]
