@@ -29,6 +29,8 @@ const MIGRATION_0014: &str = include_str!("../migrations/0014_reading_list_epub_
 const MIGRATION_0015: &str = include_str!("../migrations/0015_knowledge_weekly_error_contract.sql");
 const MIGRATION_0016: &str = include_str!("../migrations/0016_reading_list_epub_audit.sql");
 const MIGRATION_0017: &str = include_str!("../migrations/0017_knowledge_capture_inbox.sql");
+const MIGRATION_0018: &str =
+    include_str!("../migrations/0018_capture_inbox_card_binding.sql");
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -306,6 +308,7 @@ impl KnowledgeCatalog {
             (15, MIGRATION_0015),
             (16, MIGRATION_0016),
             (17, MIGRATION_0017),
+            (18, MIGRATION_0018),
         ] {
             let applied = connection
                 .query_row(
@@ -860,7 +863,7 @@ mod tests {
                 row.get(0)
             })
             .unwrap();
-        assert_eq!(version, 17);
+        assert_eq!(version, 18);
         let weekly = catalog.global_action("weekly_source_audit").unwrap();
         assert!(weekly.prompt_template.contains("禁止使用 null"));
         let world = catalog
@@ -912,6 +915,18 @@ mod tests {
         assert!(catalog.global_action("capture_inbox_accept").is_some());
         assert!(catalog.global_action("capture_inbox_skip").is_some());
         assert!(catalog.global_action("capture_inbox_modify").is_some());
+        assert!(inbox.prompt_template.contains("JSON 頂層必須同時包含"));
+        for action_id in [
+            "capture_inbox_accept",
+            "capture_inbox_skip",
+            "capture_inbox_modify",
+        ] {
+            assert!(catalog
+                .global_action(action_id)
+                .unwrap()
+                .prompt_template
+                .contains("必須帶上本次操作的 inbox_id"));
+        }
     }
 
     #[test]

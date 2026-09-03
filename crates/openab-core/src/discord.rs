@@ -1112,13 +1112,15 @@ fn parse_knowledge_card_envelope(content: &str) -> Option<KnowledgeCardEnvelope>
 /// True when `content` is a fully validated knowledge-cards payload that should
 /// be delivered to Discord unsplit so the marker/JSON are not broken apart.
 pub fn knowledge_cards_payload_is_valid(content: &str) -> bool {
-    parse_and_validate_knowledge_cards(content).is_some()
+    parse_and_validate_knowledge_cards(content).is_ok()
 }
 
+/// Validates a knowledge-cards envelope, naming the first failed check so an
+/// operator can tell a malformed card apart from a merely unsupported one.
 fn parse_and_validate_knowledge_cards(
     content: &str,
-) -> Option<(KnowledgeCardEnvelope, Option<&'static KnowledgeSource>)> {
-    let envelope = parse_knowledge_card_envelope(content)?;
+) -> Result<(KnowledgeCardEnvelope, Option<&'static KnowledgeSource>), &'static str> {
+    let envelope = parse_knowledge_card_envelope(content).ok_or("envelope is not parseable JSON")?;
     let max_items = if matches!(
         envelope.kind.as_str(),
         "search" | "synthesis" | "project_notes" | "epub_audit"
@@ -1130,8 +1132,11 @@ fn parse_and_validate_knowledge_cards(
     let empty_retention_run = envelope.kind == "retention"
         && envelope.items.is_empty()
         && envelope.job_run.is_some();
-    if (!empty_retention_run && envelope.items.is_empty()) || envelope.items.len() > max_items {
-        return None;
+    if !empty_retention_run && envelope.items.is_empty() {
+        return Err("items is empty");
+    }
+    if envelope.items.len() > max_items {
+        return Err("items exceeds the per-card maximum");
     }
     if envelope.kind != "search"
         && envelope.kind != "synthesis"
@@ -1143,43 +1148,47 @@ fn parse_and_validate_knowledge_cards(
         && envelope.kind != "epub_intake_preview"
         && envelope.kind != "epub_audit"
     {
-        return None;
+        return Err("kind is not a supported card contract");
     }
 
     let project = if envelope.kind == "project_notes" || envelope.kind == "project_note_preview" {
-        Some(knowledge_side_project(&envelope.project_id)?)
+        Some(knowledge_side_project(&envelope.project_id).ok_or("project_id is unknown")?)
     } else {
         None
     };
     if envelope.kind == "project_note_preview" && envelope.items.len() != 1 {
-        return None;
+        return Err("project_note_preview needs exactly one item");
     }
     if envelope.kind == "epub_intake_preview" && envelope.items.len() != 1 {
-        return None;
+        return Err("epub_intake_preview needs exactly one item");
     }
-    if envelope.kind == "capture_inbox_preview"
-        && (envelope.items.len() != 1
-            || uuid::Uuid::parse_str(envelope.inbox_id.trim()).is_err()
-            || !(1..=10).contains(&envelope.item_index))
-    {
-        return None;
+    if envelope.kind == "capture_inbox_preview" {
+        if envelope.items.len() != 1 {
+            return Err("capture_inbox_preview needs exactly one item");
+        }
+        if uuid::Uuid::parse_str(envelope.inbox_id.trim()).is_err() {
+            return Err("capture_inbox_preview is missing a valid inbox_id");
+        }
+        if !(1..=10).contains(&envelope.item_index) {
+            return Err("capture_inbox_preview is missing a valid item_index");
+        }
     }
     if matches!(envelope.kind.as_str(), "synthesis" | "epub_audit")
         && envelope.overview.trim().is_empty()
     {
-        return None;
+        return Err("overview is required for this kind");
     }
     if envelope.job_run.is_some() && envelope.kind != "retention" {
-        return None;
+        return Err("job_run is only valid on a retention card");
     }
     if let Some(run) = &envelope.job_run {
-        validate_scheduled_job_run(run).ok()?;
+        validate_scheduled_job_run(run).map_err(|_| "job_run failed validation")?;
     }
     if !envelope.articles.is_empty() {
         if envelope.kind != "retention" || envelope.job_run.is_none() {
-            return None;
+            return Err("articles are only valid on a retention job run");
         }
-        validate_scheduled_articles(&envelope.articles).ok()?;
+        validate_scheduled_articles(&envelope.articles).map_err(|_| "articles failed validation")?;
     }
 
     for item in &envelope.items {
@@ -1188,28 +1197,31 @@ fn parse_and_validate_knowledge_cards(
             && envelope.kind != "capture_inbox_preview"
             && envelope.kind != "epub_audit";
         let url = item.url.trim();
-        if (requires_url && !knowledge_card_url_is_valid(url, notion_only))
-            || item.title.trim().is_empty()
-        {
-            return None;
+        if requires_url && !knowledge_card_url_is_valid(url, notion_only) {
+            return Err("an item url is missing or not an allowed https link");
+        }
+        if item.title.trim().is_empty() {
+            return Err("an item title is empty");
         }
         if envelope.kind == "retention" {
             if item.delete_after.trim().is_empty() || !knowledge_source_is_known(&item.source_id) {
-                return None;
+                return Err("a retention item is missing delete_after or a known source_id");
             }
-            compact_notion_page_id(&item.target_page_id)?;
-            compact_notion_page_id(&item.queue_page_id)?;
+            compact_notion_page_id(&item.target_page_id)
+                .ok_or("a retention item has an invalid target_page_id")?;
+            compact_notion_page_id(&item.queue_page_id)
+                .ok_or("a retention item has an invalid queue_page_id")?;
         }
         if envelope.kind == "epub_intake_preview"
             && (uuid::Uuid::parse_str(item.intake_id.trim()).is_err()
                 || item.sha256.len() != 64
                 || !item.sha256.chars().all(|ch| ch.is_ascii_hexdigit()))
         {
-            return None;
+            return Err("epub_intake_preview needs a valid intake_id and sha256");
         }
     }
 
-    Some((envelope, project))
+    Ok((envelope, project))
 }
 
 fn knowledge_card_url_is_valid(url: &str, notion_only: bool) -> bool {
@@ -1282,7 +1294,7 @@ fn knowledge_components_v2_message(
     channel_id: u64,
     reply_to_message_id: Option<u64>,
 ) -> Option<ComponentsV2Message> {
-    let (envelope, _) = parse_and_validate_knowledge_cards(content)?;
+    let (envelope, _) = parse_and_validate_knowledge_cards(content).ok()?;
     knowledge_components_v2_page_message(&envelope, channel_id, reply_to_message_id, 0)
 }
 
@@ -1468,7 +1480,7 @@ fn knowledge_cards_message(content: &str) -> Option<CreateMessage> {
 
 fn knowledge_cards_message_for(content: &str, capture_owner: Option<u64>) -> Option<CreateMessage> {
     let catalog = knowledge_catalog();
-    let (envelope, project) = parse_and_validate_knowledge_cards(content)?;
+    let (envelope, project) = parse_and_validate_knowledge_cards(content).ok()?;
 
     let heading = truncate_chars(envelope.heading.trim(), 240);
     let message_content = if matches!(envelope.kind.as_str(), "synthesis" | "epub_audit") {
@@ -1651,9 +1663,12 @@ fn knowledge_delivery_message(content: &str, channel_id: u64) -> CreateMessage {
         return builder;
     }
     if knowledge_cards_marker_present(content) {
+        let reason = parse_and_validate_knowledge_cards(content)
+            .err()
+            .unwrap_or("unknown");
         warn!(
             channel_id,
-            "knowledge cards marker present but validation failed; using fallback"
+            reason, "knowledge cards marker present but validation failed; using fallback"
         );
         return CreateMessage::new().content(KNOWLEDGE_CARDS_INVALID_FALLBACK);
     }
@@ -4263,7 +4278,8 @@ impl DiscordAdapter {
         content: &str,
         reply_to_message_id: Option<u64>,
     ) -> anyhow::Result<Option<String>> {
-        let validated = parse_and_validate_knowledge_cards(content).map(|(envelope, _)| envelope);
+        let validated =
+            parse_and_validate_knowledge_cards(content).map(|(envelope, _)| envelope).ok();
         let Some(payload) =
             knowledge_components_v2_message(content, channel_id, reply_to_message_id)
         else {
@@ -4302,7 +4318,7 @@ impl DiscordAdapter {
     }
 
     async fn report_scheduled_job_run(&self, content: &str) {
-        let Some((envelope, _)) = parse_and_validate_knowledge_cards(content) else {
+        let Ok((envelope, _)) = parse_and_validate_knowledge_cards(content) else {
             return;
         };
         let Some(run) = envelope.job_run else {
@@ -14114,6 +14130,32 @@ mod tests {
         let skips_empty = knowledge_request_preview("查詢知識", &filtered);
         assert_eq!(skips_empty, "查詢知識\n- 問題: 什麼是 Agent");
         assert!(!skips_empty.contains("未提供"));
+    }
+
+    #[test]
+    fn capture_inbox_preview_without_its_binding_is_named_in_the_rejection() {
+        // The shape a model produces when it reuses the single-capture card:
+        // right kind, no inbox_id or item_index.
+        let unbound = concat!(
+            "OPENAB_KNOWLEDGE_CARDS_V1\n",
+            r#"{"kind":"capture_inbox_preview","heading":"收錄文章預覽（1/3）","items":[{"title":"Loop Engineering","url":"https://github.com/cobusgreyling/loop-engineering","meta":"Article · Current · create","summary":"pattern library"}]}"#
+        );
+        assert_eq!(
+            parse_and_validate_knowledge_cards(unbound).unwrap_err(),
+            "capture_inbox_preview is missing a valid inbox_id"
+        );
+
+        let no_index = unbound.replace(
+            r#""heading""#,
+            r#""inbox_id":"11111111-2222-4333-8444-555555555555","heading""#,
+        );
+        assert_eq!(
+            parse_and_validate_knowledge_cards(&no_index).unwrap_err(),
+            "capture_inbox_preview is missing a valid item_index"
+        );
+
+        let bound = no_index.replace(r#""heading""#, r#""item_index":1,"heading""#);
+        assert!(parse_and_validate_knowledge_cards(&bound).is_ok());
     }
 
     #[test]
