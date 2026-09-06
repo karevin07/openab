@@ -2485,9 +2485,12 @@ fn knowledge_home_message() -> CreateInteractionResponseMessage {
     if !view.footer.is_empty() {
         embed = embed.footer(CreateEmbedFooter::new(view.footer.clone()));
     }
+    // Ephemeral like every drill-down view, so repeated `/knowledge` calls do
+    // not leave a trail of public cards with still-live buttons in the channel.
     CreateInteractionResponseMessage::new()
         .embed(embed)
         .components(components)
+        .ephemeral(true)
 }
 
 fn discord_thread_id_from_session_key(key: &str) -> Option<u64> {
@@ -8712,7 +8715,7 @@ impl Handler {
                 .await;
             let content = result.map_or_else(
                 |error| format!("⚠️ 無法開始 Reading List 操作：{error}"),
-                |thread_id| format!("✅ 已在 <#{thread_id}> 開始查詢 Reading List。"),
+                |thread_id| format!("✅ 已在 <#{thread_id}> 開始處理：{title}。"),
             );
             let _ = comp
                 .edit_response(&ctx.http, EditInteractionResponse::new().content(content))
@@ -13905,6 +13908,9 @@ mod tests {
         assert!(rendered.contains("weekly_reading_digest"));
         assert!(rendered.contains("取得確認後才寫入 Notion"));
         assert!(!rendered.contains("confirm"));
+        // Ephemeral (flags = 64), like every drill-down view, so repeated
+        // `/knowledge` calls do not pile up public cards with live buttons.
+        assert_eq!(value.get("flags").and_then(serde_json::Value::as_u64), Some(64));
     }
 
     #[test]

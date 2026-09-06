@@ -31,6 +31,8 @@ const MIGRATION_0016: &str = include_str!("../migrations/0016_reading_list_epub_
 const MIGRATION_0017: &str = include_str!("../migrations/0017_knowledge_capture_inbox.sql");
 const MIGRATION_0018: &str =
     include_str!("../migrations/0018_capture_inbox_card_binding.sql");
+const MIGRATION_0019: &str =
+    include_str!("../migrations/0019_reading_list_epub_write_disclosure.sql");
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -309,6 +311,7 @@ impl KnowledgeCatalog {
             (16, MIGRATION_0016),
             (17, MIGRATION_0017),
             (18, MIGRATION_0018),
+            (19, MIGRATION_0019),
         ] {
             let applied = connection
                 .query_row(
@@ -776,6 +779,16 @@ mod tests {
         let search = reading.action("search").unwrap();
         assert_eq!(search.inputs.len(), 5);
         assert_eq!(catalog.views.len(), 6);
+        // The Reading List card carries a confirmed-write action (EPUB Intake),
+        // so its copy must not promise that every shortcut stays read-only.
+        let reading_list_view = catalog.view("reading_list").unwrap();
+        assert!(reading_list_view.description.contains("確認上傳"));
+        assert!(!reading_list_view.description.contains("快捷操作維持唯讀"));
+        assert!(catalog
+            .view("help")
+            .unwrap()
+            .description
+            .contains("按「✅ 確認上傳」後才上傳 Drive"));
         assert_eq!(catalog.global_actions_for("home").len(), 7);
         let home = catalog.view("home").unwrap();
         assert_eq!(
@@ -863,7 +876,7 @@ mod tests {
                 row.get(0)
             })
             .unwrap();
-        assert_eq!(version, 18);
+        assert_eq!(version, 19);
         let weekly = catalog.global_action("weekly_source_audit").unwrap();
         assert!(weekly.prompt_template.contains("禁止使用 null"));
         let world = catalog
