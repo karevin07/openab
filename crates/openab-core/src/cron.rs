@@ -404,6 +404,7 @@ fn file_mtime(path: &Path) -> Option<SystemTime> {
 pub struct CronBindings {
     pub resolve_channel: Option<Arc<dyn Fn(&str, &str) -> Option<String> + Send + Sync>>,
     pub resolve_action_prompt: Option<Arc<dyn Fn(&str, &str) -> Option<String> + Send + Sync>>,
+    pub resolve_action_title: Option<Arc<dyn Fn(&str, &str) -> Option<String> + Send + Sync>>,
     pub session: Option<Arc<dyn CronSessionView>>,
     pub sticky_store_path: Option<PathBuf>,
     #[cfg(feature = "discord")]
@@ -607,6 +608,29 @@ fn resolved_prompt(job: &CronJobConfig, bindings: &CronBindings) -> Option<Strin
     }
     let message = job.message.trim();
     (!message.is_empty()).then(|| job.message.clone())
+}
+
+fn resolved_trigger_text(
+    job: &CronJobConfig,
+    prompt: &str,
+    bindings: &CronBindings,
+) -> String {
+    let message = job.message.trim();
+    if !message.is_empty() {
+        return message.to_string();
+    }
+    if let Some(action_id) = job.normalized_action_id() {
+        let alias = job.normalized_workspace_alias().unwrap_or("*");
+        if let Some(resolve_title) = &bindings.resolve_action_title {
+            if let Some(title) = resolve_title(alias, action_id) {
+                let trimmed = title.trim();
+                if !trimmed.is_empty() {
+                    return trimmed.to_string();
+                }
+            }
+        }
+    }
+    prompt.trim().to_string()
 }
 
 fn sticky_thread_id(job: &CronJobConfig, bindings: &CronBindings) -> Option<String> {
@@ -1135,10 +1159,18 @@ async fn fire_cronjob(
         origin_event_id: None,
     };
 
+    let trigger_text = resolved_trigger_text(job, &prompt, bindings);
+    let prefix = format!("🕐 [{}]: ", job.sender_name);
+    let max_limit = adapter.message_limit();
+    let prefix_len = prefix.chars().count();
+    let allowed_body_len = max_limit.saturating_sub(prefix_len);
+    let trigger_body = format::truncate_chars_head(&trigger_text, allowed_body_len);
+    let trigger_content = format!("{prefix}{trigger_body}");
+
     let trigger_msg = match adapter
         .send_message(
             &thread_channel,
-            &format!("🕐 [{}]: {}", job.sender_name, prompt),
+            &trigger_content,
         )
         .await
     {
@@ -1150,7 +1182,7 @@ async fn fire_cronjob(
     };
 
     let reply_channel = if should_create_cron_thread(job, resolved_thread_id.as_deref()) {
-        let thread_name = format::shorten_thread_name(&prompt);
+        let thread_name = format::shorten_thread_name(&trigger_text);
         match adapter
             .create_thread(&thread_channel, &trigger_msg, &thread_name)
             .await
@@ -2639,6 +2671,48 @@ sender_name = "DailySummary"
         assert_eq!(
             resolved_prompt(&job, &bindings).as_deref(),
             Some("fallback-prompt")
+        );
+    }
+
+    #[test]
+    fn resolved_trigger_text_prefers_message_over_action_title() {
+        let mut job = test_cron_job();
+        job.action_id = Some("weekly_source_audit".into());
+        job.message = "explicit-message".into();
+        let bindings = CronBindings {
+            resolve_action_title: Some(Arc::new(|_, _| Some("Action Title".into()))),
+            ..CronBindings::default()
+        };
+        assert_eq!(
+            resolved_trigger_text(&job, "full-prompt", &bindings),
+            "explicit-message"
+        );
+    }
+
+    #[test]
+    fn resolved_trigger_text_uses_action_title_when_message_empty() {
+        let mut job = test_cron_job();
+        job.action_id = Some("weekly_source_audit".into());
+        job.message = "".into();
+        let bindings = CronBindings {
+            resolve_action_title: Some(Arc::new(|_, _| Some("每週排程來源更新統計".into()))),
+            ..CronBindings::default()
+        };
+        assert_eq!(
+            resolved_trigger_text(&job, "full-prompt", &bindings),
+            "每週排程來源更新統計"
+        );
+    }
+
+    #[test]
+    fn resolved_trigger_text_falls_back_to_prompt() {
+        let mut job = test_cron_job();
+        job.action_id = None;
+        job.message = "".into();
+        let bindings = CronBindings::default();
+        assert_eq!(
+            resolved_trigger_text(&job, "  fallback-prompt-text  ", &bindings),
+            "fallback-prompt-text"
         );
     }
 }

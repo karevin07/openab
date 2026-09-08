@@ -804,6 +804,15 @@ pub fn resolve_project_action_prompt(
     resolve_project_action(actions, workspace_alias, action_id).map(|action| action.prompt.clone())
 }
 
+/// Resolve a Project Home action title. A workspace-local id wins over `*`.
+pub fn resolve_project_action_title(
+    actions: &[DiscordProjectActionConfig],
+    workspace_alias: &str,
+    action_id: &str,
+) -> Option<String> {
+    resolve_project_action(actions, workspace_alias, action_id).map(|action| action.title.clone())
+}
+
 fn validate_discord_project_commands(
     commands: &[DiscordProjectCommandConfig],
 ) -> anyhow::Result<()> {
@@ -3283,6 +3292,40 @@ prompt = "Run cargo test without changing files."
         );
         assert_eq!(
             resolve_project_action_prompt(&actions, "@openab", "missing").as_deref(),
+            None
+        );
+    }
+
+    #[test]
+    fn resolve_project_action_title_prefers_workspace_local_over_global() {
+        let actions = vec![
+            DiscordProjectActionConfig {
+                workspace_alias: "*".into(),
+                id: "daily_summary".into(),
+                label: "Daily summary".into(),
+                description: String::new(),
+                title: "Global Title".into(),
+                prompt: "global".into(),
+            },
+            DiscordProjectActionConfig {
+                workspace_alias: "openab".into(),
+                id: "daily_summary".into(),
+                label: "Daily summary".into(),
+                description: String::new(),
+                title: "Local Title".into(),
+                prompt: "local".into(),
+            },
+        ];
+        assert_eq!(
+            resolve_project_action_title(&actions, "openab", "daily_summary").as_deref(),
+            Some("Local Title")
+        );
+        assert_eq!(
+            resolve_project_action_title(&actions, "example-library", "daily_summary").as_deref(),
+            Some("Global Title")
+        );
+        assert_eq!(
+            resolve_project_action_title(&actions, "@openab", "missing").as_deref(),
             None
         );
     }

@@ -257,6 +257,7 @@ pub struct RuntimeHandler {
     session_publish: Option<SessionPublishContext>,
     #[cfg(feature = "discord")]
     mirror_events: tokio::sync::Mutex<MirrorEventCache>,
+    cron_run_now: Option<tokio::sync::mpsc::UnboundedSender<String>>,
 }
 
 #[cfg(unix)]
@@ -266,6 +267,7 @@ impl RuntimeHandler {
         registry: Arc<tokio::sync::RwLock<std::collections::HashMap<String, String>>>,
         shard: ShardSlot,
         #[cfg(feature = "discord")] session_publish: Option<SessionPublishContext>,
+        cron_run_now: Option<tokio::sync::mpsc::UnboundedSender<String>>,
     ) -> Self {
         Self {
             adapters,
@@ -275,6 +277,7 @@ impl RuntimeHandler {
             session_publish,
             #[cfg(feature = "discord")]
             mirror_events: tokio::sync::Mutex::new(MirrorEventCache::default()),
+            cron_run_now,
         }
     }
 
@@ -492,6 +495,27 @@ impl CtlHandler for RuntimeHandler {
             "session.publish" => self.publish_session(value).await,
             #[cfg(feature = "discord")]
             "session.mirror" => self.mirror_session_event(thread_id, value).await,
+            "cron.run" => {
+                let Some(tx) = &self.cron_run_now else {
+                    return Response {
+                        ok: false,
+                        message: "cron scheduler not running or cron_run_now channel unavailable".into(),
+                        value: None,
+                    };
+                };
+                match tx.send(value.to_string()) {
+                    Ok(()) => Response {
+                        ok: true,
+                        message: format!("triggered cronjob: {value}"),
+                        value: None,
+                    },
+                    Err(e) => Response {
+                        ok: false,
+                        message: format!("failed to trigger cronjob: {e}"),
+                        value: None,
+                    },
+                }
+            }
             "thread.name" => {
                 let Some((adapter, tid)) = self.resolve(thread_id).await else {
                     return Response {
@@ -826,5 +850,22 @@ mod tests {
         assert_eq!(resp.value.as_deref(), Some("val-of-thread.name"));
 
         server.abort();
+    }
+
+    #[tokio::test]
+    async fn runtime_handler_cron_run() {
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+        let handler = RuntimeHandler::new(
+            std::collections::HashMap::new(),
+            new_registry(),
+            Arc::new(std::sync::OnceLock::new()),
+            #[cfg(feature = "discord")]
+            None,
+            Some(tx),
+        );
+        let resp = handler.handle_set(None, "cron.run", "opencode-weekly-source-audit").await;
+        assert!(resp.ok);
+        assert_eq!(resp.message, "triggered cronjob: opencode-weekly-source-audit");
+        assert_eq!(rx.recv().await.as_deref(), Some("opencode-weekly-source-audit"));
     }
 }

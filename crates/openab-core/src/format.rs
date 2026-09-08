@@ -244,6 +244,21 @@ pub fn shorten_thread_name(prompt: &str) -> String {
     }
 }
 
+/// Truncate a string to at most `limit` Unicode characters, keeping the head
+/// and appending '…' when truncated.
+pub fn truncate_chars_head(s: &str, limit: usize) -> String {
+    if limit == 0 {
+        return String::new();
+    }
+    if s.chars().count() <= limit {
+        s.to_string()
+    } else {
+        let mut out: String = s.chars().take(limit.saturating_sub(1)).collect();
+        out.push('…');
+        out
+    }
+}
+
 /// Truncate a string to at most `limit` Unicode characters, keeping the tail
 /// (most recent output) for better streaming UX.
 pub fn truncate_chars_tail(s: &str, limit: usize) -> String {
@@ -467,5 +482,15 @@ mod tests {
         let chunks = split_message(&text, effective);
         assert_length_invariant(&chunks, effective);
         assert_eq!(chunks.concat(), text, "content lost with mention reserve");
+    }
+
+    #[test]
+    fn truncate_chars_head_basic_and_boundaries() {
+        assert_eq!(truncate_chars_head("hello", 10), "hello");
+        assert_eq!(truncate_chars_head("hello", 5), "hello");
+        assert_eq!(truncate_chars_head("hello", 4), "hel…");
+        assert_eq!(truncate_chars_head("hello", 1), "…");
+        assert_eq!(truncate_chars_head("hello", 0), "");
+        assert_eq!(truncate_chars_head("繁體中文測試訊息", 5), "繁體中文…");
     }
 }

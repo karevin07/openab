@@ -1067,6 +1067,9 @@ async fn main() -> anyhow::Result<()> {
     #[cfg(unix)]
     let ctl_shard: ctl::ShardSlot = Arc::new(std::sync::OnceLock::new());
 
+    // Channel for triggering cron jobs immediately (from Discord or ctl)
+    let (cron_run_now_tx, cron_run_now_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+
     // Thread registry: thread_id → platform. Populated on message dispatch.
     #[cfg(unix)]
     let ctl_registry = ctl::new_registry();
@@ -1094,6 +1097,7 @@ async fn main() -> anyhow::Result<()> {
                     project_registry.clone(),
                     router.workspace_aliases_map(),
                 )),
+                Some(cron_run_now_tx.clone()),
             ))))
         }
     };
@@ -1714,7 +1718,6 @@ async fn main() -> anyhow::Result<()> {
         control_db.clone(),
         cron_sticky_path.clone(),
     )?);
-    let (cron_run_now_tx, cron_run_now_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
 
     let has_cron_work = !cfg.cron.jobs.is_empty() || usercron_path.is_some();
     let cron_handle = if has_cron_work {
@@ -1755,19 +1758,33 @@ async fn main() -> anyhow::Result<()> {
             #[cfg(not(feature = "discord"))]
             Vec::new()
         };
+        let project_actions = Arc::new(project_actions);
         let binding_router = cron_router.clone();
+        let prompt_actions = project_actions.clone();
+        let title_actions = project_actions.clone();
         let cron_bindings = cron::CronBindings {
             resolve_channel: Some(Arc::new(move |platform, alias| {
                 binding_router.channel_id_for_workspace_alias(platform, alias)
             })),
             resolve_action_prompt: Some(Arc::new(move |alias, action_id| {
                 let prompt =
-                    config::resolve_project_action_prompt(&project_actions, alias, action_id);
+                    config::resolve_project_action_prompt(&prompt_actions, alias, action_id);
                 #[cfg(feature = "discord")]
                 let prompt = prompt.or_else(|| {
                     openab_core::knowledge_catalog::knowledge_catalog().global_prompt(action_id)
                 });
                 prompt
+            })),
+            resolve_action_title: Some(Arc::new(move |alias, action_id| {
+                let title =
+                    config::resolve_project_action_title(&title_actions, alias, action_id);
+                #[cfg(feature = "discord")]
+                let title = title.or_else(|| {
+                    openab_core::knowledge_catalog::knowledge_catalog()
+                        .global_action(action_id)
+                        .map(|action| action.title.clone())
+                });
+                title
             })),
             session: Some(pool.clone() as Arc<dyn cron::CronSessionView>),
             sticky_store_path: Some(cron_sticky_path.clone()),
