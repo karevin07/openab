@@ -36,7 +36,7 @@ use crate::media;
 use crate::project_command::ProjectCommandOutput;
 use crate::project_command::{
     list_workspace_books, project_command_argv_display, run_project_command,
-    validate_workspace_book, BOOK_SELECT_MAX_OPTIONS,
+    validate_workspace_book, WorkspaceBook, BOOK_SELECT_MAX_OPTIONS,
 };
 use crate::project_registry::{ProjectAccessTarget, ProjectBinding, ProjectRegistry};
 use crate::remind::{self, ReminderStore};
@@ -3115,25 +3115,61 @@ fn project_command_display_with_book(
 fn project_command_book_picker_message(
     binding: &ProjectBinding,
     command: &DiscordProjectCommandConfig,
-    books: &[String],
-    total_books: usize,
+    books: &[WorkspaceBook],
+    requested_page: usize,
 ) -> CreateInteractionResponseMessage {
+    let total_books = books.len();
+    let page_count = total_books.div_ceil(BOOK_SELECT_MAX_OPTIONS).max(1);
+    let page = requested_page.min(page_count - 1);
+    let start = page * BOOK_SELECT_MAX_OPTIONS;
+    let page_books = &books[start..total_books.min(start + BOOK_SELECT_MAX_OPTIONS)];
     let mut description = format!(
         "選擇要套用 **{}** 的書籍（來自 `books/`）。選完後仍會再確認一次才執行。",
         command.label
     );
-    if total_books > books.len() {
+    if page_count > 1 {
         description.push_str(&format!(
-            "\n目前列出前 {} 本（共 {} 本；Discord 下拉上限 {}）。",
-            books.len(),
-            total_books,
-            BOOK_SELECT_MAX_OPTIONS
+            "\n第 {} / {} 頁，共 {} 本。可翻頁或搜尋書名／slug。",
+            page + 1,
+            page_count,
+            total_books
         ));
     }
-    let options = books
+    let options = page_books
         .iter()
-        .map(|slug| CreateSelectMenuOption::new(slug, slug))
+        .map(project_command_book_option)
         .collect::<Vec<_>>();
+    let mut controls = Vec::new();
+    if page_count > 1 {
+        controls.extend([
+            CreateButton::new(format!(
+                "oab_project_command:page:{}:{}",
+                command.id,
+                page.saturating_sub(1)
+            ))
+            .label("◀ 上一頁")
+            .style(ButtonStyle::Secondary)
+            .disabled(page == 0),
+            CreateButton::new(format!(
+                "oab_project_command:page:{}:{}",
+                command.id,
+                (page + 1).min(page_count - 1)
+            ))
+            .label("下一頁 ▶")
+            .style(ButtonStyle::Secondary)
+            .disabled(page + 1 >= page_count),
+        ]);
+    }
+    controls.push(
+        CreateButton::new(format!("oab_project_command:search:{}", command.id))
+            .label("🔎 搜尋書籍")
+            .style(ButtonStyle::Primary),
+    );
+    controls.push(
+        CreateButton::new("oab_project_command:cancel")
+            .label("Cancel")
+            .style(ButtonStyle::Secondary),
+    );
     CreateInteractionResponseMessage::new()
         .embed(
             CreateEmbed::new()
@@ -3159,11 +3195,103 @@ fn project_command_book_picker_message(
                 )
                 .placeholder("選擇書籍 slug"),
             ),
-            CreateActionRow::Buttons(vec![CreateButton::new("oab_project_command:cancel")
-                .label("Cancel")
-                .style(ButtonStyle::Secondary)]),
+            CreateActionRow::Buttons(controls),
         ])
         .ephemeral(true)
+}
+
+fn project_command_book_option(book: &WorkspaceBook) -> CreateSelectMenuOption {
+    let label = if book.title.is_empty() {
+        book.slug.as_str()
+    } else {
+        book.title.as_str()
+    };
+    let mut option =
+        CreateSelectMenuOption::new(truncate_for_discord(label, 100), book.slug.as_str());
+    if !book.title.is_empty() {
+        option = option.description(truncate_for_discord(&book.slug, 100));
+    }
+    option
+}
+
+fn project_command_book_search_modal(command: &DiscordProjectCommandConfig) -> CreateModal {
+    CreateModal::new(
+        format!("oab_project_command_search:{}", command.id),
+        "Search repository books",
+    )
+    .components(vec![CreateActionRow::InputText(
+        CreateInputText::new(InputTextStyle::Short, "書名或 slug", "query")
+            .placeholder("例如：末日之翼 或 doomsday-wings")
+            .min_length(1)
+            .max_length(100),
+    )])
+}
+
+fn project_command_book_search_results_message(
+    binding: &ProjectBinding,
+    command: &DiscordProjectCommandConfig,
+    books: &[WorkspaceBook],
+    query: &str,
+) -> CreateInteractionResponseMessage {
+    let shown = books.len().min(BOOK_SELECT_MAX_OPTIONS);
+    let mut description = format!(
+        "搜尋 `{}`，找到 {} 本。",
+        suppress_mentions(query),
+        books.len()
+    );
+    if books.len() > shown {
+        description.push_str(&format!(
+            "目前顯示前 {shown} 本；請用更精確的關鍵字縮小結果。"
+        ));
+    }
+    let options = books[..shown]
+        .iter()
+        .map(project_command_book_option)
+        .collect::<Vec<_>>();
+    CreateInteractionResponseMessage::new()
+        .embed(
+            CreateEmbed::new()
+                .title(format!("🔎 Search book · {}", command.label))
+                .description(description)
+                .colour(0x9B59B6)
+                .field(
+                    "Repository",
+                    inline_code(&format!("@{}", binding.workspace_alias)),
+                    true,
+                ),
+        )
+        .components(vec![
+            CreateActionRow::SelectMenu(
+                CreateSelectMenu::new(
+                    format!("oab_project_command:pick:{}", command.id),
+                    CreateSelectMenuKind::String { options },
+                )
+                .placeholder("選擇搜尋結果"),
+            ),
+            CreateActionRow::Buttons(vec![
+                CreateButton::new(format!("oab_project_command:search:{}", command.id))
+                    .label("🔎 重新搜尋")
+                    .style(ButtonStyle::Primary),
+                CreateButton::new(format!("oab_project_command:page:{}:0", command.id))
+                    .label("返回全部書籍")
+                    .style(ButtonStyle::Secondary),
+                CreateButton::new("oab_project_command:cancel")
+                    .label("Cancel")
+                    .style(ButtonStyle::Secondary),
+            ]),
+        ])
+        .ephemeral(true)
+}
+
+fn filter_project_command_books(books: Vec<WorkspaceBook>, query: &str) -> Vec<WorkspaceBook> {
+    let query = query.trim().to_lowercase();
+    books
+        .into_iter()
+        .filter(|book| {
+            book.slug.to_lowercase().contains(&query)
+                || (!book.title.is_empty() && book.title.to_lowercase().contains(&query))
+        })
+        .collect()
 }
 
 fn project_commands_message(
@@ -6500,6 +6628,15 @@ impl EventHandler for Handler {
             }
             Interaction::Modal(modal) if modal.data.custom_id == "oab_project_new" => {
                 self.handle_project_new_task_modal(&ctx, &modal).await;
+            }
+            Interaction::Modal(modal)
+                if modal
+                    .data
+                    .custom_id
+                    .starts_with("oab_project_command_search:") =>
+            {
+                self.handle_project_command_book_search_modal(&ctx, &modal)
+                    .await;
             }
             Interaction::Modal(modal)
                 if modal.data.custom_id.starts_with("oab_knowledge_modal:")
@@ -10972,9 +11109,9 @@ impl Handler {
                 }
             };
             match list_workspace_books(&workspace) {
-                Ok((books, total)) if !books.is_empty() => {
+                Ok(books) if !books.is_empty() => {
                     let response = CreateInteractionResponse::Message(
-                        project_command_book_picker_message(&binding, &command, &books, total),
+                        project_command_book_picker_message(&binding, &command, &books, 0),
                     );
                     if let Err(error) = comp.create_response(&ctx.http, response).await {
                         tracing::error!(%error, command_id = %command.id, "failed to open book picker");
@@ -11065,6 +11202,115 @@ impl Handler {
                 return;
             }
         };
+
+        if let Some(command_id) = action.strip_prefix("search:") {
+            let Some(command) = self
+                .project_command_for(&binding.workspace_alias, command_id)
+                .cloned()
+            else {
+                let response = CreateInteractionResponse::Message(
+                    CreateInteractionResponseMessage::new()
+                        .content("⚠️ This repository command was removed before search.")
+                        .ephemeral(true),
+                );
+                let _ = comp.create_response(&ctx.http, response).await;
+                return;
+            };
+            if !command.book_select {
+                let response = CreateInteractionResponse::Message(
+                    CreateInteractionResponseMessage::new()
+                        .content("⚠️ This repository command no longer asks for a book.")
+                        .ephemeral(true),
+                );
+                let _ = comp.create_response(&ctx.http, response).await;
+                return;
+            }
+            let response =
+                CreateInteractionResponse::Modal(project_command_book_search_modal(&command));
+            let _ = comp.create_response(&ctx.http, response).await;
+            return;
+        }
+
+        if let Some(page_tail) = action.strip_prefix("page:") {
+            let Some((command_id, page)) = page_tail.rsplit_once(':') else {
+                let response = CreateInteractionResponse::Message(
+                    CreateInteractionResponseMessage::new()
+                        .content("⚠️ Invalid book-picker page.")
+                        .ephemeral(true),
+                );
+                let _ = comp.create_response(&ctx.http, response).await;
+                return;
+            };
+            let Some(command) = self
+                .project_command_for(&binding.workspace_alias, command_id)
+                .cloned()
+            else {
+                let response = CreateInteractionResponse::Message(
+                    CreateInteractionResponseMessage::new()
+                        .content("⚠️ This repository command was removed before paging.")
+                        .ephemeral(true),
+                );
+                let _ = comp.create_response(&ctx.http, response).await;
+                return;
+            };
+            if !command.book_select {
+                let response = CreateInteractionResponse::Message(
+                    CreateInteractionResponseMessage::new()
+                        .content("⚠️ This repository command no longer asks for a book.")
+                        .ephemeral(true),
+                );
+                let _ = comp.create_response(&ctx.http, response).await;
+                return;
+            }
+            let aliases = self.router.workspace_aliases_map();
+            let workspace = match resolve_workspace(
+                &format!("@{}", binding.workspace_alias),
+                &aliases,
+                &self.router.bot_home_path(),
+                &self.router.workspace_root_path(),
+            ) {
+                Ok(path) => path,
+                Err(message) => {
+                    let response = CreateInteractionResponse::Message(
+                        CreateInteractionResponseMessage::new()
+                            .content(format!("⚠️ {message}"))
+                            .ephemeral(true),
+                    );
+                    let _ = comp.create_response(&ctx.http, response).await;
+                    return;
+                }
+            };
+            let page = page.parse::<usize>().unwrap_or(0);
+            match list_workspace_books(&workspace) {
+                Ok(books) if !books.is_empty() => {
+                    let response = CreateInteractionResponse::UpdateMessage(
+                        project_command_book_picker_message(&binding, &command, &books, page),
+                    );
+                    let _ = comp.create_response(&ctx.http, response).await;
+                }
+                Ok(_) => {
+                    let response = CreateInteractionResponse::UpdateMessage(
+                        CreateInteractionResponseMessage::new()
+                            .content("⚠️ 這個 repository 的 `books/` 沒有可選書籍。")
+                            .embeds(Vec::new())
+                            .components(Vec::new()),
+                    );
+                    let _ = comp.create_response(&ctx.http, response).await;
+                }
+                Err(error) => {
+                    let response = CreateInteractionResponse::Message(
+                        CreateInteractionResponseMessage::new()
+                            .content(format!(
+                                "⚠️ 無法列出書籍：{}",
+                                suppress_mentions(&truncate_for_discord(&error.to_string(), 500))
+                            ))
+                            .ephemeral(true),
+                    );
+                    let _ = comp.create_response(&ctx.http, response).await;
+                }
+            }
+            return;
+        }
 
         if let Some(command_id) = action.strip_prefix("pick:") {
             let selected_book = match &comp.data.kind {
@@ -11206,6 +11452,148 @@ impl Handler {
         }
         self.execute_project_command_interaction(ctx, comp, binding, command, book_slug)
             .await;
+    }
+
+    async fn handle_project_command_book_search_modal(
+        &self,
+        ctx: &Context,
+        modal: &serenity::model::application::ModalInteraction,
+    ) {
+        if modal.user.bot
+            || is_denied_user(
+                false,
+                self.allow_all_users,
+                &self.allowed_users,
+                modal.user.id.get(),
+            )
+        {
+            let response = CreateInteractionResponse::Message(
+                CreateInteractionResponseMessage::new()
+                    .content("🚫 你沒有執行 repository commands 的權限。")
+                    .ephemeral(true),
+            );
+            let _ = modal.create_response(&ctx.http, response).await;
+            return;
+        }
+
+        let command_id = modal
+            .data
+            .custom_id
+            .strip_prefix("oab_project_command_search:")
+            .unwrap_or("");
+        let query = modal_input_value(modal, "query")
+            .map(str::trim)
+            .unwrap_or("");
+        if query.is_empty() {
+            let response = CreateInteractionResponse::Message(
+                CreateInteractionResponseMessage::new()
+                    .content("⚠️ 請輸入書名或 slug。")
+                    .ephemeral(true),
+            );
+            let _ = modal.create_response(&ctx.http, response).await;
+            return;
+        }
+
+        let binding = match self
+            .project_binding_for_channel(ctx, modal.channel_id)
+            .await
+        {
+            Ok((binding, _)) => binding,
+            Err(message) => {
+                let response = CreateInteractionResponse::Message(
+                    CreateInteractionResponseMessage::new()
+                        .content(format!("⚠️ {message}"))
+                        .ephemeral(true),
+                );
+                let _ = modal.create_response(&ctx.http, response).await;
+                return;
+            }
+        };
+        let Some(command) = self
+            .project_command_for(&binding.workspace_alias, command_id)
+            .cloned()
+        else {
+            let response = CreateInteractionResponse::Message(
+                CreateInteractionResponseMessage::new()
+                    .content("⚠️ This repository command was removed before search.")
+                    .ephemeral(true),
+            );
+            let _ = modal.create_response(&ctx.http, response).await;
+            return;
+        };
+        if !command.book_select {
+            let response = CreateInteractionResponse::Message(
+                CreateInteractionResponseMessage::new()
+                    .content("⚠️ This repository command no longer asks for a book.")
+                    .ephemeral(true),
+            );
+            let _ = modal.create_response(&ctx.http, response).await;
+            return;
+        }
+
+        let aliases = self.router.workspace_aliases_map();
+        let workspace = match resolve_workspace(
+            &format!("@{}", binding.workspace_alias),
+            &aliases,
+            &self.router.bot_home_path(),
+            &self.router.workspace_root_path(),
+        ) {
+            Ok(path) => path,
+            Err(message) => {
+                let response = CreateInteractionResponse::Message(
+                    CreateInteractionResponseMessage::new()
+                        .content(format!("⚠️ {message}"))
+                        .ephemeral(true),
+                );
+                let _ = modal.create_response(&ctx.http, response).await;
+                return;
+            }
+        };
+        let books = match list_workspace_books(&workspace) {
+            Ok(books) => books,
+            Err(error) => {
+                let response = CreateInteractionResponse::Message(
+                    CreateInteractionResponseMessage::new()
+                        .content(format!(
+                            "⚠️ 無法搜尋書籍：{}",
+                            suppress_mentions(&truncate_for_discord(&error.to_string(), 500))
+                        ))
+                        .ephemeral(true),
+                );
+                let _ = modal.create_response(&ctx.http, response).await;
+                return;
+            }
+        };
+        let matches = filter_project_command_books(books, query);
+        if matches.is_empty() {
+            let response = CreateInteractionResponse::Message(
+                CreateInteractionResponseMessage::new()
+                    .content(format!(
+                        "⚠️ 找不到符合 `{}` 的書籍。請回到選書卡片重新搜尋。",
+                        suppress_mentions(query)
+                    ))
+                    .ephemeral(true),
+            );
+            let _ = modal.create_response(&ctx.http, response).await;
+            return;
+        }
+
+        let normalized_query = query.to_lowercase();
+        let exact = matches.iter().find(|book| {
+            book.slug.to_lowercase() == normalized_query
+                || (!book.title.is_empty() && book.title.to_lowercase() == normalized_query)
+        });
+        let message = if let Some(book) = exact {
+            project_command_confirmation_message(&binding, &command, Some(&book.slug))
+        } else {
+            project_command_book_search_results_message(&binding, &command, &matches, query)
+        };
+        if let Err(error) = modal
+            .create_response(&ctx.http, CreateInteractionResponse::Message(message))
+            .await
+        {
+            tracing::error!(%error, command_id = %command.id, "failed to show repository book search results");
+        }
     }
 
     async fn handle_repository_command_queue_control(
@@ -15456,13 +15844,66 @@ mod tests {
         let picker = serde_json::to_string(&project_command_book_picker_message(
             &ui_binding(),
             &force,
-            &["blood-chalice".into(), "heshi-mentu".into()],
-            2,
+            &[
+                WorkspaceBook {
+                    slug: "blood-chalice".into(),
+                    title: "血之聖杯".into(),
+                },
+                WorkspaceBook {
+                    slug: "heshi-mentu".into(),
+                    title: String::new(),
+                },
+            ],
+            0,
         ))
         .unwrap();
         assert!(picker.contains("oab_project_command:pick:force-sync"));
         assert!(picker.contains("heshi-mentu"));
+        assert!(picker.contains("血之聖杯"));
+        assert!(picker.contains("oab_project_command:search:force-sync"));
         assert!(picker.contains("選擇書籍 slug"));
+
+        let books = (1..=30)
+            .map(|index| WorkspaceBook {
+                slug: format!("book-{index:02}"),
+                title: format!("第 {index:02} 本書"),
+            })
+            .collect::<Vec<_>>();
+        let first_page = serde_json::to_value(project_command_book_picker_message(
+            &ui_binding(),
+            &force,
+            &books,
+            0,
+        ))
+        .unwrap();
+        let first_select =
+            component_with_custom_id(&first_page, "oab_project_command:pick:force-sync").unwrap();
+        assert_eq!(first_select["options"].as_array().unwrap().len(), 25);
+        assert!(first_page.to_string().contains("第 1 / 2 頁，共 30 本"));
+        assert!(first_page
+            .to_string()
+            .contains("oab_project_command:page:force-sync:1"));
+
+        let second_page = serde_json::to_value(project_command_book_picker_message(
+            &ui_binding(),
+            &force,
+            &books,
+            1,
+        ))
+        .unwrap();
+        let second_select =
+            component_with_custom_id(&second_page, "oab_project_command:pick:force-sync").unwrap();
+        assert_eq!(second_select["options"].as_array().unwrap().len(), 5);
+        assert!(second_page.to_string().contains("第 2 / 2 頁，共 30 本"));
+
+        let matches = filter_project_command_books(books.clone(), "第 07 本");
+        assert_eq!(matches, vec![books[6].clone()]);
+        let matches = filter_project_command_books(books, "book-12");
+        assert_eq!(matches.len(), 1);
+
+        let modal = serde_json::to_string(&project_command_book_search_modal(&force)).unwrap();
+        assert!(modal.contains("oab_project_command_search:force-sync"));
+        assert!(modal.contains("書名或 slug"));
     }
 
     #[test]

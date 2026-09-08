@@ -15,6 +15,12 @@ const CAPTURE_LIMIT_BYTES: usize = 32 * 1024;
 /// Discord String Select hard limit.
 pub const BOOK_SELECT_MAX_OPTIONS: usize = 25;
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorkspaceBook {
+    pub slug: String,
+    pub title: String,
+}
+
 #[derive(Debug)]
 pub struct ProjectCommandOutput {
     pub exit_code: Option<i32>,
@@ -65,11 +71,23 @@ pub fn is_valid_book_slug(slug: &str) -> bool {
             .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
 }
 
-/// List book directory names under `workspace/books/`, sorted.
+fn workspace_book_title(book_dir: &Path) -> String {
+    let Ok(index) = fs::read_to_string(book_dir.join("00-index.md")) else {
+        return String::new();
+    };
+    index
+        .lines()
+        .find_map(|line| {
+            let title = line.trim().strip_prefix("# ")?.trim();
+            (!title.is_empty()).then(|| title.to_string())
+        })
+        .unwrap_or_default()
+}
+
+/// List valid book directories under `workspace/books/`, sorted by slug.
 ///
-/// Returns at most [`BOOK_SELECT_MAX_OPTIONS`] entries plus the total count so
-/// callers can show a truncation note.
-pub fn list_workspace_books(workspace: &Path) -> Result<(Vec<String>, usize)> {
+/// Discord paginates this complete inventory into 25-option select menus.
+pub fn list_workspace_books(workspace: &Path) -> Result<Vec<WorkspaceBook>> {
     let books_root = workspace.join("books");
     if !books_root.is_dir() {
         bail!("workspace has no books/ directory");
@@ -88,14 +106,13 @@ pub fn list_workspace_books(workspace: &Path) -> Result<(Vec<String>, usize)> {
         if !is_valid_book_slug(slug) {
             continue;
         }
-        slugs.push(slug.to_string());
+        slugs.push(WorkspaceBook {
+            slug: slug.to_string(),
+            title: workspace_book_title(&entry.path()),
+        });
     }
-    slugs.sort();
-    let total = slugs.len();
-    if slugs.len() > BOOK_SELECT_MAX_OPTIONS {
-        slugs.truncate(BOOK_SELECT_MAX_OPTIONS);
-    }
-    Ok((slugs, total))
+    slugs.sort_by(|left, right| left.slug.cmp(&right.slug));
+    Ok(slugs)
 }
 
 /// Confirm `slug` names an existing directory under `workspace/books/`.
@@ -141,7 +158,9 @@ pub fn resolve_project_command_args(
             })
             .collect();
         if !replaced {
-            bail!("book_select command is missing the {PROJECT_COMMAND_BOOK_PLACEHOLDER} placeholder");
+            bail!(
+                "book_select command is missing the {PROJECT_COMMAND_BOOK_PLACEHOLDER} placeholder"
+            );
         }
         return Ok(args);
     }
@@ -440,9 +459,22 @@ mod tests {
         fs::write(books.join("readme.txt"), "no").unwrap();
         fs::create_dir_all(books.join("bad_name")).unwrap();
 
-        let (slugs, total) = list_workspace_books(workspace.path()).unwrap();
-        assert_eq!(total, 2);
-        assert_eq!(slugs, ["blood-chalice", "heshi-mentu"]);
+        fs::write(books.join("blood-chalice/00-index.md"), "# 血盞花\n").unwrap();
+
+        let books = list_workspace_books(workspace.path()).unwrap();
+        assert_eq!(
+            books,
+            [
+                WorkspaceBook {
+                    slug: "blood-chalice".into(),
+                    title: "血盞花".into(),
+                },
+                WorkspaceBook {
+                    slug: "heshi-mentu".into(),
+                    title: String::new(),
+                },
+            ]
+        );
         assert!(validate_workspace_book(workspace.path(), "heshi-mentu").is_ok());
         assert!(validate_workspace_book(workspace.path(), "../etc").is_err());
         assert!(validate_workspace_book(workspace.path(), "missing-book").is_err());
