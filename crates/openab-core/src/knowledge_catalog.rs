@@ -29,10 +29,11 @@ const MIGRATION_0014: &str = include_str!("../migrations/0014_reading_list_epub_
 const MIGRATION_0015: &str = include_str!("../migrations/0015_knowledge_weekly_error_contract.sql");
 const MIGRATION_0016: &str = include_str!("../migrations/0016_reading_list_epub_audit.sql");
 const MIGRATION_0017: &str = include_str!("../migrations/0017_knowledge_capture_inbox.sql");
-const MIGRATION_0018: &str =
-    include_str!("../migrations/0018_capture_inbox_card_binding.sql");
+const MIGRATION_0018: &str = include_str!("../migrations/0018_capture_inbox_card_binding.sql");
 const MIGRATION_0019: &str =
     include_str!("../migrations/0019_reading_list_epub_write_disclosure.sql");
+const MIGRATION_0020: &str = include_str!("../migrations/0020_reading_list_operations_ui.sql");
+const MIGRATION_0021: &str = include_str!("../migrations/0021_knowledge_ux_recovery.sql");
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -312,6 +313,8 @@ impl KnowledgeCatalog {
             (17, MIGRATION_0017),
             (18, MIGRATION_0018),
             (19, MIGRATION_0019),
+            (20, MIGRATION_0020),
+            (21, MIGRATION_0021),
         ] {
             let applied = connection
                 .query_row(
@@ -762,10 +765,13 @@ mod tests {
         assert_eq!(catalog.sources_by_kind("scheduled").len(), 3);
         assert_eq!(catalog.sources_by_kind("side_project").len(), 2);
         let reading = catalog.source("personal_reading_list").unwrap();
-        assert!(reading
-            .fields
-            .iter()
-            .any(|field| field.logical_name == "epub_link" && field.notion_property == "EPUB Link"));
+        assert!(
+            reading
+                .fields
+                .iter()
+                .any(|field| field.logical_name == "epub_link"
+                    && field.notion_property == "EPUB Link")
+        );
         assert!(reading
             .fields
             .iter()
@@ -778,18 +784,18 @@ mod tests {
             .any(|field| { field.logical_name == "author" && field.notion_property == "Auther" }));
         let search = reading.action("search").unwrap();
         assert_eq!(search.inputs.len(), 5);
-        assert_eq!(catalog.views.len(), 6);
-        // The Reading List card carries a confirmed-write action (EPUB Intake),
-        // so its copy must not promise that every shortcut stays read-only.
+        assert_eq!(catalog.views.len(), 7);
+        // Confirmed writes live behind the Reading List operations submenu, so
+        // the main card must disclose where maintenance actions are located.
         let reading_list_view = catalog.view("reading_list").unwrap();
-        assert!(reading_list_view.description.contains("確認上傳"));
+        assert!(reading_list_view.description.contains("整理工具"));
         assert!(!reading_list_view.description.contains("快捷操作維持唯讀"));
         assert!(catalog
             .view("help")
             .unwrap()
             .description
             .contains("按「✅ 確認上傳」後才上傳 Drive"));
-        assert_eq!(catalog.global_actions_for("home").len(), 7);
+        assert_eq!(catalog.global_actions_for("home").len(), 8);
         let home = catalog.view("home").unwrap();
         assert_eq!(
             home.config_string("hub_url").as_deref(),
@@ -865,7 +871,7 @@ mod tests {
         drop(connection);
 
         let catalog = KnowledgeCatalog::open_or_seed(Some(&path)).unwrap();
-        assert_eq!(catalog.views.len(), 6);
+        assert_eq!(catalog.views.len(), 7);
         assert_eq!(
             catalog.global_action("retention_scan").unwrap().behavior,
             "prompt"
@@ -876,7 +882,7 @@ mod tests {
                 row.get(0)
             })
             .unwrap();
-        assert_eq!(version, 19);
+        assert_eq!(version, 21);
         let weekly = catalog.global_action("weekly_source_audit").unwrap();
         assert!(weekly.prompt_template.contains("禁止使用 null"));
         let world = catalog
@@ -893,6 +899,21 @@ mod tests {
         assert!(reading.action("recent_finance").is_some());
         assert!(reading.action("intake").is_some());
         assert!(reading.action("audit").is_some());
+        assert!(reading.action("operations").is_some());
+        assert!(reading.action("expect_review").is_some());
+        assert!(reading.action("taxonomy").is_some());
+        assert!(reading.action("epub_match").is_some());
+        assert!(reading.action("ops_status").is_some());
+        assert!(catalog.view("reading_list_operations").is_some());
+        assert!(catalog
+            .global_action("capture_inbox")
+            .unwrap()
+            .prompt_template
+            .contains("呼叫 process"));
+        assert!(catalog.global_action("reading_expect_score").is_some());
+        assert!(catalog.global_action("reading_expect_skip").is_some());
+        assert!(catalog.global_action("reading_epub_match_apply").is_some());
+        assert!(catalog.global_action("reading_epub_match_skip").is_some());
         assert!(reading
             .fields
             .iter()
@@ -913,7 +934,10 @@ mod tests {
             .prompt_template
             .contains("reading_list_epub_commit"));
         assert_eq!(
-            catalog.global_action("epub_intake_cancel").unwrap().behavior,
+            catalog
+                .global_action("epub_intake_cancel")
+                .unwrap()
+                .behavior,
             "local"
         );
         assert!(catalog
@@ -928,6 +952,10 @@ mod tests {
         assert!(catalog.global_action("capture_inbox_accept").is_some());
         assert!(catalog.global_action("capture_inbox_skip").is_some());
         assert!(catalog.global_action("capture_inbox_modify").is_some());
+        assert!(catalog.global_action("capture_inbox_resume").is_some());
+        assert!(catalog.global_action("capture_inbox_retry").is_some());
+        assert!(catalog.global_action("knowledge_card_retry").is_some());
+        assert!(catalog.global_action("knowledge_card_plain").is_some());
         assert!(inbox.prompt_template.contains("JSON 頂層必須同時包含"));
         for action_id in [
             "capture_inbox_accept",

@@ -920,7 +920,23 @@ struct KnowledgeCardEnvelope {
     #[serde(default)]
     inbox_id: String,
     #[serde(default)]
-    item_index: u8,
+    item_index: u16,
+    #[serde(default)]
+    batch_id: String,
+    #[serde(default)]
+    plan_id: String,
+    #[serde(default)]
+    total: u16,
+    #[serde(default)]
+    queued: u16,
+    #[serde(default)]
+    ready: u16,
+    #[serde(default)]
+    accepted: u16,
+    #[serde(default)]
+    skipped: u16,
+    #[serde(default)]
+    failed: u16,
     #[serde(default)]
     job_run: Option<ScheduledJobRun>,
     /// Bulk article mirror for the retention cron run. Never rendered into
@@ -952,6 +968,8 @@ struct KnowledgeCardItem {
     intake_id: String,
     #[serde(default)]
     sha256: String,
+    #[serde(default)]
+    match_state: String,
 }
 
 const DISCORD_COMPONENTS_V2_FLAG: u64 = 1 << 15;
@@ -1120,7 +1138,8 @@ pub fn knowledge_cards_payload_is_valid(content: &str) -> bool {
 fn parse_and_validate_knowledge_cards(
     content: &str,
 ) -> Result<(KnowledgeCardEnvelope, Option<&'static KnowledgeSource>), &'static str> {
-    let envelope = parse_knowledge_card_envelope(content).ok_or("envelope is not parseable JSON")?;
+    let envelope =
+        parse_knowledge_card_envelope(content).ok_or("envelope is not parseable JSON")?;
     let max_items = if matches!(
         envelope.kind.as_str(),
         "search" | "synthesis" | "project_notes" | "epub_audit"
@@ -1129,9 +1148,8 @@ fn parse_and_validate_knowledge_cards(
     } else {
         KNOWLEDGE_RESULTS_PAGE_SIZE
     };
-    let empty_retention_run = envelope.kind == "retention"
-        && envelope.items.is_empty()
-        && envelope.job_run.is_some();
+    let empty_retention_run =
+        envelope.kind == "retention" && envelope.items.is_empty() && envelope.job_run.is_some();
     if !empty_retention_run && envelope.items.is_empty() {
         return Err("items is empty");
     }
@@ -1147,6 +1165,8 @@ fn parse_and_validate_knowledge_cards(
         && envelope.kind != "capture_inbox_preview"
         && envelope.kind != "epub_intake_preview"
         && envelope.kind != "epub_audit"
+        && envelope.kind != "reading_expect_review"
+        && envelope.kind != "reading_epub_match_review"
     {
         return Err("kind is not a supported card contract");
     }
@@ -1172,6 +1192,42 @@ fn parse_and_validate_knowledge_cards(
         if !(1..=10).contains(&envelope.item_index) {
             return Err("capture_inbox_preview is missing a valid item_index");
         }
+        let progress_total = u32::from(envelope.queued)
+            + u32::from(envelope.ready)
+            + u32::from(envelope.accepted)
+            + u32::from(envelope.skipped)
+            + u32::from(envelope.failed);
+        if !(2..=10).contains(&envelope.total) || progress_total != u32::from(envelope.total) {
+            return Err("capture_inbox_preview has invalid progress counters");
+        }
+    }
+    if envelope.kind == "reading_expect_review" {
+        if envelope.items.len() != 1 {
+            return Err("reading_expect_review needs exactly one item");
+        }
+        if uuid::Uuid::parse_str(envelope.batch_id.trim()).is_err() {
+            return Err("reading_expect_review is missing a valid batch_id");
+        }
+        if envelope.item_index == 0 {
+            return Err("reading_expect_review is missing a valid item_index");
+        }
+    }
+    if envelope.kind == "reading_epub_match_review" {
+        if envelope.items.len() != 1 {
+            return Err("reading_epub_match_review needs exactly one item");
+        }
+        if uuid::Uuid::parse_str(envelope.plan_id.trim()).is_err() {
+            return Err("reading_epub_match_review is missing a valid plan_id");
+        }
+        if envelope.item_index == 0 {
+            return Err("reading_epub_match_review is missing a valid item_index");
+        }
+        if !matches!(
+            envelope.items[0].match_state.as_str(),
+            "high" | "medium" | "low" | "already_linked" | "not_in_notion"
+        ) {
+            return Err("reading_epub_match_review has an invalid match_state");
+        }
     }
     if matches!(envelope.kind.as_str(), "synthesis" | "epub_audit")
         && envelope.overview.trim().is_empty()
@@ -1188,14 +1244,16 @@ fn parse_and_validate_knowledge_cards(
         if envelope.kind != "retention" || envelope.job_run.is_none() {
             return Err("articles are only valid on a retention job run");
         }
-        validate_scheduled_articles(&envelope.articles).map_err(|_| "articles failed validation")?;
+        validate_scheduled_articles(&envelope.articles)
+            .map_err(|_| "articles failed validation")?;
     }
 
     for item in &envelope.items {
         let requires_url = envelope.kind != "project_note_preview";
         let notion_only = envelope.kind != "capture_preview"
             && envelope.kind != "capture_inbox_preview"
-            && envelope.kind != "epub_audit";
+            && envelope.kind != "epub_audit"
+            && envelope.kind != "reading_epub_match_review";
         let url = item.url.trim();
         if requires_url && !knowledge_card_url_is_valid(url, notion_only) {
             return Err("an item url is missing or not an allowed https link");
@@ -1540,6 +1598,8 @@ fn knowledge_cards_message_for(content: &str, capture_owner: Option<u64>) -> Opt
             "capture_preview" => 0x5865F2,
             "capture_inbox_preview" => 0x3498DB,
             "epub_intake_preview" => 0x9B59B6,
+            "reading_expect_review" => 0xF1C40F,
+            "reading_epub_match_review" => 0x5865F2,
             _ => 0x2F80ED,
         };
         let mut embed = CreateEmbed::new()
@@ -1548,6 +1608,13 @@ fn knowledge_cards_message_for(content: &str, capture_owner: Option<u64>) -> Opt
             .colour(colour);
         if envelope.kind != "project_note_preview" {
             embed = embed.url(item.url.trim());
+        }
+        if envelope.kind == "capture_inbox_preview" {
+            let processed = envelope.accepted + envelope.skipped + envelope.failed;
+            embed = embed.footer(CreateEmbedFooter::new(format!(
+                "Inbox {} · 已處理 {processed}/{} · 待確認 {} · 失敗 {}",
+                envelope.inbox_id, envelope.total, envelope.ready, envelope.failed
+            )));
         }
         embeds.push(embed);
     }
@@ -1614,7 +1681,7 @@ fn knowledge_cards_message_for(content: &str, capture_owner: Option<u64>) -> Opt
         };
         let inbox_id = uuid::Uuid::parse_str(envelope.inbox_id.trim()).ok()?;
         let item_index = envelope.item_index;
-        message = message.components(vec![CreateActionRow::Buttons(vec![
+        let mut buttons = vec![
             CreateButton::new(format!(
                 "oab_knowledge:ci_accept:{owner_id}:{inbox_id}:{item_index}"
             ))
@@ -1630,7 +1697,16 @@ fn knowledge_cards_message_for(content: &str, capture_owner: Option<u64>) -> Opt
             ))
             .label(modify_action.label.clone())
             .style(knowledge_button_style(&modify_action.button_style)),
-        ])]);
+        ];
+        if envelope.failed > 0 {
+            let retry_action = catalog.global_action("capture_inbox_retry")?;
+            buttons.push(
+                CreateButton::new(format!("oab_knowledge:ci_retry:{owner_id}:{inbox_id}"))
+                    .label(retry_action.label.clone())
+                    .style(knowledge_button_style(&retry_action.button_style)),
+            );
+        }
+        message = message.components(vec![CreateActionRow::Buttons(buttons)]);
     } else if envelope.kind == "epub_intake_preview" {
         let confirm_action = catalog.global_action("epub_intake_confirm")?;
         let cancel_action = catalog.global_action("epub_intake_cancel")?;
@@ -1653,6 +1729,68 @@ fn knowledge_cards_message_for(content: &str, capture_owner: Option<u64>) -> Opt
             .label(cancel_action.label.clone())
             .style(knowledge_button_style(&cancel_action.button_style)),
         ])]);
+    } else if envelope.kind == "reading_expect_review" {
+        let Some(owner_id) = capture_owner else {
+            warn!("reading_expect_review card missing owner; posting embed without controls");
+            return Some(message);
+        };
+        let batch_id = uuid::Uuid::parse_str(envelope.batch_id.trim()).ok()?;
+        let item_index = envelope.item_index;
+        let score_options = (0..=20)
+            .map(|half| {
+                let value = half as f32 / 2.0;
+                let label = if half % 2 == 0 {
+                    format!("{} 分", half / 2)
+                } else {
+                    format!("{value:.1} 分")
+                };
+                CreateSelectMenuOption::new(label, format!("{value:.1}"))
+            })
+            .collect();
+        message = message.components(vec![
+            CreateActionRow::SelectMenu(
+                CreateSelectMenu::new(
+                    format!("oab_knowledge:rl_expect_score:{owner_id}:{batch_id}:{item_index}"),
+                    CreateSelectMenuKind::String {
+                        options: score_options,
+                    },
+                )
+                .placeholder("選擇 Expect（0–10，每次 0.5）"),
+            ),
+            CreateActionRow::Buttons(vec![CreateButton::new(format!(
+                "oab_knowledge:rl_expect_skip:{owner_id}:{batch_id}:{item_index}"
+            ))
+            .label("稍後再評")
+            .style(ButtonStyle::Secondary)]),
+        ]);
+    } else if envelope.kind == "reading_epub_match_review" {
+        let Some(owner_id) = capture_owner else {
+            warn!("reading_epub_match_review card missing owner; posting embed without controls");
+            return Some(message);
+        };
+        let plan_id = uuid::Uuid::parse_str(envelope.plan_id.trim()).ok()?;
+        let item_index = envelope.item_index;
+        let can_apply = matches!(
+            envelope.items.first()?.match_state.as_str(),
+            "high" | "medium"
+        );
+        message = message.components(vec![CreateActionRow::Buttons(vec![
+            CreateButton::new(format!(
+                "oab_knowledge:rl_match_apply:{owner_id}:{plan_id}:{item_index}"
+            ))
+            .label(if can_apply {
+                "套用這筆配對"
+            } else {
+                "需人工確認"
+            })
+            .style(ButtonStyle::Success)
+            .disabled(!can_apply),
+            CreateButton::new(format!(
+                "oab_knowledge:rl_match_skip:{owner_id}:{plan_id}:{item_index}"
+            ))
+            .label("略過")
+            .style(ButtonStyle::Secondary),
+        ])]);
     }
     Some(message)
 }
@@ -1670,7 +1808,18 @@ fn knowledge_delivery_message(content: &str, channel_id: u64) -> CreateMessage {
             channel_id,
             reason, "knowledge cards marker present but validation failed; using fallback"
         );
-        return CreateMessage::new().content(KNOWLEDGE_CARDS_INVALID_FALLBACK);
+        let mut message = CreateMessage::new().content(KNOWLEDGE_CARDS_INVALID_FALLBACK);
+        if let Some(owner_id) = owner {
+            message = message.components(vec![CreateActionRow::Buttons(vec![
+                CreateButton::new(format!("oab_knowledge:card_retry:{owner_id}"))
+                    .label("重試卡片")
+                    .style(ButtonStyle::Primary),
+                CreateButton::new(format!("oab_knowledge:card_plain:{owner_id}"))
+                    .label("改用文字")
+                    .style(ButtonStyle::Secondary),
+            ])]);
+        }
+        return message;
     }
     CreateMessage::new().content(content)
 }
@@ -1720,6 +1869,30 @@ fn knowledge_action_button_rows(
                         CreateButton::new(custom_id(action))
                             .label(action.label.clone())
                             .style(knowledge_button_style(&action.button_style))
+                    })
+                    .collect(),
+            )
+        })
+        .collect()
+}
+
+fn knowledge_named_action_button_rows(
+    source: &KnowledgeSource,
+    action_ids: &[&str],
+) -> Vec<CreateActionRow> {
+    action_ids
+        .chunks(5)
+        .map(|ids| {
+            CreateActionRow::Buttons(
+                ids.iter()
+                    .filter_map(|action_id| source.action(action_id))
+                    .map(|action| {
+                        CreateButton::new(format!(
+                            "oab_knowledge:reading_list_{}",
+                            action.action_id
+                        ))
+                        .label(action.label.clone())
+                        .style(knowledge_button_style(&action.button_style))
                     })
                     .collect(),
             )
@@ -1811,6 +1984,25 @@ fn parse_capture_inbox_binding(value: &str) -> Option<(u64, uuid::Uuid, u8)> {
     let item_index = parts.next()?.parse::<u8>().ok()?;
     (parts.next().is_none() && (1..=10).contains(&item_index))
         .then_some((owner_id, inbox_id, item_index))
+}
+
+fn parse_capture_inbox_retry_binding(value: &str) -> Option<(u64, uuid::Uuid)> {
+    let mut parts = value.split(':');
+    let owner_id = parts.next()?.parse::<u64>().ok()?;
+    let inbox_id = uuid::Uuid::parse_str(parts.next()?).ok()?;
+    parts.next().is_none().then_some((owner_id, inbox_id))
+}
+
+fn parse_reading_expect_binding(value: &str) -> Option<(u64, uuid::Uuid, u16)> {
+    let mut parts = value.split(':');
+    let owner_id = parts.next()?.parse::<u64>().ok()?;
+    let batch_id = uuid::Uuid::parse_str(parts.next()?).ok()?;
+    let item_index = parts.next()?.parse::<u16>().ok()?;
+    (parts.next().is_none() && item_index > 0).then_some((owner_id, batch_id, item_index))
+}
+
+fn parse_reading_match_binding(value: &str) -> Option<(u64, uuid::Uuid, u16)> {
+    parse_reading_expect_binding(value)
 }
 
 fn knowledge_capture_inbox_modify_modal(
@@ -1991,12 +2183,20 @@ fn knowledge_scheduled_source_message(
                 .description(view.description.clone())
                 .colour(view.colour),
         )
-        .components(knowledge_action_button_rows(source, |action| {
-            format!(
-                "oab_knowledge:source_{}:{}",
-                action.action_id, source.source_id
+        .components({
+            let mut rows = knowledge_action_button_rows(source, |action| {
+                format!(
+                    "oab_knowledge:source_{}:{}",
+                    action.action_id, source.source_id
+                )
+            });
+            rows.push(CreateActionRow::Buttons(vec![CreateButton::new(
+                "oab_knowledge:home",
             )
-        }))
+            .label("↩ Knowledge Home")
+            .style(ButtonStyle::Secondary)]));
+            rows
+        })
         .ephemeral(true)
 }
 
@@ -2021,6 +2221,23 @@ fn knowledge_reading_list_message() -> CreateInteractionResponseMessage {
     let view = knowledge_catalog()
         .view("reading_list")
         .expect("seeded Reading List view");
+    let mut components = knowledge_named_action_button_rows(
+        source,
+        &[
+            "recommend",
+            "recent_finance",
+            "current",
+            "search",
+            "overview",
+            "audit",
+            "operations",
+        ],
+    );
+    components.push(CreateActionRow::Buttons(vec![CreateButton::new(
+        "oab_knowledge:home",
+    )
+    .label("↩ Knowledge Home")
+    .style(ButtonStyle::Secondary)]));
     CreateInteractionResponseMessage::new()
         .embed(
             CreateEmbed::new()
@@ -2028,9 +2245,43 @@ fn knowledge_reading_list_message() -> CreateInteractionResponseMessage {
                 .description(view.description.clone())
                 .colour(view.colour),
         )
-        .components(knowledge_action_button_rows(source, |action| {
-            format!("oab_knowledge:reading_list_{}", action.action_id)
-        }))
+        .components(components)
+        .ephemeral(true)
+}
+
+fn knowledge_reading_list_operations_message() -> CreateInteractionResponseMessage {
+    let source = knowledge_reading_list().expect("seeded Reading List source");
+    let view = knowledge_catalog()
+        .view("reading_list_operations")
+        .expect("seeded Reading List operations view");
+    let mut components = knowledge_named_action_button_rows(
+        source,
+        &[
+            "expect_review",
+            "taxonomy",
+            "epub_match",
+            "ops_status",
+            "intake",
+        ],
+    );
+    components.push(CreateActionRow::Buttons(vec![
+        CreateButton::new("oab_knowledge:reading_list_home")
+            .label("↩ Reading List")
+            .style(ButtonStyle::Secondary),
+        CreateButton::new("oab_knowledge:home")
+            .label("🏠 Knowledge Home")
+            .style(ButtonStyle::Secondary),
+    ]));
+    let mut embed = CreateEmbed::new()
+        .title(view.title.clone())
+        .description(view.description.clone())
+        .colour(view.colour);
+    if !view.footer.is_empty() {
+        embed = embed.footer(CreateEmbedFooter::new(view.footer.clone()));
+    }
+    CreateInteractionResponseMessage::new()
+        .embed(embed)
+        .components(components)
         .ephemeral(true)
 }
 
@@ -2041,6 +2292,15 @@ fn knowledge_reading_list_search_modal() -> CreateModal {
         "oab_knowledge_modal:reading_list_search".to_string(),
     )
     .expect("Reading List search action has inputs")
+}
+
+fn knowledge_reading_list_epub_match_modal() -> CreateModal {
+    knowledge_action_modal(
+        knowledge_reading_list().expect("seeded Reading List source"),
+        "epub_match",
+        "oab_knowledge_modal:reading_list_epub_match".to_string(),
+    )
+    .expect("Reading List EPUB matcher has a folder input")
 }
 
 fn knowledge_reading_list_prompt(operation: &str) -> Option<(String, String)> {
@@ -2079,7 +2339,12 @@ fn knowledge_side_projects_message() -> CreateInteractionResponseMessage {
                 .description(view.description.clone())
                 .colour(view.colour),
         )
-        .components(vec![knowledge_side_project_select()])
+        .components(vec![
+            knowledge_side_project_select(),
+            CreateActionRow::Buttons(vec![CreateButton::new("oab_knowledge:home")
+                .label("↩ Knowledge Home")
+                .style(ButtonStyle::Secondary)]),
+        ])
         .ephemeral(true)
 }
 
@@ -2100,12 +2365,23 @@ fn knowledge_side_project_message(project: &KnowledgeSource) -> CreateInteractio
                 )
                 .colour(view.colour),
         )
-        .components(knowledge_action_button_rows(project, |action| {
-            format!(
-                "oab_knowledge:project_note_{}:{}",
-                action.action_id, project.source_id
-            )
-        }))
+        .components({
+            let mut rows = knowledge_action_button_rows(project, |action| {
+                format!(
+                    "oab_knowledge:project_note_{}:{}",
+                    action.action_id, project.source_id
+                )
+            });
+            rows.push(CreateActionRow::Buttons(vec![
+                CreateButton::new("oab_knowledge:side_projects_home")
+                    .label("↩ Side Projects")
+                    .style(ButtonStyle::Secondary),
+                CreateButton::new("oab_knowledge:home")
+                    .label("🏠 Knowledge Home")
+                    .style(ButtonStyle::Secondary),
+            ]));
+            rows
+        })
         .ephemeral(true)
 }
 
@@ -2682,6 +2958,10 @@ fn knowledge_capture_inbox_modal() -> CreateModal {
     knowledge_global_modal("capture_inbox").expect("seeded capture inbox workflow")
 }
 
+fn knowledge_capture_inbox_resume_modal() -> CreateModal {
+    knowledge_global_modal("capture_inbox_resume").expect("seeded capture inbox resume workflow")
+}
+
 fn knowledge_search_modal() -> CreateModal {
     knowledge_global_modal("search").expect("seeded search workflow")
 }
@@ -2693,6 +2973,7 @@ fn knowledge_home_modal(action: &str) -> Option<CreateModal> {
     match action {
         "capture" => Some(knowledge_capture_modal()),
         "capture_inbox" => Some(knowledge_capture_inbox_modal()),
+        "capture_inbox_resume" => Some(knowledge_capture_inbox_resume_modal()),
         "search" => Some(knowledge_search_modal()),
         _ => None,
     }
@@ -4409,8 +4690,9 @@ impl DiscordAdapter {
         content: &str,
         reply_to_message_id: Option<u64>,
     ) -> anyhow::Result<Option<String>> {
-        let validated =
-            parse_and_validate_knowledge_cards(content).map(|(envelope, _)| envelope).ok();
+        let validated = parse_and_validate_knowledge_cards(content)
+            .map(|(envelope, _)| envelope)
+            .ok();
         let Some(payload) =
             knowledge_components_v2_message(content, channel_id, reply_to_message_id)
         else {
@@ -4669,7 +4951,10 @@ impl ChatAdapter for DiscordAdapter {
         event: TaskLifecycleEvent,
     ) -> anyhow::Result<()> {
         let thread_id: u64 = Self::resolve_channel(channel).parse()?;
-        let task = self.task_registry.as_ref().and_then(|registry| registry.task_for_thread(thread_id));
+        let task = self
+            .task_registry
+            .as_ref()
+            .and_then(|registry| registry.task_for_thread(thread_id));
         let report_type = match &event {
             TaskLifecycleEvent::SessionOpened => Some("opened"),
             TaskLifecycleEvent::Finished => Some("turn_completed"),
@@ -4677,9 +4962,18 @@ impl ChatAdapter for DiscordAdapter {
             _ => None,
         };
         if let (Some(reporter), Some(event_type)) = (&self.reporter, report_type) {
-            let title = task.as_ref().map(|value| value.title.as_str()).unwrap_or("Discord session");
-            let workspace = task.as_ref().map(|value| value.workspace_alias.as_str()).unwrap_or("");
-            if let Err(error) = reporter.report(thread_id, event_type, title, workspace).await {
+            let title = task
+                .as_ref()
+                .map(|value| value.title.as_str())
+                .unwrap_or("Discord session");
+            let workspace = task
+                .as_ref()
+                .map(|value| value.workspace_alias.as_str())
+                .unwrap_or("");
+            if let Err(error) = reporter
+                .report(thread_id, event_type, title, workspace)
+                .await
+            {
                 tracing::warn!(%error, thread_id, event_type, "failed to report session event");
             }
         }
@@ -4826,7 +5120,10 @@ fn inventory_task_state(state: TaskState) -> &'static str {
     }
 }
 
-async fn inventory_thread_metadata(http: &Http, thread_id: u64) -> anyhow::Result<(String, String)> {
+async fn inventory_thread_metadata(
+    http: &Http,
+    thread_id: u64,
+) -> anyhow::Result<(String, String)> {
     let channel = ChannelId::new(thread_id).to_channel(http).await?;
     let Channel::Guild(channel) = channel else {
         anyhow::bail!("session channel is not a guild channel");
@@ -7943,12 +8240,9 @@ impl Handler {
                 .await;
             return;
         }
-        let Some(payload) = knowledge_components_v2_page_message(
-            &entry.envelope,
-            entry.channel_id,
-            None,
-            page,
-        ) else {
+        let Some(payload) =
+            knowledge_components_v2_page_message(&entry.envelope, entry.channel_id, None, page)
+        else {
             let _ = comp
                 .create_response(
                     &ctx.http,
@@ -7967,22 +8261,21 @@ impl Handler {
             return;
         }
         let result = match serde_json::to_vec(&payload) {
-            Ok(body) => {
-                ctx.http
-                    .fire::<ComponentsV2CreatedMessage>(
-                        Request::new(
-                            Route::ChannelMessage {
-                                channel_id: comp.channel_id,
-                                message_id: comp.message.id,
-                            },
-                            LightMethod::Patch,
-                        )
-                        .body(Some(body)),
+            Ok(body) => ctx
+                .http
+                .fire::<ComponentsV2CreatedMessage>(
+                    Request::new(
+                        Route::ChannelMessage {
+                            channel_id: comp.channel_id,
+                            message_id: comp.message.id,
+                        },
+                        LightMethod::Patch,
                     )
-                    .await
-                    .map(|_| ())
-                    .map_err(anyhow::Error::from)
-            }
+                    .body(Some(body)),
+                )
+                .await
+                .map(|_| ())
+                .map_err(anyhow::Error::from),
             Err(error) => Err(anyhow::Error::from(error)),
         };
         if let Err(error) = result {
@@ -8040,6 +8333,329 @@ impl Handler {
             .custom_id
             .strip_prefix("oab_knowledge:")
             .unwrap_or("");
+        for (prefix, action_id, progress) in [
+            (
+                "card_retry:",
+                "knowledge_card_retry",
+                "⏳ 正在依原始結果重新產生 Knowledge 卡片……",
+            ),
+            (
+                "card_plain:",
+                "knowledge_card_plain",
+                "⏳ 正在把原始結果改寫成文字……",
+            ),
+        ] {
+            if let Some(bound) = action.strip_prefix(prefix) {
+                let owner_id = bound.parse::<u64>().ok();
+                if owner_id != Some(comp.user.id.get()) {
+                    let _ = comp
+                        .create_response(
+                            &ctx.http,
+                            CreateInteractionResponse::Message(
+                                CreateInteractionResponseMessage::new()
+                                    .content("🔒 只有原始 Knowledge 請求的發起人可以重試。")
+                                    .ephemeral(true),
+                            ),
+                        )
+                        .await;
+                    return;
+                }
+                if let Err(error) = comp
+                    .create_response(
+                        &ctx.http,
+                        CreateInteractionResponse::UpdateMessage(
+                            CreateInteractionResponseMessage::new()
+                                .content(progress)
+                                .embeds(Vec::new())
+                                .components(Vec::new()),
+                        ),
+                    )
+                    .await
+                {
+                    tracing::error!(%error, action_id, "failed to acknowledge Knowledge card recovery");
+                    return;
+                }
+                let Some((title, prompt)) = knowledge_global_prompt(action_id, &[], None) else {
+                    let _ = comp
+                        .edit_response(
+                            &ctx.http,
+                            EditInteractionResponse::new()
+                                .content("⚠️ Knowledge 卡片復原工作流設定已失效。"),
+                        )
+                        .await;
+                    return;
+                };
+                if let Err(error) = self
+                    .submit_knowledge_prompt(ctx, scope, &comp.user, &title, prompt, None, false)
+                    .await
+                {
+                    let _ = comp
+                        .edit_response(
+                            &ctx.http,
+                            EditInteractionResponse::new()
+                                .content(format!("⚠️ 無法重新產生 Knowledge 結果：{error}")),
+                        )
+                        .await;
+                }
+                return;
+            }
+        }
+        if let Some(bound) = action.strip_prefix("ci_retry:") {
+            let Some((owner_id, inbox_id)) = parse_capture_inbox_retry_binding(bound) else {
+                let _ = comp
+                    .create_response(
+                        &ctx.http,
+                        CreateInteractionResponse::Message(
+                            CreateInteractionResponseMessage::new()
+                                .content("⚠️ 這張 Inbox 卡片已失效，請從首頁重新開啟。")
+                                .ephemeral(true),
+                        ),
+                    )
+                    .await;
+                return;
+            };
+            if comp.user.id.get() != owner_id {
+                let _ = comp
+                    .create_response(
+                        &ctx.http,
+                        CreateInteractionResponse::Message(
+                            CreateInteractionResponseMessage::new()
+                                .content("🔒 只有這個 Capture Inbox 的發起人可以重試。")
+                                .ephemeral(true),
+                        ),
+                    )
+                    .await;
+                return;
+            }
+            if let Err(error) = comp
+                .create_response(
+                    &ctx.http,
+                    CreateInteractionResponse::UpdateMessage(
+                        CreateInteractionResponseMessage::new()
+                            .content("⏳ 正在重新排入並處理失敗的來源……")
+                            .embeds(Vec::new())
+                            .components(Vec::new()),
+                    ),
+                )
+                .await
+            {
+                tracing::error!(%error, %inbox_id, "failed to acknowledge Capture Inbox retry");
+                return;
+            }
+            let inbox_id = inbox_id.to_string();
+            let submitted = [("inbox_id", inbox_id.as_str())];
+            let Some((title, prompt)) =
+                knowledge_global_prompt("capture_inbox_retry", &submitted, None)
+            else {
+                return;
+            };
+            if let Err(error) = self
+                .submit_knowledge_prompt(ctx, scope, &comp.user, &title, prompt, None, false)
+                .await
+            {
+                let _ = comp
+                    .edit_response(
+                        &ctx.http,
+                        EditInteractionResponse::new()
+                            .content(format!("⚠️ 無法重試 Inbox 來源：{error}")),
+                    )
+                    .await;
+            }
+            return;
+        }
+        for (prefix, action_id, progress) in [
+            (
+                "rl_match_apply:",
+                "reading_epub_match_apply",
+                "⏳ 正在驗證並套用這筆 EPUB 配對……",
+            ),
+            (
+                "rl_match_skip:",
+                "reading_epub_match_skip",
+                "⏭️ 已略過這筆 EPUB 配對，正在準備下一筆……",
+            ),
+        ] {
+            if let Some(bound) = action.strip_prefix(prefix) {
+                let Some((owner_id, plan_id, item_index)) = parse_reading_match_binding(bound)
+                else {
+                    let _ = comp
+                        .create_response(
+                            &ctx.http,
+                            CreateInteractionResponse::Message(
+                                CreateInteractionResponseMessage::new()
+                                    .content("⚠️ 這張 EPUB 配對卡片已失效，請重新執行批次配對。")
+                                    .ephemeral(true),
+                            ),
+                        )
+                        .await;
+                    return;
+                };
+                if comp.user.id.get() != owner_id {
+                    let _ = comp
+                        .create_response(
+                            &ctx.http,
+                            CreateInteractionResponse::Message(
+                                CreateInteractionResponseMessage::new()
+                                    .content("🔒 只有這次 EPUB 配對的發起人可以處理項目。")
+                                    .ephemeral(true),
+                            ),
+                        )
+                        .await;
+                    return;
+                }
+                if let Err(error) = comp
+                    .create_response(
+                        &ctx.http,
+                        CreateInteractionResponse::UpdateMessage(
+                            CreateInteractionResponseMessage::new()
+                                .content(progress)
+                                .embeds(Vec::new())
+                                .components(Vec::new()),
+                        ),
+                    )
+                    .await
+                {
+                    tracing::error!(%error, %plan_id, item_index, "failed to acknowledge EPUB match decision");
+                    return;
+                }
+                let plan_id = plan_id.to_string();
+                let item_index = item_index.to_string();
+                let submitted = [
+                    ("plan_id", plan_id.as_str()),
+                    ("item_index", item_index.as_str()),
+                ];
+                let Some((title, prompt)) =
+                    knowledge_global_prompt(action_id, &submitted, knowledge_reading_list())
+                else {
+                    let _ = comp
+                        .edit_response(
+                            &ctx.http,
+                            EditInteractionResponse::new()
+                                .content("⚠️ EPUB reconciliation 工作流設定已失效。"),
+                        )
+                        .await;
+                    return;
+                };
+                if let Err(error) = self
+                    .submit_knowledge_prompt(ctx, scope, &comp.user, &title, prompt, None, false)
+                    .await
+                {
+                    let _ = comp
+                        .edit_response(
+                            &ctx.http,
+                            EditInteractionResponse::new()
+                                .content(format!("⚠️ 無法處理 EPUB 配對：{error}")),
+                        )
+                        .await;
+                }
+                return;
+            }
+        }
+        for (prefix, action_id, progress) in [
+            (
+                "rl_expect_score:",
+                "reading_expect_score",
+                "⏳ 正在寫入並驗證這本書的 Expect……",
+            ),
+            (
+                "rl_expect_skip:",
+                "reading_expect_skip",
+                "⏭️ 已略過這本書，正在準備下一本……",
+            ),
+        ] {
+            if let Some(bound) = action.strip_prefix(prefix) {
+                let Some((owner_id, batch_id, item_index)) = parse_reading_expect_binding(bound)
+                else {
+                    let _ = comp
+                        .create_response(
+                            &ctx.http,
+                            CreateInteractionResponse::Message(
+                                CreateInteractionResponseMessage::new()
+                                    .content("⚠️ 這張 Expect 卡片已失效，請重新開啟補分流程。")
+                                    .ephemeral(true),
+                            ),
+                        )
+                        .await;
+                    return;
+                };
+                if comp.user.id.get() != owner_id {
+                    let _ = comp
+                        .create_response(
+                            &ctx.http,
+                            CreateInteractionResponse::Message(
+                                CreateInteractionResponseMessage::new()
+                                    .content("🔒 只有這次 Expect review 的發起人可以評分。")
+                                    .ephemeral(true),
+                            ),
+                        )
+                        .await;
+                    return;
+                }
+                let expect = if action_id == "reading_expect_score" {
+                    let Some(value) = first_string_select(&comp.data.kind) else {
+                        return;
+                    };
+                    let Ok(score) = value.parse::<f32>() else {
+                        return;
+                    };
+                    if !(0.0..=10.0).contains(&score) || (score * 2.0).fract() != 0.0 {
+                        return;
+                    }
+                    Some(value.to_string())
+                } else {
+                    None
+                };
+                if let Err(error) = comp
+                    .create_response(
+                        &ctx.http,
+                        CreateInteractionResponse::UpdateMessage(
+                            CreateInteractionResponseMessage::new()
+                                .content(progress)
+                                .embeds(Vec::new())
+                                .components(Vec::new()),
+                        ),
+                    )
+                    .await
+                {
+                    tracing::error!(%error, %batch_id, item_index, "failed to acknowledge Expect decision");
+                    return;
+                }
+                let batch_id = batch_id.to_string();
+                let item_index = item_index.to_string();
+                let mut submitted = vec![
+                    ("batch_id", batch_id.as_str()),
+                    ("item_index", item_index.as_str()),
+                ];
+                if let Some(expect) = expect.as_deref() {
+                    submitted.push(("expect", expect));
+                }
+                let Some((title, prompt)) =
+                    knowledge_global_prompt(action_id, &submitted, knowledge_reading_list())
+                else {
+                    let _ = comp
+                        .edit_response(
+                            &ctx.http,
+                            EditInteractionResponse::new()
+                                .content("⚠️ Expect review 工作流設定已失效。"),
+                        )
+                        .await;
+                    return;
+                };
+                if let Err(error) = self
+                    .submit_knowledge_prompt(ctx, scope, &comp.user, &title, prompt, None, false)
+                    .await
+                {
+                    let _ = comp
+                        .edit_response(
+                            &ctx.http,
+                            EditInteractionResponse::new()
+                                .content(format!("⚠️ 無法處理 Expect：{error}")),
+                        )
+                        .await;
+                }
+                return;
+            }
+        }
         for (prefix, action_id, progress) in [
             (
                 "ci_accept:",
@@ -8244,6 +8860,42 @@ impl Handler {
             }
             return;
         }
+        if action == "home" {
+            if let Err(error) = comp
+                .create_response(
+                    &ctx.http,
+                    CreateInteractionResponse::UpdateMessage(knowledge_home_message()),
+                )
+                .await
+            {
+                tracing::error!(%error, "failed to return to Knowledge Home");
+            }
+            return;
+        }
+        if action == "reading_list_home" {
+            if let Err(error) = comp
+                .create_response(
+                    &ctx.http,
+                    CreateInteractionResponse::UpdateMessage(knowledge_reading_list_message()),
+                )
+                .await
+            {
+                tracing::error!(%error, "failed to return to Reading List");
+            }
+            return;
+        }
+        if action == "side_projects_home" {
+            if let Err(error) = comp
+                .create_response(
+                    &ctx.http,
+                    CreateInteractionResponse::UpdateMessage(knowledge_side_projects_message()),
+                )
+                .await
+            {
+                tracing::error!(%error, "failed to return to Side Projects");
+            }
+            return;
+        }
         if action == "retention_keep" {
             let selected = first_string_select(&comp.data.kind).and_then(|value| {
                 let mut parts = value.split('|');
@@ -8314,7 +8966,9 @@ impl Handler {
         if let Some(bound) = action.strip_prefix("epub_intake_confirm:") {
             let mut parts = bound.split(':');
             let owner_id = parts.next().and_then(|value| value.parse::<u64>().ok());
-            let intake_id = parts.next().filter(|value| uuid::Uuid::parse_str(value).is_ok());
+            let intake_id = parts
+                .next()
+                .filter(|value| uuid::Uuid::parse_str(value).is_ok());
             if parts.next().is_some() || owner_id.is_none() || intake_id.is_none() {
                 let _ = comp
                     .create_response(
@@ -8366,13 +9020,16 @@ impl Handler {
                 ("Discord preview message ID", preview_message_id.as_str()),
                 ("Discord user ID", user_id.as_str()),
             ];
-            let Some((action_title, prompt)) =
-                knowledge_global_prompt("epub_intake_confirm", &submitted, knowledge_reading_list())
-            else {
+            let Some((action_title, prompt)) = knowledge_global_prompt(
+                "epub_intake_confirm",
+                &submitted,
+                knowledge_reading_list(),
+            ) else {
                 let _ = comp
                     .edit_response(
                         &ctx.http,
-                        EditInteractionResponse::new().content("⚠️ EPUB Intake 確認流程設定已失效。"),
+                        EditInteractionResponse::new()
+                            .content("⚠️ EPUB Intake 確認流程設定已失效。"),
                     )
                     .await;
                 return;
@@ -8394,7 +9051,9 @@ impl Handler {
         if let Some(bound) = action.strip_prefix("epub_intake_cancel:") {
             let mut parts = bound.split(':');
             let owner_id = parts.next().and_then(|value| value.parse::<u64>().ok());
-            let intake_id_valid = parts.next().is_some_and(|value| uuid::Uuid::parse_str(value).is_ok());
+            let intake_id_valid = parts
+                .next()
+                .is_some_and(|value| uuid::Uuid::parse_str(value).is_ok());
             if parts.next().is_some() || owner_id.is_none() || !intake_id_valid {
                 let _ = comp
                     .create_response(
@@ -8818,6 +9477,20 @@ impl Handler {
             return;
         }
         if let Some(operation) = action.strip_prefix("reading_list_") {
+            if operation == "operations" {
+                if let Err(error) = comp
+                    .create_response(
+                        &ctx.http,
+                        CreateInteractionResponse::UpdateMessage(
+                            knowledge_reading_list_operations_message(),
+                        ),
+                    )
+                    .await
+                {
+                    tracing::error!(%error, "failed to show Reading List operations");
+                }
+                return;
+            }
             if operation == "search" {
                 if let Err(error) = comp
                     .create_response(
@@ -8827,6 +9500,18 @@ impl Handler {
                     .await
                 {
                     tracing::error!(%error, "failed to open Reading List search modal");
+                }
+                return;
+            }
+            if operation == "epub_match" {
+                if let Err(error) = comp
+                    .create_response(
+                        &ctx.http,
+                        CreateInteractionResponse::Modal(knowledge_reading_list_epub_match_modal()),
+                    )
+                    .await
+                {
+                    tracing::error!(%error, "failed to open Reading List EPUB matcher modal");
                 }
                 return;
             }
@@ -8889,6 +9574,11 @@ impl Handler {
                         .description(view.description.clone())
                         .colour(view.colour),
                 )
+                .components(vec![CreateActionRow::Buttons(vec![CreateButton::new(
+                    "oab_knowledge:home",
+                )
+                .label("↩ Knowledge Home")
+                .style(ButtonStyle::Secondary)])])
                 .ephemeral(true);
             let _ = comp
                 .create_response(&ctx.http, CreateInteractionResponse::Message(message))
@@ -9054,6 +9744,9 @@ impl Handler {
         } else if action == "reading_list_search" {
             knowledge_reading_list()
                 .and_then(|source| knowledge_modal_action_prompt(source, "search", modal))
+        } else if action == "reading_list_epub_match" {
+            knowledge_reading_list()
+                .and_then(|source| knowledge_modal_action_prompt(source, "epub_match", modal))
         } else if let Some(project_id) = action.strip_prefix("project_note_new:") {
             knowledge_side_project(project_id)
                 .and_then(|project| knowledge_modal_action_prompt(project, "new", modal))
@@ -9884,7 +10577,8 @@ impl Handler {
         };
 
         if matches!(&task_state_update, Some(TaskState::Closed)) {
-            self.report_session_event(cmd.channel_id.get(), "closed").await;
+            self.report_session_event(cmd.channel_id.get(), "closed")
+                .await;
         }
         if let Some(state) = task_state_update {
             if let Ok(task) = self.task_registry.set_state(cmd.channel_id.get(), state) {
@@ -10029,10 +10723,12 @@ impl Handler {
         };
 
         if stopped {
-            self.report_session_event(comp.channel_id.get(), "stopped").await;
+            self.report_session_event(comp.channel_id.get(), "stopped")
+                .await;
         }
         if matches!(&task_state_update, Some(TaskState::Closed)) {
-            self.report_session_event(comp.channel_id.get(), "closed").await;
+            self.report_session_event(comp.channel_id.get(), "closed")
+                .await;
         }
 
         let snapshot = self
@@ -12378,7 +13074,8 @@ impl Handler {
         let result = self.router.pool().cancel_session(&thread_key).await;
         let stopped = result.is_ok();
         if stopped {
-            self.report_session_event(cmd.channel_id.get(), "stopped").await;
+            self.report_session_event(cmd.channel_id.get(), "stopped")
+                .await;
         }
 
         let msg = match result {
@@ -12412,7 +13109,8 @@ impl Handler {
 
         let cancel_result = self.router.pool().cancel_session(&session_key).await;
         if cancel_result.is_ok() {
-            self.report_session_event(cmd.channel_id.get(), "stopped").await;
+            self.report_session_event(cmd.channel_id.get(), "stopped")
+                .await;
         }
 
         // Buffer count is approximate (sweep races with new arrivals) so we surface
@@ -12450,7 +13148,8 @@ impl Handler {
 
         let result = self.router.pool().reset_session(&session_key).await;
         if result.is_ok() {
-            self.report_session_event(cmd.channel_id.get(), "closed").await;
+            self.report_session_event(cmd.channel_id.get(), "closed")
+                .await;
         }
 
         let msg = match result {
@@ -14101,18 +14800,27 @@ mod tests {
         let aliases = HashMap::from([
             ("api".to_string(), "/work/api".to_string()),
             ("frontend".to_string(), "/work/frontend".to_string()),
-            ("example-library".to_string(), "/work/example-library".to_string()),
+            (
+                "example-library".to_string(),
+                "/work/example-library".to_string(),
+            ),
         ]);
         let used = HashSet::from(["api".to_string()]);
 
         assert_eq!(
             project_workspace_choices(&aliases, &used, "library"),
-            vec![("@example-library".to_string(), "example-library".to_string())]
+            vec![(
+                "@example-library".to_string(),
+                "example-library".to_string()
+            )]
         );
         assert_eq!(
             project_workspace_choices(&aliases, &used, ""),
             vec![
-                ("@example-library".to_string(), "example-library".to_string()),
+                (
+                    "@example-library".to_string(),
+                    "example-library".to_string()
+                ),
                 ("@frontend".to_string(), "frontend".to_string()),
             ]
         );
@@ -14283,6 +14991,7 @@ mod tests {
         let rendered = value.to_string();
         assert!(rendered.contains("oab_knowledge:capture"));
         assert!(rendered.contains("oab_knowledge:capture_inbox"));
+        assert!(rendered.contains("oab_knowledge:capture_inbox_resume"));
         assert!(rendered.contains("oab_knowledge:search"));
         assert!(rendered.contains("oab_knowledge:project"));
         assert!(rendered.contains("oab_knowledge:reading_list"));
@@ -14298,7 +15007,10 @@ mod tests {
         assert!(!rendered.contains("confirm"));
         // Ephemeral (flags = 64), like every drill-down view, so repeated
         // `/knowledge` calls do not pile up public cards with live buttons.
-        assert_eq!(value.get("flags").and_then(serde_json::Value::as_u64), Some(64));
+        assert_eq!(
+            value.get("flags").and_then(serde_json::Value::as_u64),
+            Some(64)
+        );
     }
 
     #[test]
@@ -14438,6 +15150,7 @@ mod tests {
         assert!(rendered.contains("oab_knowledge:source_search:github_ai_data_weekly"));
         assert!(rendered.contains("oab_knowledge:source_synthesis:github_ai_data_weekly"));
         assert!(rendered.contains("oab_knowledge:source_retention:github_ai_data_weekly"));
+        assert!(rendered.contains("oab_knowledge:home"));
         assert!(rendered.contains("永久保留"));
 
         let (_, retention) = knowledge_scheduled_source_prompt(source, "retention").unwrap();
@@ -14454,16 +15167,28 @@ mod tests {
             .unwrap()
             .to_string();
         assert!(rendered.contains("oab_knowledge:reading_list_recommend"));
-        assert!(rendered.contains("oab_knowledge:reading_list_intake"));
+        assert!(!rendered.contains("oab_knowledge:reading_list_intake"));
         assert!(rendered.contains("oab_knowledge:reading_list_recent_finance"));
         assert!(rendered.contains("oab_knowledge:reading_list_current"));
         assert!(rendered.contains("oab_knowledge:reading_list_search"));
         assert!(rendered.contains("oab_knowledge:reading_list_overview"));
         assert!(rendered.contains("oab_knowledge:reading_list_audit"));
-        assert!(rendered.contains("不會變更閱讀狀態或評分"));
+        assert!(rendered.contains("oab_knowledge:reading_list_operations"));
+        assert!(rendered.contains("oab_knowledge:home"));
+        assert!(rendered.contains("待讀推薦是主要入口"));
 
         let components = serde_json::to_value(knowledge_reading_list_message()).unwrap();
-        assert_eq!(components["components"].as_array().unwrap().len(), 2);
+        assert_eq!(components["components"].as_array().unwrap().len(), 3);
+
+        let operations = serde_json::to_value(knowledge_reading_list_operations_message())
+            .unwrap()
+            .to_string();
+        assert!(operations.contains("oab_knowledge:reading_list_expect_review"));
+        assert!(operations.contains("oab_knowledge:reading_list_taxonomy"));
+        assert!(operations.contains("oab_knowledge:reading_list_epub_match"));
+        assert!(operations.contains("oab_knowledge:reading_list_ops_status"));
+        assert!(operations.contains("oab_knowledge:reading_list_intake"));
+        assert!(operations.contains("oab_knowledge:reading_list_home"));
 
         let modal = serde_json::to_value(knowledge_reading_list_search_modal())
             .unwrap()
@@ -14488,6 +15213,63 @@ mod tests {
         assert!(audit.contains("完整 pagination"));
         assert!(audit.contains("reading_list_epub_audit"));
         assert!(knowledge_reading_list_prompt("delete").is_none());
+    }
+
+    #[test]
+    fn reading_expect_review_card_binds_score_and_skip_to_one_item() {
+        let payload = concat!(
+            "OPENAB_KNOWLEDGE_CARDS_V1\n",
+            r#"{"kind":"reading_expect_review","heading":"Reading List｜Expect 1 / 12","batch_id":"11111111-2222-4333-8444-555555555555","item_index":1,"items":[{"title":"Example Book","url":"https://app.notion.com/p/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","meta":"History · Knowledge","summary":"A compact description.","next_step":"選擇 Expect。"}]}"#,
+        );
+        assert!(knowledge_cards_payload_is_valid(payload));
+        let rendered = serde_json::to_value(
+            knowledge_cards_message_for(payload, Some(42)).expect("Expect review card"),
+        )
+        .unwrap()
+        .to_string();
+        assert!(rendered
+            .contains("oab_knowledge:rl_expect_score:42:11111111-2222-4333-8444-555555555555:1"));
+        assert!(rendered
+            .contains("oab_knowledge:rl_expect_skip:42:11111111-2222-4333-8444-555555555555:1"));
+        assert!(rendered.contains("4.5 分"));
+        assert!(rendered.contains("10 分"));
+        assert!(
+            parse_reading_expect_binding("42:11111111-2222-4333-8444-555555555555:1").is_some()
+        );
+
+        let missing_binding = payload.replace(
+            r#","batch_id":"11111111-2222-4333-8444-555555555555","item_index":1"#,
+            "",
+        );
+        assert!(!knowledge_cards_payload_is_valid(&missing_binding));
+    }
+
+    #[test]
+    fn reading_epub_match_review_only_enables_confirmable_matches() {
+        let payload = concat!(
+            "OPENAB_KNOWLEDGE_CARDS_V1\n",
+            r#"{"kind":"reading_epub_match_review","heading":"EPUB 配對｜1 / 20","plan_id":"11111111-2222-4333-8444-555555555555","item_index":1,"items":[{"title":"自由的窄廊.epub → 自由的窄廊","url":"https://app.notion.com/p/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","meta":"high · 100%","summary":"精確相符。","match_state":"high"}]}"#,
+        );
+        assert!(knowledge_cards_payload_is_valid(payload));
+        let rendered = serde_json::to_value(
+            knowledge_cards_message_for(payload, Some(42)).expect("EPUB match card"),
+        )
+        .unwrap();
+        let text = rendered.to_string();
+        assert!(
+            text.contains("oab_knowledge:rl_match_apply:42:11111111-2222-4333-8444-555555555555:1")
+        );
+        assert!(
+            text.contains("oab_knowledge:rl_match_skip:42:11111111-2222-4333-8444-555555555555:1")
+        );
+        assert!(text.contains("套用這筆配對"));
+
+        let low = payload.replace(r#""match_state":"high""#, r#""match_state":"low""#);
+        let low = serde_json::to_value(knowledge_cards_message_for(&low, Some(42)).unwrap())
+            .unwrap()
+            .to_string();
+        assert!(low.contains("需人工確認"));
+        assert!(low.contains(r#""disabled":true"#));
     }
 
     #[test]
@@ -14548,7 +15330,10 @@ mod tests {
             "capture_inbox_preview is missing a valid item_index"
         );
 
-        let bound = no_index.replace(r#""heading""#, r#""item_index":1,"heading""#);
+        let bound = no_index.replace(
+            r#""heading""#,
+            r#""item_index":1,"total":2,"queued":1,"ready":1,"accepted":0,"skipped":0,"failed":0,"heading""#,
+        );
         assert!(parse_and_validate_knowledge_cards(&bound).is_ok());
     }
 
@@ -14562,6 +15347,7 @@ mod tests {
             .map(|action| action.action_id.as_str())
             .collect();
         assert!(modal_actions.contains(&"capture_inbox"));
+        assert!(modal_actions.contains(&"capture_inbox_resume"));
         for action_id in modal_actions {
             assert!(
                 knowledge_home_modal(action_id).is_some(),
@@ -14585,6 +15371,11 @@ mod tests {
         .to_string();
         assert!(inbox.contains("oab_knowledge_modal:capture_inbox"));
         assert!(inbox.contains("urls"));
+        let resume = serde_json::to_value(knowledge_capture_inbox_resume_modal())
+            .unwrap()
+            .to_string();
+        assert!(resume.contains("oab_knowledge_modal:capture_inbox_resume"));
+        assert!(resume.contains("inbox_id"));
 
         let search = serde_json::to_value(knowledge_search_modal())
             .unwrap()
@@ -14630,6 +15421,7 @@ mod tests {
         assert!(picker.contains("project_notes_alpha"));
         assert!(picker.contains("project_notes_beta"));
         assert!(picker.contains("Example Project Beta"));
+        assert!(picker.contains("oab_knowledge:home"));
 
         let project = knowledge_side_project("project_notes_alpha").unwrap();
         let actions = serde_json::to_value(knowledge_side_project_message(project))
@@ -14639,6 +15431,8 @@ mod tests {
         assert!(actions.contains("oab_knowledge:project_note_recent:project_notes_alpha"));
         assert!(actions.contains("oab_knowledge:project_note_search:project_notes_alpha"));
         assert!(actions.contains("oab_knowledge:project_note_synthesis:project_notes_alpha"));
+        assert!(actions.contains("oab_knowledge:side_projects_home"));
+        assert!(actions.contains("oab_knowledge:home"));
         assert!(actions.contains("不會自動當成正式規格或決策"));
 
         let (_, recent) = knowledge_side_project_prompt(project, "recent").unwrap();
@@ -14938,10 +15732,7 @@ mod tests {
         assert!(rendered.contains("本週保留檢查完成"));
         assert!(!rendered.contains("OPENAB_KNOWLEDGE_CARDS_V1"));
 
-        let false_success = payload.replace(
-            r#""failed_items":0"#,
-            r#""failed_items":1"#,
-        );
+        let false_success = payload.replace(r#""failed_items":0"#, r#""failed_items":1"#);
         assert!(!knowledge_cards_payload_is_valid(&false_success));
     }
 
@@ -14977,7 +15768,9 @@ mod tests {
             r#"{"kind":"retention","heading":"完成","items":[],"job_run":{"job_id":"opencode-scheduled-source-retention","run_id":"r-1","started_at":"2026-08-30T03:00:00+08:00","finished_at":"2026-08-30T03:12:00+08:00","status":"success","metrics":{"sources_scanned":3,"items_scanned":1,"protected_items":0,"enqueued_items":0,"pending_items":0,"trash_due_items":0,"trashed_items":0,"failed_items":0},"note":""},"articles":[ARTICLES]}"#,
         );
         let good = r#"{"source_id":"world_stories","page_id":"aaaa-bbbb-cccc","title":"t","url":"https://app.notion.com/p/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}"#;
-        assert!(knowledge_cards_payload_is_valid(&base.replace("ARTICLES", good)));
+        assert!(knowledge_cards_payload_is_valid(
+            &base.replace("ARTICLES", good)
+        ));
 
         let unknown_source = good.replace("world_stories", "personal_reading_list");
         assert!(!knowledge_cards_payload_is_valid(
@@ -15015,9 +15808,8 @@ mod tests {
         let rendered = serde_json::to_value(knowledge_cards_message(notes).unwrap())
             .unwrap()
             .to_string();
-        assert!(rendered.contains(
-            "[新的控制方式](https://app.notion.com/p/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa)"
-        ));
+        assert!(rendered
+            .contains("[新的控制方式](https://app.notion.com/p/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa)"));
         assert!(rendered.contains("**1.** ["));
         assert!(rendered.contains("**2.** ["));
         assert!(rendered.contains("Knowledge · 2 筆"));
@@ -15076,7 +15868,7 @@ mod tests {
     fn knowledge_capture_inbox_preview_binds_per_item_controls() {
         let payload = concat!(
             "OPENAB_KNOWLEDGE_CARDS_V1\n",
-            r#"{"kind":"capture_inbox_preview","heading":"Capture Inbox｜1 / 3","inbox_id":"11111111-2222-4333-8444-555555555555","item_index":1,"items":[{"title":"Agent reliability notes","url":"https://example.com/agent-reliability","meta":"Guide · AI · create","summary":"Production reliability patterns","next_step":"選擇收錄、略過或修改。"}]}"#,
+            r#"{"kind":"capture_inbox_preview","heading":"Capture Inbox｜1 / 3","inbox_id":"11111111-2222-4333-8444-555555555555","item_index":1,"total":3,"queued":0,"ready":2,"accepted":0,"skipped":0,"failed":1,"items":[{"title":"Agent reliability notes","url":"https://example.com/agent-reliability","meta":"Guide · AI · create","summary":"Production reliability patterns","next_step":"選擇收錄、略過或修改。"}]}"#,
         );
         assert!(knowledge_cards_payload_is_valid(payload));
         let rendered = serde_json::to_value(
@@ -15096,14 +15888,24 @@ mod tests {
         assert!(rendered.contains("收錄"));
         assert!(rendered.contains("略過"));
         assert!(rendered.contains("修改"));
+        assert!(rendered.contains("oab_knowledge:ci_retry:42:11111111-2222-4333-8444-555555555555"));
+        assert!(rendered.contains("已處理 1/3"));
 
         let missing_binding = payload.replace(
             r#","inbox_id":"11111111-2222-4333-8444-555555555555","item_index":1"#,
             "",
         );
         assert!(!knowledge_cards_payload_is_valid(&missing_binding));
+        let oversized_counters = payload.replace(
+            r#""total":3,"queued":0,"ready":2,"accepted":0,"skipped":0,"failed":1"#,
+            r#""total":65535,"queued":65535,"ready":65535,"accepted":65535,"skipped":65535,"failed":65535"#,
+        );
+        assert!(!knowledge_cards_payload_is_valid(&oversized_counters));
         assert!(parse_capture_inbox_binding("42:11111111-2222-4333-8444-555555555555:1").is_some());
         assert!(parse_capture_inbox_binding("42:not-a-uuid:1").is_none());
+        assert!(
+            parse_capture_inbox_retry_binding("42:11111111-2222-4333-8444-555555555555").is_some()
+        );
     }
 
     #[test]
@@ -15117,18 +15919,14 @@ mod tests {
             serde_json::to_value(knowledge_cards_message_for(payload, Some(42)).unwrap())
                 .unwrap()
                 .to_string();
-        assert!(rendered.contains(
-            "oab_knowledge:epub_intake_confirm:42:11111111-2222-4333-8444-555555555555"
-        ));
-        assert!(rendered.contains(
-            "oab_knowledge:epub_intake_cancel:42:11111111-2222-4333-8444-555555555555"
-        ));
+        assert!(rendered
+            .contains("oab_knowledge:epub_intake_confirm:42:11111111-2222-4333-8444-555555555555"));
+        assert!(rendered
+            .contains("oab_knowledge:epub_intake_cancel:42:11111111-2222-4333-8444-555555555555"));
         assert!(rendered.contains("The Psychology of Money"));
 
-        let invalid_id = payload.replace(
-            "11111111-2222-4333-8444-555555555555",
-            "not-an-intake-id",
-        );
+        let invalid_id =
+            payload.replace("11111111-2222-4333-8444-555555555555", "not-an-intake-id");
         assert!(!knowledge_cards_payload_is_valid(&invalid_id));
         let invalid_sha = payload.replace(
             "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
@@ -15264,10 +16062,13 @@ mod tests {
         assert!(knowledge_cards_marker_present(invalid));
         assert!(!knowledge_cards_payload_is_valid(invalid));
         assert!(knowledge_cards_message(invalid).is_none());
+        remember_knowledge_capture_owner(99, 42);
         let fallback = serde_json::to_value(knowledge_delivery_message(invalid, 99))
             .unwrap()
             .to_string();
         assert!(fallback.contains("卡片驗證失敗"));
+        assert!(fallback.contains("oab_knowledge:card_retry:42"));
+        assert!(fallback.contains("oab_knowledge:card_plain:42"));
         assert!(!fallback.contains("OPENAB_KNOWLEDGE_CARDS_V1"));
         assert!(!fallback.contains("https://example.com/x"));
     }
