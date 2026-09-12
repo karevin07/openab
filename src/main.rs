@@ -1070,6 +1070,29 @@ async fn main() -> anyhow::Result<()> {
     // Channel for triggering cron jobs immediately (from Discord or ctl)
     let (cron_run_now_tx, cron_run_now_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
 
+    // Hoisted ahead of ctl_handle below (which needs to know now, not just at
+    // cron_handle's construction further down) so a deployment with no cron
+    // jobs gets a `None` sender instead of one whose receiver is about to be
+    // dropped, which would turn every `cron.run` ctl call into a generic
+    // "channel closed" error instead of ctl.rs's specific diagnostic.
+    let usercron_path = if cfg.cron.usercron_enabled {
+        cfg.cron.usercron_path.as_ref().map(|p| {
+            let path = std::path::PathBuf::from(p);
+            if path.is_absolute() {
+                path
+            } else {
+                std::env::var("HOME")
+                    .map(std::path::PathBuf::from)
+                    .unwrap_or_default()
+                    .join(".openab")
+                    .join(path)
+            }
+        })
+    } else {
+        None
+    };
+    let has_cron_work = !cfg.cron.jobs.is_empty() || usercron_path.is_some();
+
     // Thread registry: thread_id → platform. Populated on message dispatch.
     #[cfg(unix)]
     let ctl_registry = ctl::new_registry();
@@ -1097,7 +1120,7 @@ async fn main() -> anyhow::Result<()> {
                     project_registry.clone(),
                     router.workspace_aliases_map(),
                 )),
-                Some(cron_run_now_tx.clone()),
+                has_cron_work.then_some(cron_run_now_tx.clone()),
             ))))
         }
     };
@@ -1683,22 +1706,6 @@ async fn main() -> anyhow::Result<()> {
         }
     };
 
-    let usercron_path = if cfg.cron.usercron_enabled {
-        cfg.cron.usercron_path.as_ref().map(|p| {
-            let path = std::path::PathBuf::from(p);
-            if path.is_absolute() {
-                path
-            } else {
-                std::env::var("HOME")
-                    .map(std::path::PathBuf::from)
-                    .unwrap_or_default()
-                    .join(".openab")
-                    .join(path)
-            }
-        })
-    } else {
-        None
-    };
     let openab_data_dir = std::env::var("HOME")
         .map(PathBuf::from)
         .unwrap_or_default()
@@ -1719,7 +1726,6 @@ async fn main() -> anyhow::Result<()> {
         cron_sticky_path.clone(),
     )?);
 
-    let has_cron_work = !cfg.cron.jobs.is_empty() || usercron_path.is_some();
     let cron_handle = if has_cron_work {
         let shutdown_rx = shutdown_rx.clone();
         let cronjobs = cfg.cron.jobs.clone();

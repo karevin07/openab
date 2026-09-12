@@ -868,4 +868,26 @@ mod tests {
         assert_eq!(resp.message, "triggered cronjob: opencode-weekly-source-audit");
         assert_eq!(rx.recv().await.as_deref(), Some("opencode-weekly-source-audit"));
     }
+
+    #[tokio::test]
+    async fn runtime_handler_cron_run_without_cron_work_names_the_cause() {
+        // Regression guard: main.rs must pass `None` here (not a sender whose
+        // receiver was already dropped because no cron job was configured),
+        // or this specific diagnostic becomes unreachable behind a generic
+        // "channel closed" send error instead.
+        let handler = RuntimeHandler::new(
+            std::collections::HashMap::new(),
+            new_registry(),
+            Arc::new(std::sync::OnceLock::new()),
+            #[cfg(feature = "discord")]
+            None,
+            None,
+        );
+        let resp = handler.handle_set(None, "cron.run", "opencode-weekly-source-audit").await;
+        assert!(!resp.ok);
+        assert_eq!(
+            resp.message,
+            "cron scheduler not running or cron_run_now channel unavailable"
+        );
+    }
 }
