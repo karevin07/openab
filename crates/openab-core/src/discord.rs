@@ -2005,6 +2005,16 @@ fn parse_reading_match_binding(value: &str) -> Option<(u64, uuid::Uuid, u16)> {
     parse_reading_expect_binding(value)
 }
 
+/// Validate a `reading_expect_score` select value: `0.0..=10.0` in 0.5 steps,
+/// matching the options the select menu itself offers. Returns the original
+/// string so callers forward exactly what was selected.
+fn valid_expect_score(value: &str) -> Option<String> {
+    let score: f32 = value.parse().ok()?;
+    let in_range = (0.0..=10.0).contains(&score);
+    let half_step = (score * 2.0).fract() == 0.0;
+    (in_range && half_step).then(|| value.to_string())
+}
+
 fn knowledge_capture_inbox_modify_modal(
     owner_id: u64,
     inbox_id: uuid::Uuid,
@@ -2216,23 +2226,35 @@ fn knowledge_scheduled_source_prompt(
     knowledge_action_prompt(source, operation, &[])
 }
 
+/// `personal_reading_list` actions shown on the main Reading List card.
+///
+/// Kept as a named constant, together with [`READING_LIST_OPERATIONS_ACTIONS`],
+/// so `knowledge_reading_list_source_actions_are_fully_covered` below can
+/// assert every catalog action enabled for this source lands on one of the
+/// two cards it is split across — a migration that enables a new action here
+/// without adding it to either list renders nowhere, silently.
+const READING_LIST_CARD_ACTIONS: &[&str] = &[
+    "recommend",
+    "recent_finance",
+    "current",
+    "search",
+    "overview",
+    "audit",
+    "operations",
+];
+
+/// `personal_reading_list` actions shown on the Reading List Operations card.
+/// See [`READING_LIST_CARD_ACTIONS`].
+const READING_LIST_OPERATIONS_ACTIONS: &[&str] =
+    &["expect_review", "taxonomy", "epub_match", "ops_status", "intake"];
+
 fn knowledge_reading_list_message() -> CreateInteractionResponseMessage {
     let source = knowledge_reading_list().expect("seeded Reading List source");
     let view = knowledge_catalog()
         .view("reading_list")
         .expect("seeded Reading List view");
-    let mut components = knowledge_named_action_button_rows(
-        source,
-        &[
-            "recommend",
-            "recent_finance",
-            "current",
-            "search",
-            "overview",
-            "audit",
-            "operations",
-        ],
-    );
+    let mut components =
+        knowledge_named_action_button_rows(source, READING_LIST_CARD_ACTIONS);
     components.push(CreateActionRow::Buttons(vec![CreateButton::new(
         "oab_knowledge:home",
     )
@@ -2254,16 +2276,8 @@ fn knowledge_reading_list_operations_message() -> CreateInteractionResponseMessa
     let view = knowledge_catalog()
         .view("reading_list_operations")
         .expect("seeded Reading List operations view");
-    let mut components = knowledge_named_action_button_rows(
-        source,
-        &[
-            "expect_review",
-            "taxonomy",
-            "epub_match",
-            "ops_status",
-            "intake",
-        ],
-    );
+    let mut components =
+        knowledge_named_action_button_rows(source, READING_LIST_OPERATIONS_ACTIONS);
     components.push(CreateActionRow::Buttons(vec![
         CreateButton::new("oab_knowledge:reading_list_home")
             .label("↩ Reading List")
@@ -8592,16 +8606,24 @@ impl Handler {
                     return;
                 }
                 let expect = if action_id == "reading_expect_score" {
-                    let Some(value) = first_string_select(&comp.data.kind) else {
+                    let valid_score =
+                        first_string_select(&comp.data.kind).and_then(valid_expect_score);
+                    let Some(value) = valid_score else {
+                        let _ = comp
+                            .create_response(
+                                &ctx.http,
+                                CreateInteractionResponse::Message(
+                                    CreateInteractionResponseMessage::new()
+                                        .content(
+                                            "⚠️ 這張 Expect 卡片已失效，請重新開啟補分流程。",
+                                        )
+                                        .ephemeral(true),
+                                ),
+                            )
+                            .await;
                         return;
                     };
-                    let Ok(score) = value.parse::<f32>() else {
-                        return;
-                    };
-                    if !(0.0..=10.0).contains(&score) || (score * 2.0).fract() != 0.0 {
-                        return;
-                    }
-                    Some(value.to_string())
+                    Some(value)
                 } else {
                     None
                 };
@@ -15216,6 +15238,31 @@ mod tests {
     }
 
     #[test]
+    fn reading_list_source_actions_are_fully_covered_by_the_two_cards() {
+        // The main Reading List card and its Operations sub-card are two
+        // hardcoded allowlists over one catalog source, so a migration that
+        // enables a new personal_reading_list action without adding it to
+        // either list would otherwise render nowhere with nothing to notice.
+        let source = knowledge_reading_list().expect("seeded Reading List source");
+        let covered: std::collections::HashSet<&str> = READING_LIST_CARD_ACTIONS
+            .iter()
+            .chain(READING_LIST_OPERATIONS_ACTIONS)
+            .copied()
+            .collect();
+        let missing: Vec<&str> = source
+            .actions
+            .iter()
+            .map(|action| action.action_id.as_str())
+            .filter(|action_id| !covered.contains(action_id))
+            .collect();
+        assert!(
+            missing.is_empty(),
+            "personal_reading_list actions enabled in the catalog but shown on \
+             neither the Reading List card nor its Operations card: {missing:?}"
+        );
+    }
+
+    #[test]
     fn reading_expect_review_card_binds_score_and_skip_to_one_item() {
         let payload = concat!(
             "OPENAB_KNOWLEDGE_CARDS_V1\n",
@@ -15236,6 +15283,13 @@ mod tests {
         assert!(
             parse_reading_expect_binding("42:11111111-2222-4333-8444-555555555555:1").is_some()
         );
+        assert_eq!(valid_expect_score("4.5"), Some("4.5".to_string()));
+        assert_eq!(valid_expect_score("0"), Some("0".to_string()));
+        assert_eq!(valid_expect_score("10"), Some("10".to_string()));
+        assert_eq!(valid_expect_score("10.5"), None, "above the 0..=10 range");
+        assert_eq!(valid_expect_score("-0.5"), None, "below the 0..=10 range");
+        assert_eq!(valid_expect_score("4.25"), None, "not a 0.5 step");
+        assert_eq!(valid_expect_score("not-a-number"), None);
 
         let missing_binding = payload.replace(
             r#","batch_id":"11111111-2222-4333-8444-555555555555","item_index":1"#,
