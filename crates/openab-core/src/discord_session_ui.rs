@@ -33,13 +33,19 @@ pub(crate) struct ManagedSessionEntry {
     pub(crate) snapshot: SessionSnapshot,
 }
 
+/// Same wording as [`crate::discord::task_state_presentation`] for every state
+/// the two share, so a session looks the same on its own Task Status Card and
+/// in the cross-project Session Manager list. `SessionState` has no `Queued`
+/// or `Failed` counterpart (those are task-lifecycle states, not pool state)
+/// and adds one state Task Status never shows on its own: a task record that
+/// exists but has not yet produced a pooled session.
 fn managed_session_presentation(entry: &ManagedSessionEntry) -> (&'static str, &'static str, u32) {
     if entry.snapshot.externally_detached {
         return ("🖥️", "Cursor 接手中", 0x9B59B6);
     }
     match entry.snapshot.state {
         SessionState::Active => ("🟢", "執行中", 0x2ECC71),
-        SessionState::Suspended | SessionState::Persisted => ("🟦", "可接續", 0x3498DB),
+        SessionState::Suspended | SessionState::Persisted => ("🟦", "待你回應", 0x3498DB),
         SessionState::None if entry.task.state == TaskState::Closed => ("⚫", "已關閉", 0x95A5A6),
         SessionState::None => ("⚪", "尚未建立", 0x95A5A6),
     }

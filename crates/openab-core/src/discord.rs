@@ -425,7 +425,7 @@ fn session_control_card(
             .style(ButtonStyle::Danger)
             .disabled(!has_session),
         CreateButton::new("oab_help:open")
-            .label("? Help")
+            .label("❓ Help")
             .style(ButtonStyle::Secondary),
     ]);
     let mut components = vec![CreateActionRow::Buttons(buttons)];
@@ -482,14 +482,22 @@ fn project_access_display(binding: &ProjectBinding) -> String {
     truncate_for_discord(&display, 1000)
 }
 
+/// Canonical (icon, label, colour) for a task's lifecycle state.
+///
+/// The label is Traditional Chinese, matching the rest of this card family's
+/// copy and matching [`discord_session_ui::managed_session_presentation`]'s
+/// wording for every state the two share (Running/Active, Ready/Suspended,
+/// Cursor, Closed): the Session Manager and a task's own Status Card must
+/// describe the same underlying session the same way, not drift into two
+/// vocabularies for one concept.
 fn task_state_presentation(state: TaskState) -> (&'static str, &'static str, u32) {
     match state {
-        TaskState::Queued => ("⏳", "Queued", 0xF1C40F),
-        TaskState::Running => ("🟢", "Running", 0x2ECC71),
-        TaskState::Ready => ("🟦", "Waiting for you", 0x3498DB),
+        TaskState::Queued => ("⏳", "排隊中", 0xF1C40F),
+        TaskState::Running => ("🟢", "執行中", 0x2ECC71),
+        TaskState::Ready => ("🟦", "待你回應", 0x3498DB),
         TaskState::Cursor => ("🖥️", "Cursor 接手中", 0x9B59B6),
-        TaskState::Failed => ("🔴", "Failed", 0xE74C3C),
-        TaskState::Closed => ("⚫", "Closed", 0x95A5A6),
+        TaskState::Failed => ("🔴", "失敗", 0xE74C3C),
+        TaskState::Closed => ("⚫", "已關閉", 0x95A5A6),
     }
 }
 
@@ -543,9 +551,9 @@ fn task_status_embed(task: &TaskRecord) -> CreateEmbed {
         .field("Task thread", format!("<#{}>", task.thread_id), false);
     if task.queued_messages > 0 {
         embed = embed.field(
-            "Queue",
+            "訊息 Queue",
             format!(
-                "{} message(s) waiting\n使用下方「📋 管理 Queue」查看或調整。",
+                "{} 則待處理\n使用下方「📋 訊息 Queue」查看或調整。",
                 task.queued_messages
             ),
             true,
@@ -574,7 +582,7 @@ fn task_status_embed(task: &TaskRecord) -> CreateEmbed {
 fn task_control_rows(task: &TaskRecord) -> Vec<CreateActionRow> {
     let help = || {
         CreateButton::new("oab_help:open")
-            .label("? Help")
+            .label("❓ Help")
             .style(ButtonStyle::Secondary)
     };
     let project = || {
@@ -585,9 +593,11 @@ fn task_control_rows(task: &TaskRecord) -> Vec<CreateActionRow> {
         .label("← Project")
     };
     let quick_actions = || {
+        // Secondary, not Success: opening the preset picker is not a confirm
+        // action, and Ready already has its own highlighted CTA (Continue).
         CreateButton::new("oab_task:actions")
             .label("⚡ Quick actions")
-            .style(ButtonStyle::Success)
+            .style(ButtonStyle::Secondary)
     };
     let commands = || {
         CreateButton::new("oab_task:commands")
@@ -608,8 +618,13 @@ fn task_control_rows(task: &TaskRecord) -> Vec<CreateActionRow> {
     }
     if task.state == TaskState::Failed && task.last_prompt.is_some() {
         shortcuts.push(
+            // 🔁, not ↻: ↻ is reserved for "Check status"/"Refresh" elsewhere
+            // on this same card family, which only re-reads state. Retry
+            // re-sends the failed request, a materially different action —
+            // sharing one glyph for both risks a misclick reading as "just
+            // refreshing" when it actually resubmits work.
             CreateButton::new("oab_task:retry")
-                .label("↻ Retry")
+                .label("🔁 Retry")
                 .style(ButtonStyle::Primary),
         );
         shortcuts.push(
@@ -698,9 +713,13 @@ fn task_control_rows(task: &TaskRecord) -> Vec<CreateActionRow> {
     rows
 }
 
+/// Opens this thread's message dispatch queue — unrelated to the per-project
+/// Repository Command Queue behind `oab_repo_queue:open` (see
+/// `project_commands_message`). "訊息" keeps the two visually distinct even
+/// though both use the 📋 emoji and a trailing count.
 fn queue_manager_button(task: &TaskRecord) -> CreateButton {
     CreateButton::new("oab_queue:open")
-        .label(format!("📋 管理 Queue（{}）", task.queued_messages))
+        .label(format!("📋 訊息 Queue（{}）", task.queued_messages))
         .style(ButtonStyle::Primary)
 }
 
@@ -2998,21 +3017,25 @@ fn project_welcome_components(tasks: &[TaskRecord]) -> Vec<CreateActionRow> {
         .label("▶ New task")
         .style(ButtonStyle::Primary)];
     if agent_presentation().local_publish_enabled {
+        // Secondary, not Success: this opens a picker, it does not confirm
+        // anything. Success/green stays reserved for a real confirm action
+        // (e.g. the EPUB and capture-inbox accept buttons elsewhere), so
+        // "New task" is the one highlighted choice on this card.
         primary.push(
             CreateButton::new("oab_project:attach")
                 .label("📤 Attach local chat")
-                .style(ButtonStyle::Success),
+                .style(ButtonStyle::Secondary),
         );
     }
     primary.extend([
         CreateButton::new("oab_project:actions")
-            .label("⚡ New task templates")
+            .label("⚡ Quick actions")
             .style(ButtonStyle::Secondary),
         CreateButton::new("oab_project:sessions")
             .label("🧠 Sessions")
             .style(ButtonStyle::Secondary),
         CreateButton::new("oab_help:open")
-            .label("? Help")
+            .label("❓ Help")
             .style(ButtonStyle::Secondary),
     ]);
     let mut rows = vec![CreateActionRow::Buttons(primary)];
@@ -3206,7 +3229,7 @@ fn project_actions_message(
     actions: &[&DiscordProjectActionConfig],
 ) -> CreateInteractionResponseMessage {
     let mut embed = CreateEmbed::new()
-        .title(format!("⚡ @{} · New task templates", binding.workspace_alias))
+        .title(format!("⚡ @{} · Quick actions", binding.workspace_alias))
         .description(
             "這裡是 Project Home：選擇範本並確認後會建立新的 task thread/session。若要沿用既有 session，請進入該 task thread，從狀態卡點 Quick actions。",
         )
@@ -3268,7 +3291,7 @@ fn task_actions_message(
     actions: &[&DiscordProjectActionConfig],
 ) -> CreateInteractionResponseMessage {
     let mut embed = CreateEmbed::new()
-        .title(format!("⚡ Continue · {}", task.title))
+        .title(format!("⚡ Quick actions · {}", task.title))
         .description(if matches!(task.state, TaskState::Queued | TaskState::Running) {
             "選擇常用工作後會開啟可編輯的視窗；確認後排入目前 thread 的佇列，等 Agent 跑完就會執行 —— 和直接打字送出完全一樣，不會中斷進行中的工作，也不會建立新 thread。"
         } else {
@@ -3618,7 +3641,7 @@ fn project_commands_message(
             .components(vec![CreateActionRow::Buttons(vec![CreateButton::new(
                 "oab_repo_queue:open",
             )
-            .label(format!("Command Queue ({queued})"))
+            .label(format!("📋 Command Queue（{queued}）"))
             .style(ButtonStyle::Secondary)])])
             .ephemeral(true);
     }
@@ -3653,7 +3676,7 @@ fn project_commands_message(
         .components(vec![
             CreateActionRow::SelectMenu(select),
             CreateActionRow::Buttons(vec![CreateButton::new("oab_repo_queue:open")
-                .label(format!("Command Queue ({queued})"))
+                .label(format!("📋 Command Queue（{queued}）"))
                 .style(ButtonStyle::Secondary)]),
         ])
         .ephemeral(true)
@@ -4004,7 +4027,7 @@ fn project_welcome_message(binding: &ProjectBinding, tasks: &[TaskRecord]) -> Cr
     let embed = project_info_embed(binding)
         .field(
             "1 · Start a task",
-            "Tap **New task** for a custom request or **New task templates** to start a new thread from a preset. **Repository commands** run without a model and never create a session.",
+            "Tap **New task** for a custom request, or **Quick actions** to start one from a preset. In a task thread, the same **Quick actions** button continues that session instead of creating a new one. **Repository commands** run without a model and never create a session.",
             false,
         );
     let embed = if agent_presentation().local_publish_enabled {
@@ -4036,7 +4059,7 @@ fn project_welcome_edit(binding: &ProjectBinding, tasks: &[TaskRecord]) -> EditM
     let embed = project_info_embed(binding)
         .field(
             "1 · Start a task",
-            "Tap **New task** for a custom request or **New task templates** to start a new thread from a preset. **Repository commands** run without a model and never create a session.",
+            "Tap **New task** for a custom request, or **Quick actions** to start one from a preset. In a task thread, the same **Quick actions** button continues that session instead of creating a new one. **Repository commands** run without a model and never create a session.",
             false,
         );
     let embed = if agent_presentation().local_publish_enabled {
@@ -4187,10 +4210,12 @@ fn help_action_center(
             );
         }
         if accepts_session_request(task.state) {
+            // Matches the Task Status Card's own Quick actions button: same
+            // action, same Secondary style.
             task_buttons.push(
                 CreateButton::new("oab_task:actions")
                     .label("⚡ Quick actions")
-                    .style(ButtonStyle::Success),
+                    .style(ButtonStyle::Secondary),
             );
         }
         if offers_repository_commands(task.state) {
@@ -4277,7 +4302,7 @@ fn help_topic_message(
     let (title, description) = match topic {
         "discord" => (
             "📱 在 Discord 開始開發",
-            "1. 在 Project Home 點 **New task**，或用 **New task templates** 從範本建立新 thread。\n2. 進入既有 task 後，用狀態卡的 **Continue** 或 **Quick actions** 接續同一個 Cursor session；Agent 執行中送出的會排入佇列。\n3. **Repository commands** 直接執行固定指令，不經過模型、不建立 session、不加入 Cursor context，任何時候都能用。\n4. 要查看 repository 內的 PNG，直接請 Agent 將相對路徑圖片傳回 Discord。",
+            "1. 在 Project Home 點 **New task** 自訂需求，或點 **Quick actions** 從範本開新 task thread。\n2. 進入既有 task 後，用狀態卡的 **Continue** 打字，或點同一顆 **Quick actions** 從範本送出——都接續同一個 Cursor session，不會開新 thread；Agent 執行中送出的會排入佇列。\n3. **Repository commands** 直接執行固定指令，不經過模型、不建立 session、不加入 Cursor context，任何時候都能用。\n4. 要查看 repository 內的 PNG，直接請 Agent 將相對路徑圖片傳回 Discord。",
         ),
         "cursor" => (
             "🖥️ 回到電腦接續",
@@ -4308,7 +4333,7 @@ fn help_topic_message(
                     );
                     buttons.push(
                         CreateButton::new("oab_project:actions")
-                            .label("⚡ New task templates")
+                            .label("⚡ Quick actions")
                             .style(ButtonStyle::Secondary),
                     );
                     buttons.push(
@@ -4394,7 +4419,7 @@ fn help_project_message(
         }
         buttons.push(
             CreateButton::new("oab_project:actions")
-                .label("⚡ New task templates")
+                .label("⚡ Quick actions")
                 .style(ButtonStyle::Secondary),
         );
         buttons.push(
@@ -11627,7 +11652,7 @@ impl Handler {
                     .components(vec![CreateActionRow::Buttons(vec![CreateButton::new(
                         "oab_repo_queue:open",
                     )
-                    .label("Open Command Queue")
+                    .label("📋 Open Command Queue")
                     .style(ButtonStyle::Primary)])]),
             )
             .await
@@ -12426,7 +12451,7 @@ impl Handler {
                         .components(vec![CreateActionRow::Buttons(vec![CreateButton::new(
                             "oab_repo_queue:open",
                         )
-                        .label("Back to Command Queue")
+                        .label("📋 Back to Command Queue")
                         .style(ButtonStyle::Secondary)])])
                         .ephemeral(true),
                 );
@@ -16303,7 +16328,7 @@ mod tests {
     fn queue_shortcuts_are_consistent_and_notices_are_debounced() {
         let mut running = ui_task(TaskState::Running, None);
         let task_controls = serde_json::to_string(&task_control_rows(&running)).unwrap();
-        assert!(task_controls.contains("📋 管理 Queue（0）"));
+        assert!(task_controls.contains("📋 訊息 Queue（0）"));
 
         let snapshot = SessionSnapshot {
             state: SessionState::Active,
@@ -16322,14 +16347,14 @@ mod tests {
         )
         .unwrap();
         assert!(session.contains("oab_queue:open"));
-        assert!(session.contains("📋 管理 Queue（0）"));
+        assert!(session.contains("📋 訊息 Queue（0）"));
 
         assert!(should_post_queue_notice(&running));
         running.queued_messages = 1;
         let notice = serde_json::to_string(&queue_enqueued_notice(&running)).unwrap();
         assert!(notice.contains("新需求已加入 Queue"));
         assert!(notice.contains("oab_queue:open"));
-        assert!(notice.contains("📋 管理 Queue（1）"));
+        assert!(notice.contains("📋 訊息 Queue（1）"));
 
         assert!(!should_post_queue_notice(&running));
         running.state = TaskState::Queued;
@@ -16496,9 +16521,11 @@ mod tests {
         assert!(project.contains("oab_project:actions"));
         assert!(project.contains("oab_project:commands"));
         assert!(project.contains("oab_project:schedules"));
-        assert!(project.contains("New task templates"));
-        // ⌨ does the same thing on every surface, so its label is identical
-        // everywhere; only ⚡ differs, because its effect genuinely does.
+        // ⚡ and ⌨ both do the same thing regardless of which surface opens
+        // them (only the resulting scope — new task vs. this session —
+        // differs, which the card content explains), so their labels stay
+        // identical everywhere.
+        assert!(project.contains("Quick actions"));
         assert!(project.contains("Repository commands"));
         assert!(project.contains("Schedules"));
 
@@ -16630,7 +16657,7 @@ mod tests {
             &[&action],
         ))
         .unwrap();
-        assert!(current.contains("Continue · Fix API"));
+        assert!(current.contains("Quick actions · Fix API"));
         assert!(current.contains("不會建立新 thread"));
         assert!(current.contains("oab_project_actions"));
 
@@ -16656,7 +16683,7 @@ mod tests {
         assert!(value
             .to_string()
             .contains("顯示前 25 個，共 30 個 commands"));
-        assert!(value.to_string().contains("Command Queue (3)"));
+        assert!(value.to_string().contains("📋 Command Queue（3）"));
 
         let current = serde_json::to_string(&task_commands_message(
             &ui_task(TaskState::Ready, None),
