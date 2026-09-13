@@ -633,6 +633,10 @@ pub struct DiscordProjectActionConfig {
     /// Optional task title. Defaults to `label` when empty.
     #[serde(default)]
     pub title: String,
+    /// Render this high-frequency action as a native button on the Quick
+    /// Actions card. Remaining actions stay in the select menu.
+    #[serde(default)]
+    pub button: bool,
     /// Prompt placed in the editable new-task modal.
     pub prompt: String,
 }
@@ -3249,6 +3253,7 @@ id = "test"
 label = "Run tests"
 description = "Run the repository test suite"
 title = "Test OpenAB"
+button = true
 prompt = "Run cargo test without changing files."
 "#,
             "test",
@@ -3259,6 +3264,7 @@ prompt = "Run cargo test without changing files."
         assert_eq!(actions.len(), 1);
         assert_eq!(actions[0].workspace_alias, "openab");
         assert_eq!(actions[0].id, "test");
+        assert!(actions[0].button);
         assert_eq!(actions[0].prompt, "Run cargo test without changing files.");
     }
 
@@ -3271,6 +3277,7 @@ prompt = "Run cargo test without changing files."
                 label: "Daily summary".into(),
                 description: String::new(),
                 title: String::new(),
+                button: false,
                 prompt: "global".into(),
             },
             DiscordProjectActionConfig {
@@ -3279,6 +3286,7 @@ prompt = "Run cargo test without changing files."
                 label: "Daily summary".into(),
                 description: String::new(),
                 title: String::new(),
+                button: false,
                 prompt: "local".into(),
             },
         ];
@@ -3305,6 +3313,7 @@ prompt = "Run cargo test without changing files."
                 label: "Daily summary".into(),
                 description: String::new(),
                 title: "Global Title".into(),
+                button: false,
                 prompt: "global".into(),
             },
             DiscordProjectActionConfig {
@@ -3313,6 +3322,7 @@ prompt = "Run cargo test without changing files."
                 label: "Daily summary".into(),
                 description: String::new(),
                 title: "Local Title".into(),
+                button: false,
                 prompt: "local".into(),
             },
         ];

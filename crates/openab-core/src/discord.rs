@@ -86,6 +86,10 @@ const PARTICIPATION_CACHE_MAX: usize = 1000;
 /// Discord StringSelectMenu hard limit on options.
 pub(crate) const SELECT_MENU_PAGE_SIZE: usize = 25;
 
+/// Keep two rows available for high-frequency project workflows while leaving
+/// room for the ordinary select menu and future controls.
+const PROJECT_ACTION_BUTTON_LIMIT: usize = 10;
+
 /// Discord caps select menu option labels and descriptions at 100
 /// characters; anything longer makes the entire interaction response fail
 /// with "Invalid Form Body", which surfaces to users as "The application
@@ -3224,6 +3228,84 @@ fn schedules_message(
     message
 }
 
+fn project_action_rows(
+    actions: &[&DiscordProjectActionConfig],
+    menu_placeholder: &str,
+) -> Vec<CreateActionRow> {
+    let mut button_actions = Vec::new();
+    let mut menu_actions = Vec::new();
+    for action in actions.iter().take(SELECT_MENU_PAGE_SIZE) {
+        if action.button && button_actions.len() < PROJECT_ACTION_BUTTON_LIMIT {
+            button_actions.push(*action);
+        } else {
+            menu_actions.push(*action);
+        }
+    }
+
+    let mut rows = button_actions
+        .chunks(5)
+        .enumerate()
+        .map(|(row_index, chunk)| {
+            CreateActionRow::Buttons(
+                chunk
+                    .iter()
+                    .enumerate()
+                    .map(|(button_index, action)| {
+                        CreateButton::new(format!("oab_project_action:{}", action.id))
+                            .label(action.label.trim())
+                            .style(if row_index == 0 && button_index == 0 {
+                                ButtonStyle::Primary
+                            } else {
+                                ButtonStyle::Secondary
+                            })
+                    })
+                    .collect(),
+            )
+        })
+        .collect::<Vec<_>>();
+
+    if !menu_actions.is_empty() {
+        let options = menu_actions
+            .iter()
+            .map(|action| {
+                let mut option = CreateSelectMenuOption::new(action.label.trim(), &action.id);
+                if !action.description.trim().is_empty() {
+                    option = option.description(action.description.trim());
+                }
+                option
+            })
+            .collect();
+        rows.push(CreateActionRow::SelectMenu(
+            CreateSelectMenu::new(
+                "oab_project_actions",
+                CreateSelectMenuKind::String { options },
+            )
+            .placeholder(menu_placeholder),
+        ));
+    }
+    rows
+}
+
+fn project_action_button_summary(actions: &[&DiscordProjectActionConfig]) -> Option<String> {
+    let lines = actions
+        .iter()
+        .filter(|action| action.button)
+        .take(PROJECT_ACTION_BUTTON_LIMIT)
+        .map(|action| {
+            if action.description.trim().is_empty() {
+                format!("**{}**", action.label.trim())
+            } else {
+                format!(
+                    "**{}** — {}",
+                    action.label.trim(),
+                    action.description.trim()
+                )
+            }
+        })
+        .collect::<Vec<_>>();
+    (!lines.is_empty()).then(|| truncate_for_discord(&lines.join("\n"), 1000))
+}
+
 fn project_actions_message(
     binding: &ProjectBinding,
     actions: &[&DiscordProjectActionConfig],
@@ -3243,8 +3325,7 @@ fn project_actions_message(
             "只是想查狀態？",
             "git status、diff、make help 這類確定性輸出，用 ⌨ Repository commands 更快 —— 直接執行、不經過模型、不佔用對話輪次。",
             false,
-        )
-        ;
+        );
     if actions.is_empty() {
         return CreateInteractionResponseMessage::new()
             .embed(embed.field(
@@ -3255,17 +3336,9 @@ fn project_actions_message(
             .ephemeral(true);
     }
 
-    let options = actions
-        .iter()
-        .take(SELECT_MENU_PAGE_SIZE)
-        .map(|action| {
-            let mut option = CreateSelectMenuOption::new(action.label.trim(), &action.id);
-            if !action.description.trim().is_empty() {
-                option = option.description(action.description.trim());
-            }
-            option
-        })
-        .collect();
+    if let Some(summary) = project_action_button_summary(actions) {
+        embed = embed.field("常用流程", summary, false);
+    }
     let placeholder = if actions.len() > SELECT_MENU_PAGE_SIZE {
         embed = embed.footer(CreateEmbedFooter::new(format!(
             "顯示前 {SELECT_MENU_PAGE_SIZE} 個，共 {} 個 actions",
@@ -3275,14 +3348,9 @@ fn project_actions_message(
     } else {
         "選擇常用工作".to_string()
     };
-    let select = CreateSelectMenu::new(
-        "oab_project_actions",
-        CreateSelectMenuKind::String { options },
-    )
-    .placeholder(placeholder);
     CreateInteractionResponseMessage::new()
         .embed(embed)
-        .components(vec![CreateActionRow::SelectMenu(select)])
+        .components(project_action_rows(actions, &placeholder))
         .ephemeral(true)
 }
 
@@ -3325,17 +3393,9 @@ fn task_actions_message(
             ))
             .ephemeral(true);
     }
-    let options = actions
-        .iter()
-        .take(SELECT_MENU_PAGE_SIZE)
-        .map(|action| {
-            let mut option = CreateSelectMenuOption::new(action.label.trim(), &action.id);
-            if !action.description.trim().is_empty() {
-                option = option.description(action.description.trim());
-            }
-            option
-        })
-        .collect();
+    if let Some(summary) = project_action_button_summary(actions) {
+        embed = embed.field("常用流程", summary, false);
+    }
     if actions.len() > SELECT_MENU_PAGE_SIZE {
         embed = embed.footer(CreateEmbedFooter::new(format!(
             "顯示前 {SELECT_MENU_PAGE_SIZE} 個，共 {} 個 actions",
@@ -3344,13 +3404,10 @@ fn task_actions_message(
     }
     CreateInteractionResponseMessage::new()
         .embed(embed)
-        .components(vec![CreateActionRow::SelectMenu(
-            CreateSelectMenu::new(
-                "oab_project_actions",
-                CreateSelectMenuKind::String { options },
-            )
-            .placeholder("選擇要送進目前 session 的工作"),
-        )])
+        .components(project_action_rows(
+            actions,
+            "選擇要送進目前 session 的其他工作",
+        ))
         .ephemeral(true)
 }
 
@@ -6935,7 +6992,10 @@ impl EventHandler for Handler {
             {
                 self.handle_all_sessions_component(&ctx, &comp).await;
             }
-            Interaction::Component(comp) if comp.data.custom_id == "oab_project_actions" => {
+            Interaction::Component(comp)
+                if comp.data.custom_id == "oab_project_actions"
+                    || comp.data.custom_id.starts_with("oab_project_action:") =>
+            {
                 self.handle_project_action_select(&ctx, &comp).await;
             }
             Interaction::Component(comp) if comp.data.custom_id == "oab_project_commands" => {
@@ -11528,12 +11588,16 @@ impl Handler {
                 return;
             }
         };
-        let selected_id = match &comp.data.kind {
-            ComponentInteractionDataKind::StringSelect { values } => {
-                values.first().map(String::as_str)
-            }
-            _ => None,
-        };
+        let selected_id = comp
+            .data
+            .custom_id
+            .strip_prefix("oab_project_action:")
+            .or_else(|| match &comp.data.kind {
+                ComponentInteractionDataKind::StringSelect { values } => {
+                    values.first().map(String::as_str)
+                }
+                _ => None,
+            });
         let selected =
             selected_id.and_then(|id| self.project_action_for(&binding.workspace_alias, id));
         let Some(action) = selected else {
@@ -15012,6 +15076,7 @@ mod tests {
             label: format!("Action {id}"),
             description: format!("Run {id}"),
             title: format!("Task {id}"),
+            button: false,
             prompt: format!("Run the {id} workflow without changing files."),
         }
     }
@@ -16665,6 +16730,36 @@ mod tests {
         assert!(continue_modal.contains("oab_task_prompt:action"));
         assert!(continue_modal.contains("Quick action · Action test"));
         assert!(continue_modal.contains("Run the test workflow without changing files."));
+    }
+
+    #[test]
+    fn project_actions_card_promotes_high_frequency_actions_to_buttons() {
+        let mut actions = (1..=13)
+            .map(|index| ui_project_action(&format!("action-{index}")))
+            .collect::<Vec<_>>();
+        for action in actions.iter_mut().take(12) {
+            action.button = true;
+        }
+        let action_refs = actions.iter().collect::<Vec<_>>();
+
+        let project = serde_json::to_value(project_actions_message(&ui_binding(), &action_refs))
+            .expect("button action card should serialize");
+        assert!(component_with_custom_id(&project, "oab_project_action:action-1").is_some());
+        assert!(component_with_custom_id(&project, "oab_project_action:action-10").is_some());
+        assert!(component_with_custom_id(&project, "oab_project_action:action-11").is_none());
+        let select = component_with_custom_id(&project, "oab_project_actions").unwrap();
+        assert_eq!(select["options"].as_array().unwrap().len(), 3);
+        assert_eq!(project["components"].as_array().unwrap().len(), 3);
+        assert!(project.to_string().contains("常用流程"));
+        assert!(project.to_string().contains("Run action-1"));
+
+        let current = serde_json::to_value(task_actions_message(
+            &ui_task(TaskState::Ready, None),
+            &action_refs,
+        ))
+        .expect("current-session button action card should serialize");
+        assert!(component_with_custom_id(&current, "oab_project_action:action-1").is_some());
+        assert!(current.to_string().contains("目前 session"));
     }
 
     #[test]
