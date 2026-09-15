@@ -522,11 +522,25 @@ pub fn parse_knowledge_weekly_audit(content: &str) -> Result<Option<KnowledgeWee
     Ok(Some(audit))
 }
 
+/// Finds the marker and returns whatever follows it, or `None` if the marker
+/// never appears.
+///
+/// The marker must be the last thing on its line, but not necessarily the
+/// *only* thing: the prompt tells the model to emit nothing else, but a model
+/// that adds a trailing aside before finalizing ("...let me check my
+/// work.OPENAB_KNOWLEDGE_WEEKLY_V1") still means the report, just malformed —
+/// and dropping it silently (the previous exact-line-match behavior) is worse
+/// than surfacing a "format invalid" reply for a human to notice. A marker
+/// that instead has more text *after* it on the same line (e.g. the prompt's
+/// own instruction text being echoed back, "...OPENAB_KNOWLEDGE_WEEKLY_V1
+/// 換行後的一個 JSON object") is not a submission attempt and must still be
+/// ignored -- that is what distinguishes "ends with" from a plain substring
+/// search.
 fn knowledge_weekly_payload(content: &str) -> Option<&str> {
     let mut offset = 0;
     for line in content.split_inclusive('\n') {
-        let marker = line.trim_end_matches(['\r', '\n']).trim();
-        if marker == KNOWLEDGE_WEEKLY_MARKER {
+        let trimmed = line.trim_end_matches(['\r', '\n']).trim_end();
+        if trimmed.ends_with(KNOWLEDGE_WEEKLY_MARKER) {
             return Some(&content[offset + line.len()..]);
         }
         offset += line.len();
@@ -1365,6 +1379,22 @@ OPENAB_KNOWLEDGE_WEEKLY_V1
 
         assert!(!knowledge_weekly_marker_present(prompt));
         assert!(parse_knowledge_weekly_audit(prompt).unwrap().is_none());
+    }
+
+    #[test]
+    fn knowledge_weekly_marker_is_detected_even_with_a_trailing_aside() {
+        // Regression test for a real incident: the model appended the marker
+        // directly to a trailing sentence with no line break, and the JSON
+        // never arrived in this message at all (it streamed as a later,
+        // separate message with no marker of its own). The old exact-line
+        // check silently dropped this -- no log, no reply, nothing -- and the
+        // failure only surfaced hours later as a generic "no stats received"
+        // card from an unrelated bot. Detecting the marker here at least
+        // turns that into an immediate, visible parse-failure reply.
+        let content =
+            "Let me verify completeness for both database sources.OPENAB_KNOWLEDGE_WEEKLY_V1";
+        assert!(knowledge_weekly_marker_present(content));
+        assert!(parse_knowledge_weekly_audit(content).is_err());
     }
 
     #[test]

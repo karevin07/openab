@@ -34,6 +34,8 @@ const MIGRATION_0019: &str =
     include_str!("../migrations/0019_reading_list_epub_write_disclosure.sql");
 const MIGRATION_0020: &str = include_str!("../migrations/0020_reading_list_operations_ui.sql");
 const MIGRATION_0021: &str = include_str!("../migrations/0021_knowledge_ux_recovery.sql");
+const MIGRATION_0022: &str =
+    include_str!("../migrations/0022_knowledge_weekly_marker_discipline.sql");
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -315,6 +317,7 @@ impl KnowledgeCatalog {
             (19, MIGRATION_0019),
             (20, MIGRATION_0020),
             (21, MIGRATION_0021),
+            (22, MIGRATION_0022),
         ] {
             let applied = connection
                 .query_row(
@@ -882,9 +885,12 @@ mod tests {
                 row.get(0)
             })
             .unwrap();
-        assert_eq!(version, 21);
+        assert_eq!(version, 22);
         let weekly = catalog.global_action("weekly_source_audit").unwrap();
         assert!(weekly.prompt_template.contains("禁止使用 null"));
+        assert!(weekly
+            .prompt_template
+            .contains("完成核對後才開始輸出最後一則訊息"));
         let world = catalog
             .sources
             .iter()
