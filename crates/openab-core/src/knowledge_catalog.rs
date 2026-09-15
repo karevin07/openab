@@ -36,6 +36,8 @@ const MIGRATION_0020: &str = include_str!("../migrations/0020_reading_list_opera
 const MIGRATION_0021: &str = include_str!("../migrations/0021_knowledge_ux_recovery.sql");
 const MIGRATION_0022: &str =
     include_str!("../migrations/0022_knowledge_weekly_marker_discipline.sql");
+const MIGRATION_0023: &str =
+    include_str!("../migrations/0023_knowledge_weekly_item_timestamp_format.sql");
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -318,6 +320,7 @@ impl KnowledgeCatalog {
             (20, MIGRATION_0020),
             (21, MIGRATION_0021),
             (22, MIGRATION_0022),
+            (23, MIGRATION_0023),
         ] {
             let applied = connection
                 .query_row(
@@ -885,12 +888,16 @@ mod tests {
                 row.get(0)
             })
             .unwrap();
-        assert_eq!(version, 22);
+        assert_eq!(version, 23);
         let weekly = catalog.global_action("weekly_source_audit").unwrap();
         assert!(weekly.prompt_template.contains("禁止使用 null"));
         assert!(weekly
             .prompt_template
             .contains("完成核對後才開始輸出最後一則訊息"));
+        assert!(weekly.prompt_template.contains("格式範例"));
+        assert!(weekly
+            .prompt_template
+            .contains("\"created_at\":\"2026-09-14T00:59:03Z\""));
         let world = catalog
             .sources
             .iter()
