@@ -5252,6 +5252,25 @@ async fn collect_session_inventory(
         let discord_metadata = if needs_discord_metadata {
             match inventory_thread_metadata(http, thread_id).await {
                 Ok(metadata) => Some(metadata),
+                Err(error)
+                    if error
+                        .downcast_ref::<serenity::Error>()
+                        .is_some_and(is_unknown_discord_channel_error) =>
+                {
+                    // The Discord thread is permanently gone, not a transient lookup
+                    // failure — retaining this mapping would mark every future
+                    // inventory snapshot incomplete forever (F1). Prune it now so
+                    // this pass, and every one after it, can be complete.
+                    if let Err(purge_error) = router.pool().reset_session(&entry.key).await {
+                        warn!(%purge_error, thread_id, "failed to prune session inventory entry for a deleted Discord channel");
+                    } else {
+                        info!(
+                            thread_id,
+                            "pruned session inventory entry for a deleted Discord channel"
+                        );
+                    }
+                    continue;
+                }
                 Err(error) => {
                     unresolved += 1;
                     warn!(%error, thread_id, "failed to resolve session inventory thread metadata");
