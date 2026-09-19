@@ -1,4 +1,4 @@
-use crate::adapter::{AdapterRouter, ChannelRef, ChatAdapter, SenderContext};
+use crate::adapter::{AdapterRouter, ChannelRef, ChatAdapter};
 use crate::config::{CronJobConfig, CronThreadPolicy};
 use crate::format;
 use chrono::{Timelike, Utc};
@@ -249,15 +249,6 @@ const CRON_THREADLESS_PLATFORMS: &[&str] = &["googlechat", "lineworks"];
 
 fn should_create_cron_thread(job: &CronJobConfig, resolved_thread_id: Option<&str>) -> bool {
     resolved_thread_id.is_none() && !CRON_THREADLESS_PLATFORMS.contains(&job.platform.as_str())
-}
-
-fn cron_sender_thread_id(channel: &ChannelRef) -> Option<String> {
-    channel.thread_id.clone().or_else(|| {
-        channel
-            .parent_id
-            .as_ref()
-            .map(|_| channel.channel_id.clone())
-    })
 }
 
 /// Validate all cronjob configs (fail-fast on bad cron expressions or timezones).
@@ -1035,6 +1026,32 @@ impl Drop for InFlightGuard {
     }
 }
 
+/// Record a scheduled-job failure. These paths used to return silently, so a
+/// job that could not resolve its channel simply never ran and nothing said so.
+fn record_cron_incident(
+    router: &Arc<AdapterRouter>,
+    job: &CronJobConfig,
+    summary: &str,
+    detail: &str,
+) {
+    let Some(sink) = router.incidents() else {
+        return;
+    };
+    sink.record(
+        crate::incident::Incident::new(
+            crate::incident::IncidentKind::CronFailure,
+            summary,
+            detail,
+        )
+        .with_location(
+            job.platform.clone(),
+            Some(job.channel.clone()),
+            job.thread_id.clone(),
+        )
+        .with_workspace_alias(job.normalized_workspace_alias().map(str::to_string)),
+    );
+}
+
 async fn fire_cronjob(
     idx: usize,
     job: &CronJobConfig,
@@ -1063,6 +1080,12 @@ async fn fire_cronjob(
         Some(a) => a.clone(),
         None => {
             error!(platform = %job.platform, "no adapter for platform, skipping cronjob");
+            record_cron_incident(
+                router,
+                job,
+                "scheduled job has no adapter for its platform",
+                &format!("platform={}", job.platform),
+            );
             return;
         }
     };
@@ -1130,6 +1153,12 @@ async fn fire_cronjob(
             channel = %job.channel,
             "cronjob channel could not be resolved, skipping"
         );
+        record_cron_incident(
+            router,
+            job,
+            "scheduled job channel could not be resolved",
+            &format!("channel={}", job.channel),
+        );
         return;
     };
     let Some(prompt) = resolved_prompt(job, bindings) else {
@@ -1137,6 +1166,12 @@ async fn fire_cronjob(
             id = job.sticky_key().unwrap_or(""),
             action_id = job.normalized_action_id().unwrap_or(""),
             "cronjob prompt could not be resolved, skipping"
+        );
+        record_cron_incident(
+            router,
+            job,
+            "scheduled job prompt could not be resolved",
+            &format!("action_id={}", job.normalized_action_id().unwrap_or("")),
         );
         return;
     };
@@ -1160,103 +1195,63 @@ async fn fire_cronjob(
     };
 
     let trigger_text = resolved_trigger_text(job, &prompt, bindings);
-    let prefix = format!("🕐 [{}]: ", job.sender_name);
-    let max_limit = adapter.message_limit();
-    let prefix_len = prefix.chars().count();
-    let allowed_body_len = max_limit.saturating_sub(prefix_len);
-    let trigger_body = format::truncate_chars_head(&trigger_text, allowed_body_len);
-    let trigger_content = format!("{prefix}{trigger_body}");
+    let wants_thread = should_create_cron_thread(job, resolved_thread_id.as_deref());
+    let thread_name = wants_thread.then(|| format::shorten_thread_name(&trigger_text));
 
-    let trigger_msg = match adapter
-        .send_message(
-            &thread_channel,
-            &trigger_content,
-        )
-        .await
+    let (reply_channel, trigger_msg) = match crate::thread_session::open_trigger_thread(
+        &adapter,
+        &thread_channel,
+        &format!("🕐 [{}]: ", job.sender_name),
+        &trigger_text,
+        thread_name.as_deref(),
+    )
+    .await
     {
-        Ok(msg) => msg,
+        Ok(opened) => opened,
         Err(e) => {
-            error!(channel = %job.channel, error = %e, "failed to send cron message");
-            return;
-        }
-    };
-
-    let reply_channel = if should_create_cron_thread(job, resolved_thread_id.as_deref()) {
-        let thread_name = format::shorten_thread_name(&trigger_text);
-        match adapter
-            .create_thread(&thread_channel, &trigger_msg, &thread_name)
-            .await
-        {
-            Ok(ch) => {
-                if let Some(thread_id) = ch.thread_id.as_deref().or(Some(ch.channel_id.as_str())) {
-                    persist_sticky_thread(job, bindings, thread_id);
-                    if let (Some(path), Some(id)) =
-                        (usercron_path.as_deref(), non_empty_opt(job.id.as_deref()))
-                    {
-                        let _write_guard = usercron_write_lock.lock().await;
-                        if let Err(e) = update_usercron_job(path, id, None, Some(thread_id)) {
-                            warn!(path = %path.display(), id, error = %e, "failed to persist usercron thread_id");
-                        }
-                    }
-                }
-                ch
-            }
-            Err(e) => {
-                error!(channel = %job.channel, error = %e, "failed to create cron thread");
+            error!(channel = %job.channel, error = %e, "failed to start cronjob");
+            record_cron_incident(router, job, "scheduled job could not be started", &e.to_string());
+            if wants_thread {
                 let _ = adapter
-                    .send_message(
-                        &thread_channel,
-                        &format!("⚠️ cronjob: failed to create thread: {e}"),
-                    )
+                    .send_message(&thread_channel, &format!("⚠️ cronjob: {e}"))
                     .await;
-                return;
             }
-        }
-    } else {
-        thread_channel.clone()
-    };
-
-    let sender = SenderContext {
-        schema: "openab.sender.v1".into(),
-        sender_id: "openab-cron".into(),
-        sender_name: job.sender_name.clone(),
-        display_name: job.sender_name.clone(),
-        channel: job.platform.clone(),
-        channel_id: reply_channel
-            .parent_id
-            .as_deref()
-            .unwrap_or(&reply_channel.channel_id)
-            .to_string(),
-        thread_id: cron_sender_thread_id(&reply_channel),
-        is_bot: true,
-        timestamp: Some(Utc::now().to_rfc3339()),
-        message_id: None,  // cron jobs don't originate from a message
-        receiver_id: None, // cron jobs are self-triggered, no external receiver
-        output_instructions: None,
-    };
-    let sender_json = match serde_json::to_string(&sender) {
-        Ok(j) => j,
-        Err(e) => {
-            warn!(error = %e, "failed to serialize cron sender context, skipping");
             return;
         }
     };
 
-    if let Err(e) = router
-        .handle_message(
-            &adapter,
-            crate::adapter::MessageContext {
-                thread_channel: reply_channel.clone(),
-                sender_json,
-                prompt: prompt.clone(),
-                extra_blocks: vec![],
-                trigger_msg,
-                other_bot_present: false,
-            },
-        )
-        .await
+    if wants_thread {
+        if let Some(thread_id) = reply_channel
+            .thread_id
+            .as_deref()
+            .or(Some(reply_channel.channel_id.as_str()))
+        {
+            persist_sticky_thread(job, bindings, thread_id);
+            if let (Some(path), Some(id)) =
+                (usercron_path.as_deref(), non_empty_opt(job.id.as_deref()))
+            {
+                let _write_guard = usercron_write_lock.lock().await;
+                if let Err(e) = update_usercron_job(path, id, None, Some(thread_id)) {
+                    warn!(path = %path.display(), id, error = %e, "failed to persist usercron thread_id");
+                }
+            }
+        }
+    }
+
+    if let Err(e) = crate::thread_session::submit_agent_turn(
+        &adapter,
+        &router,
+        &reply_channel,
+        trigger_msg,
+        "openab-cron",
+        &job.sender_name,
+        &job.platform,
+        prompt.clone(),
+    )
+    .await
     {
         error!("cron handle_message error: {e}");
+        record_cron_incident(router, job, "scheduled job errored while running", &e.to_string());
         let _ = adapter
             .send_message(&reply_channel, &format!("⚠️ cronjob error: {e}"))
             .await;
@@ -2106,51 +2101,6 @@ message = "a"
 
         assert!(should_create_cron_thread(&job, job.thread_id.as_deref()));
         assert!(!should_create_cron_thread(&job, Some("sticky-thread")));
-    }
-
-    #[test]
-    fn googlechat_top_level_sender_has_no_thread_id() {
-        let channel = ChannelRef {
-            platform: "googlechat".into(),
-            channel_id: "spaces/TEST".into(),
-            thread_id: None,
-            parent_id: None,
-            origin_event_id: None,
-        };
-
-        assert_eq!(cron_sender_thread_id(&channel), None);
-    }
-
-    #[test]
-    fn cron_sender_preserves_explicit_thread_id() {
-        let channel = ChannelRef {
-            platform: "googlechat".into(),
-            channel_id: "spaces/TEST".into(),
-            thread_id: Some("spaces/TEST/threads/THREAD".into()),
-            parent_id: None,
-            origin_event_id: None,
-        };
-
-        assert_eq!(
-            cron_sender_thread_id(&channel).as_deref(),
-            Some("spaces/TEST/threads/THREAD")
-        );
-    }
-
-    #[test]
-    fn cron_sender_uses_child_channel_id_for_thread_platforms() {
-        let channel = ChannelRef {
-            platform: "discord".into(),
-            channel_id: "thread-456".into(),
-            thread_id: None,
-            parent_id: Some("channel-123".into()),
-            origin_event_id: None,
-        };
-
-        assert_eq!(
-            cron_sender_thread_id(&channel).as_deref(),
-            Some("thread-456")
-        );
     }
 
     // --- validate_cronjobs tests ---

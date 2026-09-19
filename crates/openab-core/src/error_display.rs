@@ -1,3 +1,48 @@
+/// What kind of thing went wrong, independent of how it is worded for a user.
+///
+/// Incident triage needs this same judgement for a different purpose — deciding
+/// whether the agent runtime is healthy enough to run a diagnostic session at
+/// all — so the substring table lives here once instead of being re-guessed at
+/// each call site.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ErrorClass {
+    Timeout,
+    ConnectionLost,
+    /// The agent binary could not be started.
+    AgentMissing,
+    PoolExhausted,
+    /// Credentials were rejected — an expired token, a bad key.
+    AuthExpired,
+    /// The agent process is gone.
+    ProcessDead,
+    Unknown,
+}
+
+pub fn error_class(message: &str) -> ErrorClass {
+    let msg_lower = message.to_lowercase();
+    if msg_lower.contains("timeout waiting for") {
+        return ErrorClass::Timeout;
+    }
+    if msg_lower.contains("connection closed") || msg_lower.contains("channel closed") {
+        return ErrorClass::ConnectionLost;
+    }
+    if msg_lower.contains("failed to spawn") || msg_lower.contains("no such file") {
+        return ErrorClass::AgentMissing;
+    }
+    if msg_lower.contains("pool exhausted") {
+        return ErrorClass::PoolExhausted;
+    }
+    if msg_lower.contains("invalid api key") || msg_lower.contains("unauthorized") {
+        return ErrorClass::AuthExpired;
+    }
+    if msg_lower.contains("agent process died")
+        || msg_lower.contains("agent process exited unexpectedly")
+    {
+        return ErrorClass::ProcessDead;
+    }
+    ErrorClass::Unknown
+}
+
 /// Format any error for user display in Discord.
 ///
 /// Handles two error categories:
@@ -7,44 +52,46 @@
 ///
 /// Provider-agnostic: no provider-specific strings, message text passed through verbatim.
 pub fn format_user_error(message: &str) -> String {
-    let msg_lower = message.to_lowercase();
-
-    // Startup / connection errors (code == 0 from anyhow)
-    if msg_lower.contains("timeout waiting for") {
-        // Use msg_lower for extraction to stay case-insistent with the match above.
-        // msg_lower and message are the same length, so byte offsets are valid.
-        if let Some(start) = msg_lower.find("timeout waiting for ") {
-            let rest = &message[start + "timeout waiting for ".len()..];
-            let method = rest.split_whitespace().next().unwrap_or("request");
-            return format!(
-                "**Request Timeout**\nTimeout waiting for {}, please try again.",
-                method
-            );
+    match error_class(message) {
+        ErrorClass::Timeout => {
+            // Use lowercase for extraction to stay consistent with the match
+            // above. Both strings are the same length, so byte offsets are valid.
+            let msg_lower = message.to_lowercase();
+            if let Some(start) = msg_lower.find("timeout waiting for ") {
+                let rest = &message[start + "timeout waiting for ".len()..];
+                let method = rest.split_whitespace().next().unwrap_or("request");
+                return format!(
+                    "**Request Timeout**\nTimeout waiting for {}, please try again.",
+                    method
+                );
+            }
+            "**Request Timeout**\nTimeout waiting for a response, please try again.".to_string()
         }
-        return "**Request Timeout**\nTimeout waiting for a response, please try again."
-            .to_string();
-    }
-    if msg_lower.contains("connection closed") || msg_lower.contains("channel closed") {
-        return "**Connection Lost**\nThe connection to the agent was lost, please try again."
-            .to_string();
-    }
-    if msg_lower.contains("failed to spawn") || msg_lower.contains("no such file") {
-        return "**Agent Not Found**\nCould not start the agent — please check your configuration."
-            .to_string();
-    }
-    if msg_lower.contains("pool exhausted") {
-        return "**Service Busy**\nAll agent sessions are in use, please try again shortly."
-            .to_string();
-    }
-    if msg_lower.contains("invalid api key") || msg_lower.contains("unauthorized") {
-        return "**Unauthorized**\nPlease check your API key configuration.".to_string();
-    }
-
-    // Unknown error — pass through as-is
-    if message.is_empty() {
-        "**Error**\nAn unknown error occurred.".to_string()
-    } else {
-        format!("**Error**\n{}", message)
+        ErrorClass::ConnectionLost => {
+            "**Connection Lost**\nThe connection to the agent was lost, please try again."
+                .to_string()
+        }
+        ErrorClass::AgentMissing => {
+            "**Agent Not Found**\nCould not start the agent — please check your configuration."
+                .to_string()
+        }
+        ErrorClass::PoolExhausted => {
+            "**Service Busy**\nAll agent sessions are in use, please try again shortly."
+                .to_string()
+        }
+        ErrorClass::AuthExpired => {
+            "**Unauthorized**\nPlease check your API key configuration.".to_string()
+        }
+        // `ProcessDead` has no dedicated user-facing copy: it reaches the user
+        // through the adapter's own "Agent process died" text, so it falls
+        // through to the pass-through branch exactly as it did before.
+        ErrorClass::ProcessDead | ErrorClass::Unknown => {
+            if message.is_empty() {
+                "**Error**\nAn unknown error occurred.".to_string()
+            } else {
+                format!("**Error**\n{}", message)
+            }
+        }
     }
 }
 
@@ -174,6 +221,35 @@ mod tests {
         let result = format_user_error("Timeout Waiting For custom/method");
         assert!(result.contains("Request Timeout"));
         assert!(result.contains("custom/method"));
+    }
+
+    // ─── error_class tests ──────────────────────────────────────────────────
+
+    #[test]
+    fn error_class_recognises_the_literal_strings_the_adapter_emits() {
+        // These four are produced verbatim at the ACP capture sites, and incident
+        // triage keys its "the runtime itself is broken" decision off them — so a
+        // reword there must fail here rather than silently sending a doomed
+        // diagnostic session.
+        assert_eq!(error_class("Agent process died"), ErrorClass::ProcessDead);
+        assert_eq!(
+            error_class("Agent process exited unexpectedly"),
+            ErrorClass::ProcessDead
+        );
+        assert_eq!(
+            error_class("failed to spawn cursor-agent: No such file"),
+            ErrorClass::AgentMissing
+        );
+        assert_eq!(
+            error_class("**Unauthorized** (code: 401)\ninvalid api key"),
+            ErrorClass::AuthExpired
+        );
+    }
+
+    #[test]
+    fn error_class_leaves_ordinary_failures_unclassified() {
+        assert_eq!(error_class("something went wrong"), ErrorClass::Unknown);
+        assert_eq!(error_class(""), ErrorClass::Unknown);
     }
 
     // ─── format_coded_error tests ───────────────────────────────────────────

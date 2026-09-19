@@ -932,6 +932,31 @@ async fn main() -> anyhow::Result<()> {
         );
     }
 
+    // Failure recording is unconditional wherever it is configured; whether
+    // anything is *done* with the records is the triage config's business, and
+    // the knowledge runtime deliberately records without triaging.
+    let (incident_sink, incident_rx) = match cfg
+        .discord
+        .as_ref()
+        .and_then(|discord| discord.incident_triage.as_ref())
+    {
+        Some(triage) => {
+            let source_id = std::env::var("OPENAB_REPORT_SOURCE_ID")
+                .unwrap_or_else(|_| "coding".to_string());
+            let sink = openab_core::incident::IncidentSink::new(&triage.spool_dir, source_id);
+            // Only attach the notify channel where something actually drains it.
+            // The knowledge runtime records without triaging, and an unbounded
+            // channel nobody reads would grow for the life of the process.
+            if triage.enabled {
+                let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+                (Some(Arc::new(sink.with_channel(tx))), Some(rx))
+            } else {
+                (Some(Arc::new(sink)), None)
+            }
+        }
+        None => (None, None),
+    };
+
     let router = Arc::new(
         AdapterRouter::new(
             pool.clone(),
@@ -946,7 +971,8 @@ async fn main() -> anyhow::Result<()> {
                 root: workspace_root,
             },
         )
-        .with_trust(gateway_trust),
+        .with_trust(gateway_trust)
+        .with_incidents(incident_sink.clone()),
     );
 
     #[cfg(feature = "discord")]
@@ -1720,6 +1746,15 @@ async fn main() -> anyhow::Result<()> {
         openab_data_dir.join("cron-toggles.json"),
     ));
     let cron_sticky_path = openab_data_dir.join("cron-threads.json");
+    // Cooldowns and the daily cap live on disk: a restart storm is exactly when
+    // those limits matter most, so they must not reset with the process.
+    let triage_state_path = openab_data_dir.join("incident-triage-state.json");
+    let triage_state: openab_core::incident::TriageState = std::fs::read_to_string(
+        &triage_state_path,
+    )
+    .ok()
+    .and_then(|body| serde_json::from_str(&body).ok())
+    .unwrap_or_default();
     #[cfg(feature = "discord")]
     let cron_sticky_store = Arc::new(cron::CronStickyStore::load_from_control_db(
         control_db.clone(),
@@ -2023,6 +2058,11 @@ async fn main() -> anyhow::Result<()> {
             admin_reporter,
             inventory_reporter_started: std::sync::atomic::AtomicBool::new(false),
             git_push_broker,
+            incident_triage: discord_cfg.incident_triage.clone(),
+            incident_rx: tokio::sync::Mutex::new(incident_rx),
+            triage_state: std::sync::Arc::new(tokio::sync::Mutex::new(triage_state)),
+            triage_state_path: Some(triage_state_path),
+            triage_watcher_started: std::sync::atomic::AtomicBool::new(false),
         };
 
         let intents = GatewayIntents::GUILD_MESSAGES

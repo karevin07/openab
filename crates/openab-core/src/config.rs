@@ -523,6 +523,9 @@ pub struct DiscordConfig {
     /// Optional private service that owns Git credentials and performs only
     /// validated, non-force pushes for allowlisted workspace aliases.
     pub git_push_broker: Option<DiscordGitPushBrokerConfig>,
+    /// Optional automatic failure triage. Recording incidents is unconditional;
+    /// this only governs whether a diagnostic agent session is opened for them.
+    pub incident_triage: Option<DiscordIncidentTriageConfig>,
     /// Allow administrators with Manage Channels to provision private project
     /// channels through `/project`. Disabled by default.
     #[serde(default)]
@@ -639,6 +642,55 @@ pub struct DiscordProjectActionConfig {
     pub button: bool,
     /// Prompt placed in the editable new-task modal.
     pub prompt: String,
+}
+
+/// Automatic failure triage: when a recorded incident matches `kinds`, open a
+/// Discord thread seeded with a diagnose-only agent session, so a failure is
+/// already investigated by the time someone looks at it.
+///
+/// Only the runtime that has repository access should enable this. The
+/// knowledge bot still records incidents to the shared spool, but leaves
+/// `enabled = false` and lets the coding bot pick them up.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct DiscordIncidentTriageConfig {
+    /// Open diagnostic sessions. When false the runtime keeps recording
+    /// incidents; it simply never prompts an agent about them.
+    #[serde(default)]
+    pub enabled: bool,
+    /// Channel that diagnostic threads are created under.
+    pub channel_id: String,
+    /// Shared spool directory. Both runtimes write here; only an enabled one reads.
+    pub spool_dir: String,
+    /// Incident kinds worth waking an agent for. Everything else is recorded only.
+    #[serde(default = "default_incident_triage_kinds")]
+    pub kinds: Vec<String>,
+    /// Minimum seconds between two sessions for the same recurring failure, so a
+    /// crash loop produces one thread rather than one per occurrence.
+    #[serde(default = "default_incident_triage_cooldown_secs")]
+    pub cooldown_secs: u64,
+    /// Hard ceiling on sessions opened per day. Triage competes with real work
+    /// for `pool.max_sessions`, so this stays deliberately small.
+    #[serde(default = "default_incident_triage_max_per_day")]
+    pub max_per_day: u32,
+    /// Report what would have happened without opening any session. Useful for
+    /// watching the triggers for a while before letting them loose.
+    #[serde(default)]
+    pub notify_only: bool,
+}
+
+fn default_incident_triage_kinds() -> Vec<String> {
+    vec![
+        "agent_turn_error".to_string(),
+        "payload_rejected".to_string(),
+    ]
+}
+
+fn default_incident_triage_cooldown_secs() -> u64 {
+    3600
+}
+
+fn default_incident_triage_max_per_day() -> u32 {
+    6
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]

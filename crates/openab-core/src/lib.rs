@@ -18,6 +18,7 @@ pub mod gateway;
 #[cfg(feature = "discord")]
 pub mod git_push_broker;
 pub mod hooks;
+pub mod incident;
 pub mod markdown;
 pub mod media;
 pub mod multibot_cache;
@@ -38,6 +39,7 @@ pub mod setup;
 pub mod stt;
 #[cfg(feature = "discord")]
 pub mod task_registry;
+pub mod thread_session;
 pub mod timestamp;
 pub mod trust;
 

@@ -6,10 +6,11 @@ use crate::adapter::{
 use crate::bot_turns::{BotTurnTracker, TurnAction, TurnSeverity, BOT_TURN_LIMIT_WARNING_PREFIX};
 use crate::config::{
     resolve_project_action, AgentPresentationConfig, AllowBots, AllowUsers, CronJobConfig,
-    DiscordProjectActionConfig, DiscordProjectCommandConfig, DiscordProjectCommandRunner,
-    SttConfig, PROJECT_COMMAND_RUN_CUSTOM_ID_PREFIX,
+    DiscordIncidentTriageConfig, DiscordProjectActionConfig, DiscordProjectCommandConfig,
+    DiscordProjectCommandRunner, SttConfig, PROJECT_COMMAND_RUN_CUSTOM_ID_PREFIX,
 };
 use crate::control_db::UiSurface;
+use crate::incident::{Incident, SkipReason, TriageDecision, TriageState};
 use crate::cron::{job_applies_to_project, next_run_unix, sticky_thread_id_for, CronToggleStore};
 // Only the client stays here; every admin card, modal and handler now lives in
 // `discord_admin_ui`, which owns the wire types it renders.
@@ -4676,6 +4677,7 @@ pub struct DiscordAdapter {
     task_registry: Option<TaskRegistry>,
     project_registry: Option<ProjectRegistry>,
     reporter: Option<DiscordAdminReporter>,
+    incidents: Option<Arc<crate::incident::IncidentSink>>,
 }
 
 impl DiscordAdapter {
@@ -4685,6 +4687,7 @@ impl DiscordAdapter {
             task_registry: None,
             project_registry: None,
             reporter: None,
+            incidents: None,
         }
     }
 
@@ -4694,6 +4697,7 @@ impl DiscordAdapter {
             task_registry: None,
             project_registry: None,
             reporter,
+            incidents: None,
         }
     }
 
@@ -4708,7 +4712,40 @@ impl DiscordAdapter {
             task_registry: Some(task_registry),
             project_registry: Some(project_registry),
             reporter,
+            incidents: None,
         }
+    }
+
+    /// Attach the failure recorder so rejected payloads leave a durable record
+    /// instead of only a log line and a Discord reply.
+    pub fn with_incidents(
+        mut self,
+        incidents: Option<Arc<crate::incident::IncidentSink>>,
+    ) -> Self {
+        self.incidents = incidents;
+        self
+    }
+
+    /// Record a failure that the model produced, so triage has something to
+    /// work from. `channel_id` is the thread the payload arrived in — the same
+    /// identity the re-entrancy guard matches on.
+    fn record_incident(
+        &self,
+        kind: crate::incident::IncidentKind,
+        summary: &str,
+        detail: &str,
+        channel_id: u64,
+    ) {
+        let Some(sink) = &self.incidents else {
+            return;
+        };
+        sink.record(
+            crate::incident::Incident::new(kind, summary, detail).with_location(
+                "discord",
+                None,
+                Some(channel_id.to_string()),
+            ),
+        );
     }
 
     /// Resolve the effective Discord channel ID from a ChannelRef.
@@ -4748,6 +4785,12 @@ impl DiscordAdapter {
             Ok(Some(audit)) => {
                 if let Err(error) = Self::validate_knowledge_weekly_sources(&audit) {
                     warn!(%error, "knowledge weekly payload source validation failed");
+                    self.record_incident(
+                        crate::incident::IncidentKind::PayloadRejected,
+                        "knowledge weekly payload is missing configured sources",
+                        &error.to_string(),
+                        channel_id,
+                    );
                     "⚠️ 每週知識來源統計格式不完整，未送交 Admin Bot。".to_string()
                 } else if let Some(reporter) = &self.reporter {
                     match reporter.report_knowledge_weekly(&audit).await {
@@ -4755,6 +4798,12 @@ impl DiscordAdapter {
                             .to_string(),
                         Err(error) => {
                             warn!(%error, "failed to report knowledge weekly audit");
+                            self.record_incident(
+                                crate::incident::IncidentKind::TelemetryFailed,
+                                "reporting the knowledge weekly audit to the Admin Bot failed",
+                                &error.to_string(),
+                                channel_id,
+                            );
                             "⚠️ 每週知識來源統計上報失敗，請檢查 Admin Bot report API。".to_string()
                         }
                     }
@@ -4766,6 +4815,12 @@ impl DiscordAdapter {
             Ok(None) => return Ok(None),
             Err(error) => {
                 warn!(%error, "knowledge weekly payload validation failed");
+                self.record_incident(
+                    crate::incident::IncidentKind::PayloadRejected,
+                    "knowledge weekly payload failed schema validation",
+                    &error.to_string(),
+                    channel_id,
+                );
                 "⚠️ 每週知識來源統計格式無效，未送交 Admin Bot。".to_string()
             }
         };
@@ -5232,6 +5287,165 @@ async fn inventory_thread_metadata(
     Ok((last_activity, channel.name))
 }
 
+/// The diagnostic brief handed to the agent.
+///
+/// Read-only by construction: the instruction to change nothing is stated
+/// before the failure details, because a model that has already read a juicy
+/// stack trace is measurably more willing to start "just fixing" it.
+fn triage_prompt(incident: &Incident) -> String {
+    let location = match (&incident.channel_id, &incident.thread_id) {
+        (_, Some(thread)) => format!("thread `{thread}`"),
+        (Some(channel), None) => format!("channel `{channel}`"),
+        (None, None) => "unknown".to_string(),
+    };
+    format!(
+        "系統剛剛發生一次失敗，請你調查根本原因並回報。\n\n\
+         **這是唯讀的診斷任務。** 不要修改任何檔案、不要 commit、不要 push、\
+         不要重啟或部署任何服務。只需要找出原因並說明建議的修法，實際要不要動手由人決定。\n\n\
+         ## 失敗資訊\n\
+         - 類型：`{kind}`\n\
+         - 回報來源：`{source}`\n\
+         - 發生時間：{detected_at}\n\
+         - 位置：{location}\n\
+         - 摘要：{summary}\n\n\
+         ## 原始錯誤\n\
+         ```\n{detail}\n```\n\n\
+         ## 請回報\n\
+         1. 根本原因（可以讀 repo 程式碼佐證）\n\
+         2. 影響範圍：還有什麼會因為同一個原因壞掉\n\
+         3. 建議修法，以及風險\n\
+         4. 這會不會自己再發生一次",
+        kind = incident.kind.as_str(),
+        source = incident.source_id,
+        detected_at = incident.detected_at.to_rfc3339(),
+        location = location,
+        summary = incident.summary,
+        detail = incident.detail,
+    )
+}
+
+/// What gets posted when a session is deliberately not opened.
+fn triage_notice(incident: &Incident, reason: &SkipReason) -> String {
+    let explanation = match reason {
+        SkipReason::RuntimeDead => {
+            "agent runtime 本身有問題，診斷 session 也會以同樣的原因失敗，所以只通知不開 session。"
+        }
+        SkipReason::NotifyOnlyMode => "目前設定為只通知不開 session。",
+        _ => "未開啟診斷 session。",
+    };
+    format!(
+        "🚨 **偵測到失敗**（`{kind}` / `{source}`）\n{summary}\n\n{explanation}",
+        kind = incident.kind.as_str(),
+        source = incident.source_id,
+        summary = incident.summary,
+        explanation = explanation,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn handle_triage_incident(
+    incident: &Incident,
+    config: &DiscordIncidentTriageConfig,
+    adapter: &Arc<dyn ChatAdapter>,
+    router: &Arc<AdapterRouter>,
+    state: &Arc<tokio::sync::Mutex<TriageState>>,
+    state_path: Option<&std::path::Path>,
+    spool: &std::path::Path,
+    claimer: &str,
+) {
+    let now = chrono::Utc::now();
+    let decision = {
+        let guard = state.lock().await;
+        crate::incident::decide_triage(config, &guard, incident, now)
+    };
+    let channel = ChannelRef {
+        platform: "discord".into(),
+        channel_id: config.channel_id.clone(),
+        thread_id: None,
+        parent_id: None,
+        origin_event_id: None,
+    };
+
+    match decision {
+        TriageDecision::Skip(reason) => {
+            debug!(
+                id = %incident.id,
+                kind = incident.kind.as_str(),
+                reason = reason.as_str(),
+                "incident recorded without triage"
+            );
+        }
+        TriageDecision::NotifyOnly(reason) => {
+            if let Err(error) = adapter
+                .send_message(&channel, &triage_notice(incident, &reason))
+                .await
+            {
+                warn!(%error, id = %incident.id, "failed to post incident notice");
+            }
+        }
+        TriageDecision::Fire => {
+            let thread_name = format::shorten_thread_name(&format!("🚨 {}", incident.summary));
+            match crate::thread_session::open_trigger_thread(
+                adapter,
+                &channel,
+                "🚨 [triage] ",
+                &incident.summary,
+                Some(&thread_name),
+            )
+            .await
+            {
+                Ok((reply_channel, trigger_msg)) => {
+                    let thread_id = reply_channel
+                        .thread_id
+                        .clone()
+                        .unwrap_or_else(|| reply_channel.channel_id.clone());
+                    // Registered *before* the turn is submitted: if the
+                    // diagnosis itself fails, that failure is already known to
+                    // belong to a triage thread and cannot start another one.
+                    {
+                        let mut guard = state.lock().await;
+                        guard.record_fired(&incident.dedup_key(), Some(&thread_id), now);
+                        guard.prune(config.cooldown_secs, now);
+                        if let Some(path) = state_path {
+                            if let Err(error) = crate::incident::write_json_0600(path, &*guard) {
+                                warn!(%error, "failed to persist incident triage state");
+                            }
+                        }
+                    }
+                    info!(
+                        id = %incident.id,
+                        kind = incident.kind.as_str(),
+                        thread_id,
+                        "opened an incident triage session"
+                    );
+                    if let Err(error) = crate::thread_session::submit_agent_turn(
+                        adapter,
+                        router,
+                        &reply_channel,
+                        trigger_msg,
+                        "openab-triage",
+                        "Incident triage",
+                        "discord",
+                        triage_prompt(incident),
+                    )
+                    .await
+                    {
+                        warn!(%error, id = %incident.id, "incident triage session failed to start");
+                        let _ = adapter
+                            .send_message(&reply_channel, &format!("⚠️ 診斷 session 啟動失敗：{error}"))
+                            .await;
+                    }
+                }
+                Err(error) => {
+                    warn!(%error, id = %incident.id, "failed to open an incident triage thread");
+                }
+            }
+        }
+    }
+
+    crate::incident::mark_done(spool, claimer, &incident.id);
+}
+
 async fn collect_session_inventory(
     source_id: &str,
     http: &Http,
@@ -5406,6 +5620,19 @@ pub struct Handler {
     pub inventory_reporter_started: AtomicBool,
     /// Optional client for the isolated Git push broker.
     pub git_push_broker: Option<GitPushBrokerClient>,
+    /// Automatic failure triage. Absent (or disabled) leaves incidents recorded
+    /// but never acted on.
+    pub incident_triage: Option<DiscordIncidentTriageConfig>,
+    /// Receives incidents recorded in this process, so triage reacts at once
+    /// instead of waiting for the next spool sweep.
+    pub incident_rx: tokio::sync::Mutex<Option<tokio::sync::mpsc::UnboundedReceiver<Incident>>>,
+    /// Cooldown / daily-cap / re-entrancy bookkeeping, persisted so a restart
+    /// storm cannot bypass the caps.
+    pub triage_state: Arc<tokio::sync::Mutex<TriageState>>,
+    /// Where `triage_state` is persisted.
+    pub triage_state_path: Option<PathBuf>,
+    /// Prevent duplicate triage loops when Discord reconnects and emits ready again.
+    pub triage_watcher_started: AtomicBool,
 }
 
 pub(crate) struct DiscordCommandScope {
@@ -5452,6 +5679,88 @@ impl Handler {
         });
     }
 
+    /// Watch for recorded failures and open a diagnose-only agent session for
+    /// the ones that earn it.
+    ///
+    /// Two inputs feed the same handler: an in-process channel, so a failure
+    /// here is acted on immediately, and a periodic sweep of the shared spool,
+    /// which picks up records written by the knowledge runtime (it has no
+    /// repository access, so it records but never triages) and anything left
+    /// behind by a restart.
+    fn start_incident_triage_watcher(&self, adapter: Arc<dyn ChatAdapter>) {
+        let Some(config) = self.incident_triage.clone() else {
+            return;
+        };
+        if !config.enabled {
+            return;
+        }
+        if self
+            .triage_watcher_started
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            return;
+        }
+        let Some(rx) = self.incident_rx.try_lock().ok().and_then(|mut slot| slot.take()) else {
+            warn!("incident triage watcher has no incident channel; not starting");
+            return;
+        };
+
+        let router = self.router.clone();
+        let state = self.triage_state.clone();
+        let state_path = self.triage_state_path.clone();
+        let spool = PathBuf::from(&config.spool_dir);
+        let claimer = self
+            .admin_reporter
+            .as_ref()
+            .map(|reporter| reporter.source_id().to_string())
+            .unwrap_or_else(|| "coding".to_string());
+
+        info!(
+            spool = %spool.display(),
+            kinds = ?config.kinds,
+            max_per_day = config.max_per_day,
+            notify_only = config.notify_only,
+            "incident triage watcher started"
+        );
+
+        tokio::spawn(async move {
+            let mut rx = rx;
+            // Once every sink is dropped `recv` returns immediately and forever,
+            // which would starve the sweep branch — so disable the branch rather
+            // than letting it win the select every time.
+            let mut channel_open = true;
+            let mut sweep = tokio::time::interval(std::time::Duration::from_secs(60));
+            sweep.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            loop {
+                let incident = tokio::select! {
+                    received = rx.recv(), if channel_open => match received {
+                        Some(incident) => Some(incident),
+                        None => {
+                            channel_open = false;
+                            None
+                        }
+                    },
+                    _ = sweep.tick() => crate::incident::claim_next(&spool, &claimer),
+                };
+                let Some(incident) = incident else {
+                    continue;
+                };
+                handle_triage_incident(
+                    &incident,
+                    &config,
+                    &adapter,
+                    &router,
+                    &state,
+                    state_path.as_deref(),
+                    &spool,
+                    &claimer,
+                )
+                .await;
+            }
+        });
+    }
+
     async fn report_session_event(&self, thread_id: u64, event_type: &str) {
         let Some(reporter) = &self.admin_reporter else {
             return;
@@ -5476,12 +5785,15 @@ impl Handler {
     pub(crate) fn discord_adapter(&self, ctx: &Context) -> Arc<dyn ChatAdapter> {
         self.adapter
             .get_or_init(|| {
-                Arc::new(DiscordAdapter::with_task_ui(
-                    ctx.http.clone(),
-                    self.task_registry.clone(),
-                    self.project_registry.clone(),
-                    self.admin_reporter.clone(),
-                ))
+                Arc::new(
+                    DiscordAdapter::with_task_ui(
+                        ctx.http.clone(),
+                        self.task_registry.clone(),
+                        self.project_registry.clone(),
+                        self.admin_reporter.clone(),
+                    )
+                    .with_incidents(self.router.incidents().cloned()),
+                )
             })
             .clone()
     }
@@ -6854,6 +7166,7 @@ impl EventHandler for Handler {
 
         self.reconcile_project_channels(&ctx).await;
         self.start_session_inventory_reporter(ctx.http.clone());
+        self.start_incident_triage_watcher(self.discord_adapter(&ctx));
 
         // Running jobs are restored as Waiting during load. Resume one FIFO
         // worker per repository only after Discord and project routing are ready.

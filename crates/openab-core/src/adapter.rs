@@ -696,6 +696,9 @@ pub struct AdapterRouter {
     /// [`AdapterRouter::with_trust`]; empty default = deny-all per platform
     /// (only consulted by paths wired to the gate — currently the gateway path).
     trust: crate::trust::PlatformTrustConfigs,
+    /// Structured failure recorder. `None` leaves every error path behaving
+    /// exactly as before.
+    incidents: Option<Arc<crate::incident::IncidentSink>>,
 }
 
 fn workspace_binding_channel_id(channel: &ChannelRef) -> &str {
@@ -731,6 +734,7 @@ impl AdapterRouter {
             bot_home: workspace.bot_home,
             workspace_root: workspace.root,
             trust: crate::trust::PlatformTrustConfigs::default(),
+            incidents: None,
         }
     }
 
@@ -739,6 +743,16 @@ impl AdapterRouter {
     pub fn with_trust(mut self, trust: crate::trust::PlatformTrustConfigs) -> Self {
         self.trust = trust;
         self
+    }
+
+    /// Attach the failure recorder (builder style, same reasoning as `with_trust`).
+    pub fn with_incidents(mut self, incidents: Option<Arc<crate::incident::IncidentSink>>) -> Self {
+        self.incidents = incidents;
+        self
+    }
+
+    pub fn incidents(&self) -> Option<&Arc<crate::incident::IncidentSink>> {
+        self.incidents.as_ref()
     }
 
     /// The single ingress trust gate: evaluate L2 (scope) + L3 (identity) for an
@@ -1027,6 +1041,7 @@ impl AdapterRouter {
         let platform_is_acp = thread_channel.platform == "acp";
         let prompt_hard_timeout = self.prompt_hard_timeout;
         let liveness_check_interval = self.liveness_check_interval;
+        let incident_sink = self.incidents.clone();
         let session_working_dir = self.pool.session_snapshot(thread_key).await.working_dir;
 
         self.pool
@@ -1157,6 +1172,11 @@ impl AdapterRouter {
                     // messages and abandons cleanly on dead agent / hard ceiling
                     // so late responses cannot leak into the next prompt.
                     let mut response_error: Option<String> = None;
+                    // Tracked alongside `response_error` so the incident record can
+                    // say *what kind* of failure this was without re-parsing the
+                    // user-facing string it was formatted into.
+                    let mut error_kind: Option<crate::incident::IncidentKind> = None;
+                    let mut error_detail = String::new();
                     let mut turn_result = TurnResult::default();
                     let prompt_start = tokio::time::Instant::now();
                     loop {
@@ -1185,6 +1205,7 @@ impl AdapterRouter {
                                     if response_error.is_none() {
                                         response_error =
                                             Some("Agent process exited unexpectedly".into());
+                                        error_kind = Some(crate::incident::IncidentKind::AgentDied);
                                     }
                                     break;
                                 }
@@ -1192,6 +1213,7 @@ impl AdapterRouter {
                             _ = tokio::time::sleep(liveness_check_interval) => {
                                 if !conn.alive() {
                                     response_error = Some("Agent process died".into());
+                                    error_kind = Some(crate::incident::IncidentKind::AgentDied);
                                     conn.abandon_request(request_id).await;
                                     break;
                                 }
@@ -1200,6 +1222,7 @@ impl AdapterRouter {
                                         "Agent exceeded hard timeout ({}s)",
                                         prompt_hard_timeout.as_secs(),
                                     ));
+                                    error_kind = Some(crate::incident::IncidentKind::PromptTimeout);
                                     conn.abandon_request(request_id).await;
                                     break;
                                 }
@@ -1216,6 +1239,23 @@ impl AdapterRouter {
                                 continue;
                             }
                             if let Some(ref err) = notification.error {
+                                // The structured fields only existed inside this
+                                // block and were collapsed into a display string;
+                                // an expired-token incident was therefore
+                                // undiagnosable after the fact. Keep them.
+                                warn!(
+                                    code = err.code,
+                                    message = %err.message,
+                                    data = err.data_message().unwrap_or(""),
+                                    "agent returned an error for session/prompt"
+                                );
+                                error_detail = format!(
+                                    "code={} message={} data={}",
+                                    err.code,
+                                    err.message,
+                                    err.data_message().unwrap_or("")
+                                );
+                                error_kind = Some(crate::incident::IncidentKind::AgentTurnError);
                                 response_error = Some(format_coded_error(err.code, &err.message, err.data_message()));
                             }
                             if let Some(ref result) = notification.result {
@@ -1406,6 +1446,27 @@ impl AdapterRouter {
                     // exactly that case. `finalize_body` is the pure helper that
                     // encodes the four-corner truth table so it can be unit-tested.
                     let text_buf = finalize_body(reset, keep_full_text, answer_start, text_buf);
+
+                    // A single emission point for every way the turn could have
+                    // failed, rather than one at each of the four capture sites.
+                    if let (Some(sink), Some(kind)) = (&incident_sink, error_kind) {
+                        let summary = response_error.clone().unwrap_or_default();
+                        let detail = if error_detail.is_empty() {
+                            summary.clone()
+                        } else {
+                            error_detail.clone()
+                        };
+                        // In a thread, `channel_id` *is* the thread and `parent_id`
+                        // the channel it hangs under — so the thread identity the
+                        // re-entrancy guard needs is `channel_id`.
+                        sink.record(
+                            crate::incident::Incident::new(kind, summary, detail).with_location(
+                                thread_channel.platform.clone(),
+                                thread_channel.parent_id.clone(),
+                                Some(thread_channel.channel_id.clone()),
+                            ),
+                        );
+                    }
 
                     // Build final content
                     let final_content =
