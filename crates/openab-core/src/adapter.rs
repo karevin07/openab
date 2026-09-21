@@ -1447,10 +1447,29 @@ impl AdapterRouter {
                     // encodes the four-corner truth table so it can be unit-tested.
                     let text_buf = finalize_body(reset, keep_full_text, answer_start, text_buf);
 
+                    // A turn can also fail by succeeding at nothing: `end_turn`
+                    // with zero output tokens and no error anywhere. That is what
+                    // a provider refusing the request looks like from here, and
+                    // it is invisible unless it is recorded like any other
+                    // failure.
+                    if error_kind.is_none() && turn_result.is_silent_failure() {
+                        error_kind = Some(crate::incident::IncidentKind::AgentSilentFailure);
+                        error_detail = format!(
+                            "stop_reason={:?} input_tokens={:?} output_tokens={:?}; \
+                             the agent returned no content and no error — check the agent's \
+                             own logs for a provider, model or auth rejection",
+                            turn_result.stop_reason,
+                            turn_result.input_tokens,
+                            turn_result.output_tokens,
+                        );
+                    }
+
                     // A single emission point for every way the turn could have
-                    // failed, rather than one at each of the four capture sites.
+                    // failed, rather than one at each of the capture sites.
                     if let (Some(sink), Some(kind)) = (&incident_sink, error_kind) {
-                        let summary = response_error.clone().unwrap_or_default();
+                        let summary = response_error.clone().unwrap_or_else(|| {
+                            "agent returned an empty turn (0 output tokens)".to_string()
+                        });
                         let detail = if error_detail.is_empty() {
                             summary.clone()
                         } else {

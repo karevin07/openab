@@ -681,6 +681,7 @@ pub struct DiscordIncidentTriageConfig {
 fn default_incident_triage_kinds() -> Vec<String> {
     vec![
         "agent_turn_error".to_string(),
+        "agent_silent_failure".to_string(),
         "payload_rejected".to_string(),
     ]
 }

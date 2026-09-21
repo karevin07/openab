@@ -35,6 +35,10 @@ pub enum IncidentKind {
     AgentTurnError,
     /// The agent process exited or stopped responding mid-turn.
     AgentDied,
+    /// The turn "succeeded" with zero output tokens — no JSON-RPC error, no
+    /// crash, just nothing. Almost always a provider, model or auth problem
+    /// upstream of us, and invisible unless something says so.
+    AgentSilentFailure,
     /// The turn passed the hard timeout and was abandoned.
     PromptTimeout,
     /// The session could not be created at all.
@@ -52,6 +56,7 @@ impl IncidentKind {
         match self {
             Self::AgentTurnError => "agent_turn_error",
             Self::AgentDied => "agent_died",
+            Self::AgentSilentFailure => "agent_silent_failure",
             Self::PromptTimeout => "prompt_timeout",
             Self::SessionCreateFailed => "session_create_failed",
             Self::PayloadRejected => "payload_rejected",
@@ -64,6 +69,7 @@ impl IncidentKind {
         match value.trim() {
             "agent_turn_error" => Some(Self::AgentTurnError),
             "agent_died" => Some(Self::AgentDied),
+            "agent_silent_failure" => Some(Self::AgentSilentFailure),
             "prompt_timeout" => Some(Self::PromptTimeout),
             "session_create_failed" => Some(Self::SessionCreateFailed),
             "payload_rejected" => Some(Self::PayloadRejected),
@@ -429,11 +435,17 @@ pub fn day_key(now: DateTime<Utc>) -> String {
 }
 
 /// Pure policy: everything that decides whether a failure earns a session.
+///
+/// `local_source_id` is the runtime that would host the diagnostic session. It
+/// matters because a failure recorded *here* can mean this runtime is the thing
+/// that is broken, while the same failure arriving from the other runtime says
+/// nothing about our ability to diagnose it.
 pub fn decide_triage(
     config: &DiscordIncidentTriageConfig,
     state: &TriageState,
     incident: &Incident,
     now: DateTime<Utc>,
+    local_source_id: &str,
 ) -> TriageDecision {
     if !config.enabled {
         return TriageDecision::Skip(SkipReason::Disabled);
@@ -466,6 +478,13 @@ pub fn decide_triage(
     }
     if config.notify_only {
         return TriageDecision::NotifyOnly(SkipReason::NotifyOnlyMode);
+    }
+    // A turn that produced nothing at all usually means the provider behind it
+    // is refusing us. If that happened in *this* runtime, the diagnostic session
+    // runs on the same broken agent and would produce nothing either; from the
+    // other runtime it is perfectly diagnosable.
+    if incident.kind == IncidentKind::AgentSilentFailure && incident.source_id == local_source_id {
+        return TriageDecision::NotifyOnly(SkipReason::RuntimeDead);
     }
     if runtime_is_dead(incident) {
         return TriageDecision::NotifyOnly(SkipReason::RuntimeDead);
@@ -542,7 +561,7 @@ mod tests {
         let from_triage_thread = incident(IncidentKind::AgentTurnError, "boom")
             .with_location("discord", None, Some("999".into()));
         assert_eq!(
-            decide_triage(&config(), &state, &from_triage_thread, now()),
+            decide_triage(&config(), &state, &from_triage_thread, now(), "coding"),
             TriageDecision::Skip(SkipReason::ReEntrant)
         );
 
@@ -550,7 +569,7 @@ mod tests {
         let mut stamped = incident(IncidentKind::AgentTurnError, "boom");
         stamped.triage_eligible = false;
         assert_eq!(
-            decide_triage(&config(), &TriageState::default(), &stamped, now()),
+            decide_triage(&config(), &TriageState::default(), &stamped, now(), "coding"),
             TriageDecision::Skip(SkipReason::ReEntrant)
         );
     }
@@ -563,13 +582,13 @@ mod tests {
 
         let during = now() + chrono::Duration::seconds(600);
         assert!(matches!(
-            decide_triage(&config(), &state, &incident, during),
+            decide_triage(&config(), &state, &incident, during, "coding"),
             TriageDecision::Skip(SkipReason::Cooldown { .. })
         ));
 
         let after = now() + chrono::Duration::seconds(3601);
         assert_eq!(
-            decide_triage(&config(), &state, &incident, after),
+            decide_triage(&config(), &state, &incident, after, "coding"),
             TriageDecision::Fire
         );
     }
@@ -581,13 +600,13 @@ mod tests {
         state.day = day_key(now());
         state.fired_today = 6;
         assert_eq!(
-            decide_triage(&config(), &state, &incident, now()),
+            decide_triage(&config(), &state, &incident, now(), "coding"),
             TriageDecision::Skip(SkipReason::DailyCap)
         );
 
         let tomorrow = now() + chrono::Duration::days(1);
         assert_eq!(
-            decide_triage(&config(), &state, &incident, tomorrow),
+            decide_triage(&config(), &state, &incident, tomorrow, "coding"),
             TriageDecision::Fire
         );
     }
@@ -596,7 +615,7 @@ mod tests {
     fn unlisted_kinds_are_recorded_but_never_fire() {
         let cron = incident(IncidentKind::CronFailure, "channel unresolved");
         assert_eq!(
-            decide_triage(&config(), &TriageState::default(), &cron, now()),
+            decide_triage(&config(), &TriageState::default(), &cron, now(), "coding"),
             TriageDecision::Skip(SkipReason::KindFiltered)
         );
     }
@@ -607,7 +626,7 @@ mod tests {
         config.enabled = false;
         let incident = incident(IncidentKind::AgentTurnError, "boom");
         assert_eq!(
-            decide_triage(&config, &TriageState::default(), &incident, now()),
+            decide_triage(&config, &TriageState::default(), &incident, now(), "coding"),
             TriageDecision::Skip(SkipReason::Disabled)
         );
     }
@@ -621,7 +640,7 @@ mod tests {
             "**Unauthorized** (code: 401) invalid api key",
         );
         assert_eq!(
-            decide_triage(&config(), &TriageState::default(), &auth, now()),
+            decide_triage(&config(), &TriageState::default(), &auth, now(), "coding"),
             TriageDecision::NotifyOnly(SkipReason::RuntimeDead)
         );
 
@@ -629,7 +648,36 @@ mod tests {
         let mut config_with_kind = config();
         config_with_kind.kinds.push("agent_died".into());
         assert_eq!(
-            decide_triage(&config_with_kind, &TriageState::default(), &died, now()),
+            decide_triage(&config_with_kind, &TriageState::default(), &died, now(), "coding"),
+            TriageDecision::NotifyOnly(SkipReason::RuntimeDead)
+        );
+    }
+
+    #[test]
+    fn a_silent_turn_is_diagnosed_across_runtimes_but_only_reported_within_one() {
+        // 2026-09-21: the knowledge runtime's provider started rejecting it, so
+        // every turn came back `end_turn` with zero tokens — no error, nothing
+        // logged, and the scheduled retention review produced nothing at all.
+        let mut config = config();
+        config.kinds.push("agent_silent_failure".into());
+        let mut silent = incident(
+            IncidentKind::AgentSilentFailure,
+            "agent returned an empty turn (0 output tokens)",
+        );
+
+        // Recorded by the knowledge runtime: the coding bot's own agent is fine,
+        // so it can go and read the other runtime's logs.
+        silent.source_id = "knowledge".into();
+        assert_eq!(
+            decide_triage(&config, &TriageState::default(), &silent, now(), "coding"),
+            TriageDecision::Fire
+        );
+
+        // Recorded by the runtime that would host the session: asking a broken
+        // agent to explain why it is broken yields a second empty turn.
+        silent.source_id = "coding".into();
+        assert_eq!(
+            decide_triage(&config, &TriageState::default(), &silent, now(), "coding"),
             TriageDecision::NotifyOnly(SkipReason::RuntimeDead)
         );
     }
@@ -640,7 +688,7 @@ mod tests {
         config.notify_only = true;
         let incident = incident(IncidentKind::PayloadRejected, "schema mismatch");
         assert_eq!(
-            decide_triage(&config, &TriageState::default(), &incident, now()),
+            decide_triage(&config, &TriageState::default(), &incident, now(), "coding"),
             TriageDecision::NotifyOnly(SkipReason::NotifyOnlyMode)
         );
     }

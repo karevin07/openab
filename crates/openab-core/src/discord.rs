@@ -5399,7 +5399,7 @@ async fn handle_triage_incident(
     let now = chrono::Utc::now();
     let decision = {
         let guard = state.lock().await;
-        crate::incident::decide_triage(config, &guard, incident, now)
+        crate::incident::decide_triage(config, &guard, incident, now, claimer)
     };
     let channel = ChannelRef {
         platform: "discord".into(),
