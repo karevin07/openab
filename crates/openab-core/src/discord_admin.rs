@@ -516,9 +516,9 @@ pub fn parse_knowledge_weekly_audit(content: &str) -> Result<Option<KnowledgeWee
     if let Some(stripped) = payload.strip_suffix("```") {
         payload = stripped.trim_end();
     }
-    let audit: KnowledgeWeeklyAudit =
+    let mut audit: KnowledgeWeeklyAudit =
         serde_json::from_str(payload).context("parse knowledge weekly payload")?;
-    validate_knowledge_weekly_audit(&audit)?;
+    validate_knowledge_weekly_audit(&mut audit)?;
     Ok(Some(audit))
 }
 
@@ -548,7 +548,7 @@ fn knowledge_weekly_payload(content: &str) -> Option<&str> {
     None
 }
 
-fn validate_knowledge_weekly_audit(audit: &KnowledgeWeeklyAudit) -> Result<()> {
+fn validate_knowledge_weekly_audit(audit: &mut KnowledgeWeeklyAudit) -> Result<()> {
     let start = chrono::DateTime::parse_from_rfc3339(&audit.window_start)
         .context("invalid knowledge weekly window_start")?;
     let end = chrono::DateTime::parse_from_rfc3339(&audit.window_end)
@@ -573,7 +573,7 @@ fn validate_knowledge_weekly_audit(audit: &KnowledgeWeeklyAudit) -> Result<()> {
         "knowledge weekly payload must contain exactly three sources"
     );
     let mut source_ids = HashSet::new();
-    for source in &audit.sources {
+    for source in &mut audit.sources {
         anyhow::ensure!(
             !source.source_id.is_empty()
                 && source.source_id.len() <= 64
@@ -584,7 +584,7 @@ fn validate_knowledge_weekly_audit(audit: &KnowledgeWeeklyAudit) -> Result<()> {
             "invalid knowledge weekly source_id"
         );
         anyhow::ensure!(
-            source_ids.insert(source.source_id.as_str()),
+            source_ids.insert(source.source_id.clone()),
             "knowledge weekly source IDs must be unique"
         );
         anyhow::ensure!(
@@ -616,13 +616,13 @@ fn validate_knowledge_weekly_audit(audit: &KnowledgeWeeklyAudit) -> Result<()> {
             "knowledge weekly error is too long"
         );
         let mut page_ids = HashSet::new();
-        for item in &source.items {
+        for item in &mut source.items {
             anyhow::ensure!(
                 !item.page_id.trim().is_empty() && item.page_id.len() <= 128,
                 "invalid knowledge weekly page_id"
             );
             anyhow::ensure!(
-                page_ids.insert(item.page_id.as_str()),
+                page_ids.insert(item.page_id.clone()),
                 "knowledge weekly page IDs must be unique per source"
             );
             anyhow::ensure!(
@@ -630,8 +630,19 @@ fn validate_knowledge_weekly_audit(audit: &KnowledgeWeeklyAudit) -> Result<()> {
                 "invalid knowledge weekly item title"
             );
             validate_public_url(&item.url, "knowledge weekly item URL")?;
-            let created = chrono::DateTime::parse_from_rfc3339(&item.created_at)
-                .context("invalid knowledge weekly item created_at")?;
+            // Models repeatedly reformat Notion created_time into
+            // "YYYY-MM-DD HH:MM:SS" (space, no zone). Coerce that shape back
+            // to RFC3339 before the window check, and rewrite the field so
+            // Admin Bot receives a clean timestamp rather than the mangled
+            // original.
+            let (normalized, created) = parse_notion_utc_timestamp(&item.created_at)
+                .with_context(|| {
+                    format!(
+                        "invalid knowledge weekly item created_at: expected RFC3339 with timezone, got '{}'",
+                        item.created_at.trim()
+                    )
+                })?;
+            item.created_at = normalized;
             anyhow::ensure!(
                 created >= start && created < end,
                 "knowledge weekly item created_at is outside the report window"
@@ -639,6 +650,86 @@ fn validate_knowledge_weekly_audit(audit: &KnowledgeWeeklyAudit) -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// Parse a Notion-originated UTC timestamp that a model may have lightly
+/// mangled while copying `created_time` into a knowledge weekly item.
+///
+/// Accepted forms, in order:
+/// 1. Strict RFC3339 (unchanged)
+/// 2. Space instead of `T` between date and time
+/// 3. Either of the above with a missing timezone, defaulting to `Z`
+///    (Notion `created_time` is always UTC)
+///
+/// On success the returned string is always a canonical RFC3339 value (UTC
+/// uses a trailing `Z`), so Admin Bot never sees the mangled original.
+///
+/// Date-only values and other ambiguous shapes are rejected. Window fields
+/// (`window_start` / `window_end` / `queried_at`) must stay on the strict
+/// parser: they require Asia/Taipei offsets, so inventing `Z` would be wrong.
+fn parse_notion_utc_timestamp(
+    raw: &str,
+) -> Result<(String, chrono::DateTime<chrono::FixedOffset>)> {
+    let trimmed = raw.trim();
+    anyhow::ensure!(
+        !trimmed.is_empty() && trimmed.contains(':'),
+        "timestamp is empty or date-only"
+    );
+
+    let mut candidates = Vec::with_capacity(3);
+    candidates.push(trimmed.to_string());
+
+    let mut with_t = None;
+    if trimmed.as_bytes().get(10) == Some(&b' ') {
+        let mut s = trimmed.to_string();
+        s.replace_range(10..11, "T");
+        with_t = Some(s.clone());
+        candidates.push(s);
+    }
+
+    // Only append Z to forms that already use `T`. Appending Z to a
+    // space-separated string can still parse on some chrono builds and would
+    // leave a non-canonical value in the rewritten field.
+    for base in [with_t, Some(trimmed.to_string())]
+        .into_iter()
+        .flatten()
+        .filter(|value| value.contains('T'))
+    {
+        if timestamp_missing_offset(&base) {
+            let mut with_z = base;
+            with_z.push('Z');
+            candidates.push(with_z);
+        }
+    }
+
+    for candidate in candidates {
+        if let Ok(dt) = chrono::DateTime::parse_from_rfc3339(&candidate) {
+            return Ok((canonicalize_rfc3339(dt), dt));
+        }
+    }
+    anyhow::bail!("unrecognized timestamp")
+}
+
+fn canonicalize_rfc3339(dt: chrono::DateTime<chrono::FixedOffset>) -> String {
+    // Keep subseconds when present so Admin Bot still sees Notion's millis;
+    // AutoSi omits the fractional part when it is zero.
+    if dt.offset().local_minus_utc() == 0 {
+        dt.with_timezone(&chrono::Utc)
+            .to_rfc3339_opts(chrono::SecondsFormat::AutoSi, true)
+    } else {
+        dt.to_rfc3339_opts(chrono::SecondsFormat::AutoSi, true)
+    }
+}
+
+fn timestamp_missing_offset(value: &str) -> bool {
+    if value.ends_with('Z') || value.ends_with('z') {
+        return false;
+    }
+    let Some(t_pos) = value.find('T') else {
+        return true;
+    };
+    let after_t = &value[t_pos + 1..];
+    !after_t.contains('+') && !after_t.chars().skip(8).any(|c| c == '-')
 }
 
 fn validate_public_url(value: &str, name: &str) -> Result<()> {
@@ -1405,6 +1496,90 @@ OPENAB_KNOWLEDGE_WEEKLY_V1
 "#;
 
         assert!(parse_knowledge_weekly_audit(payload).is_err());
+    }
+
+    #[test]
+    fn knowledge_weekly_normalizes_space_separated_created_at() {
+        // Regression for the 2026-09-19 payload_rejected incident: the model
+        // reformatted Notion created_time into "YYYY-MM-DD HH:MM:SS" (space,
+        // no timezone). Prompt-only guidance (migration 0023) did not stop it;
+        // coerce that shape to RFC3339 and rewrite the field before report.
+        let payload = r#"
+OPENAB_KNOWLEDGE_WEEKLY_V1
+{"window_start":"2026-09-08T00:00:00+08:00","window_end":"2026-09-15T00:00:00+08:00","queried_at":"2026-09-15T08:35:00+08:00","sources":[{"source_id":"github_ai_data_weekly","title":"GitHub AI & Data Weekly","url":"https://www.notion.so/source-a","status":"updated","items":[{"page_id":"page-a","title":"2026-09-14｜GitHub AI & Data Weekly","url":"https://www.notion.so/article-a","created_at":"2026-09-14 00:59:03"}]},{"source_id":"world_stories","title":"World Stories","url":"https://www.notion.so/source-b","status":"no_updates","items":[]},{"source_id":"weekly_reading_digest","title":"Weekly Reading Digest","url":"https://www.notion.so/source-c","status":"no_updates","items":[]}]}
+"#;
+
+        let audit = parse_knowledge_weekly_audit(payload).unwrap().unwrap();
+        assert_eq!(
+            audit.sources[0].items[0].created_at,
+            "2026-09-14T00:59:03Z"
+        );
+    }
+
+    #[test]
+    fn knowledge_weekly_normalizes_missing_z_created_at() {
+        let payload = r#"
+OPENAB_KNOWLEDGE_WEEKLY_V1
+{"window_start":"2026-09-08T00:00:00+08:00","window_end":"2026-09-15T00:00:00+08:00","queried_at":"2026-09-15T08:35:00+08:00","sources":[{"source_id":"source_a","title":"Source A","url":"https://www.notion.so/source-a","status":"updated","items":[{"page_id":"page-a","title":"Article A","url":"https://www.notion.so/article-a","created_at":"2026-09-14T00:59:03"}]},{"source_id":"source_b","title":"Source B","url":"https://www.notion.so/source-b","status":"no_updates","items":[]},{"source_id":"source_c","title":"Source C","url":"https://www.notion.so/source-c","status":"no_updates","items":[]}]}
+"#;
+
+        let audit = parse_knowledge_weekly_audit(payload).unwrap().unwrap();
+        assert_eq!(
+            audit.sources[0].items[0].created_at,
+            "2026-09-14T00:59:03Z"
+        );
+    }
+
+    #[test]
+    fn knowledge_weekly_rejects_date_only_created_at() {
+        let payload = r#"
+OPENAB_KNOWLEDGE_WEEKLY_V1
+{"window_start":"2026-09-08T00:00:00+08:00","window_end":"2026-09-15T00:00:00+08:00","queried_at":"2026-09-15T08:35:00+08:00","sources":[{"source_id":"source_a","title":"Source A","url":"https://www.notion.so/source-a","status":"updated","items":[{"page_id":"page-a","title":"Article A","url":"https://www.notion.so/article-a","created_at":"2026-09-14"}]},{"source_id":"source_b","title":"Source B","url":"https://www.notion.so/source-b","status":"no_updates","items":[]},{"source_id":"source_c","title":"Source C","url":"https://www.notion.so/source-c","status":"no_updates","items":[]}]}
+"#;
+
+        let err = parse_knowledge_weekly_audit(payload).unwrap_err().to_string();
+        assert!(
+            err.contains("expected RFC3339 with timezone"),
+            "error should name the contract, got: {err}"
+        );
+        assert!(
+            err.contains("2026-09-14"),
+            "error should include the bad value, got: {err}"
+        );
+    }
+
+    #[test]
+    fn parse_notion_utc_timestamp_keeps_explicit_offsets() {
+        let (normalized, dt) =
+            parse_notion_utc_timestamp("2026-08-20T12:00:00+08:00").unwrap();
+        assert_eq!(normalized, "2026-08-20T12:00:00+08:00");
+        assert_eq!(dt.offset().local_minus_utc(), 8 * 60 * 60);
+    }
+
+    #[test]
+    fn parse_notion_utc_timestamp_preserves_millis() {
+        let (normalized, _) =
+            parse_notion_utc_timestamp("2026-09-14T00:59:03.123Z").unwrap();
+        assert_eq!(normalized, "2026-09-14T00:59:03.123Z");
+    }
+
+    #[test]
+    fn knowledge_weekly_window_fields_stay_strict() {
+        // Lenient coerce (append Z) is only for Notion-originated item
+        // created_at. Window bounds require Asia/Taipei offsets; inventing Z
+        // would turn this into UTC midnight and wrongly pass or fail later
+        // checks. Missing timezone on window_start must remain a hard reject.
+        let missing_zone = r#"
+OPENAB_KNOWLEDGE_WEEKLY_V1
+{"window_start":"2026-09-08T00:00:00","window_end":"2026-09-15T00:00:00+08:00","queried_at":"2026-09-15T08:35:00+08:00","sources":[{"source_id":"source_a","title":"Source A","url":"https://www.notion.so/source-a","status":"no_updates","items":[]},{"source_id":"source_b","title":"Source B","url":"https://www.notion.so/source-b","status":"no_updates","items":[]},{"source_id":"source_c","title":"Source C","url":"https://www.notion.so/source-c","status":"no_updates","items":[]}]}
+"#;
+        let err = parse_knowledge_weekly_audit(missing_zone)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("invalid knowledge weekly window_start"),
+            "window_start must stay strict (no Z invent), got: {err}"
+        );
     }
 
     #[test]
