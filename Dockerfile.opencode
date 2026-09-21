@@ -42,11 +42,16 @@ RUN touch src/main.rs crates/openab-core/src/lib.rs crates/openab-gateway/src/li
 # The upstream fix landed in 1.17.0 (sst/opencode#30332,
 # "fix(opencode): generate reasoning variants for all OpenRouter models").
 # 1.17.3 is the latest 1.17.x verified by users to recover correctly.
+#
+# Hard floor as of 2026-09-21: 1.18.0. The opencode provider's free tier now
+# rejects older clients outright — every request came back
+# "OpenCode 1.18.0 or newer is required to use the free tier", which surfaces
+# as a 0-token empty turn, so the knowledge assistant could not run at all.
 FROM node:22-trixie-slim AS opencode-installer
 
 # Install opencode and keep only the executable for the runtime stage. Copying
 # the whole npm tree retains both the platform package and postinstall copy.
-ARG OPENCODE_VERSION=1.17.9
+ARG OPENCODE_VERSION=1.18.31
 RUN npm install -g opencode-ai@${OPENCODE_VERSION} --retry 3 \
     && test "$(opencode --version)" = "${OPENCODE_VERSION}"
 
