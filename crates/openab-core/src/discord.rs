@@ -1132,10 +1132,31 @@ fn parse_knowledge_card_envelope(content: &str) -> Option<KnowledgeCardEnvelope>
     // Agents occasionally explain or quote the card contract before emitting the
     // actual envelope. Prefer the final marker so a valid final payload is not
     // rejected because an earlier example left trailing content behind it.
-    let marker = lines
+    if let Some(marker) = lines
         .iter()
-        .rposition(|line| line.trim() == KNOWLEDGE_CARDS_PREFIX)?;
-    let payload = lines.get(marker + 1..)?.join("\n");
+        .rposition(|line| line.trim() == KNOWLEDGE_CARDS_PREFIX)
+    {
+        if let Some(payload) = lines.get(marker + 1..) {
+            if let Some(envelope) = parse_knowledge_card_payload(&payload.join("\n")) {
+                return Some(envelope);
+            }
+        }
+    }
+    // The marker is still the contract, but models drop it often enough that a
+    // whole scheduled run has been lost to one missing line — the payload was
+    // correct and simply went unrecognised, with no error anywhere. The envelope
+    // schema is strict (a closed `kind` set, plus validation downstream) and
+    // this only ever sees the agent's own output, never user input, so a message
+    // that is nothing but a valid envelope is safe to accept on its own.
+    let envelope = parse_knowledge_card_payload(content)?;
+    warn!(
+        kind = %envelope.kind,
+        "accepted a knowledge card payload that omitted the {KNOWLEDGE_CARDS_PREFIX} marker"
+    );
+    Some(envelope)
+}
+
+fn parse_knowledge_card_payload(payload: &str) -> Option<KnowledgeCardEnvelope> {
     let payload = payload
         .trim_start()
         .trim_start_matches("```json")
@@ -4881,9 +4902,25 @@ impl DiscordAdapter {
         Ok(Some(created.id))
     }
 
-    async fn report_scheduled_job_run(&self, content: &str) {
-        let Ok((envelope, _)) = parse_and_validate_knowledge_cards(content) else {
-            return;
+    async fn report_scheduled_job_run(&self, content: &str, channel_id: u64) {
+        let envelope = match parse_and_validate_knowledge_cards(content) {
+            Ok((envelope, _)) => envelope,
+            Err(reason) => {
+                // A scheduled run whose payload cannot be read produces nothing
+                // at all, and used to do so without a single line anywhere. Only
+                // say so when the content was trying to be a card, otherwise
+                // every ordinary reply would warn.
+                if content.contains("\"job_run\"") {
+                    warn!(reason, "scheduled job result could not be parsed");
+                    self.record_incident(
+                        crate::incident::IncidentKind::PayloadRejected,
+                        "scheduled job result could not be parsed",
+                        reason,
+                        channel_id,
+                    );
+                }
+                return;
+            }
         };
         let Some(run) = envelope.job_run else {
             return;
@@ -4894,6 +4931,12 @@ impl DiscordAdapter {
         };
         if let Err(error) = reporter.report_scheduled_job_run(&run).await {
             warn!(%error, job_id = %run.job_id, "failed to report scheduled job result");
+            self.record_incident(
+                crate::incident::IncidentKind::TelemetryFailed,
+                "reporting a scheduled job result to the Admin Bot failed",
+                &error.to_string(),
+                channel_id,
+            );
         }
         if envelope.articles.is_empty() {
             return;
@@ -4970,7 +5013,7 @@ impl ChatAdapter for DiscordAdapter {
                 message_id,
             });
         }
-        self.report_scheduled_job_run(content).await;
+        self.report_scheduled_job_run(content, ch_id).await;
         match self
             .send_knowledge_components_v2(ch_id, content, None)
             .await
@@ -5042,7 +5085,7 @@ impl ChatAdapter for DiscordAdapter {
                 message_id,
             });
         }
-        self.report_scheduled_job_run(content).await;
+        self.report_scheduled_job_run(content, ch_id).await;
         match self
             .send_knowledge_components_v2(ch_id, content, Some(msg_id))
             .await
@@ -15657,6 +15700,44 @@ mod tests {
         assert!(audit.contains("完整 pagination"));
         assert!(audit.contains("reading_list_epub_audit"));
         assert!(knowledge_reading_list_prompt("delete").is_none());
+    }
+
+    #[test]
+    fn a_card_payload_is_still_read_when_the_model_omits_the_marker() {
+        // 2026-09-21: the scheduled retention run produced a correct payload but
+        // no OPENAB_KNOWLEDGE_CARDS_V1 line, so it was never recognised, never
+        // reported, and landed in Discord as raw JSON with nothing logged. The
+        // marker stays the contract; this only stops one missing line from
+        // discarding an entire run.
+        let bare = concat!(
+            r#"{"kind":"retention","heading":"Knowledge Retention｜排程掃描","items":[],"#,
+            r#""job_run":{"job_id":"opencode-scheduled-source-retention","#,
+            r#""run_id":"retention-20260921-051338-7c41f2e9","#,
+            r#""started_at":"2026-09-21T05:13:38Z","finished_at":"2026-09-21T05:14:59Z","#,
+            r#""status":"success","note":"three sources scanned","#,
+            r#""metrics":{"sources_scanned":3,"items_scanned":54,"protected_items":35,"#,
+            r#""enqueued_items":0,"pending_items":0,"trash_due_items":0,"#,
+            r#""trashed_items":0,"failed_items":0}}}"#,
+        );
+        let envelope = parse_knowledge_card_envelope(bare).expect("bare envelope is accepted");
+        assert_eq!(envelope.kind, "retention");
+        assert_eq!(
+            envelope.job_run.expect("job_run survives").run_id,
+            "retention-20260921-051338-7c41f2e9"
+        );
+
+        // With the marker present it must keep taking the marker's payload, so
+        // a quoted example earlier in the message cannot win.
+        let with_marker = format!("here is an example\n{KNOWLEDGE_CARDS_PREFIX}\n{bare}");
+        assert_eq!(
+            parse_knowledge_card_envelope(&with_marker)
+                .expect("marker payload")
+                .kind,
+            "retention"
+        );
+
+        // Prose that merely mentions a card must still be ignored.
+        assert!(parse_knowledge_card_envelope("I will emit a retention card shortly.").is_none());
     }
 
     #[test]
