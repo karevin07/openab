@@ -2063,6 +2063,8 @@ async fn main() -> anyhow::Result<()> {
             triage_state: std::sync::Arc::new(tokio::sync::Mutex::new(triage_state)),
             triage_state_path: Some(triage_state_path),
             triage_watcher_started: std::sync::atomic::AtomicBool::new(false),
+            session_auto_close: discord_cfg.session_auto_close.clone(),
+            idle_closer_started: std::sync::atomic::AtomicBool::new(false),
         };
 
         let intents = GatewayIntents::GUILD_MESSAGES

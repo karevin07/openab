@@ -7,6 +7,7 @@ use crate::bot_turns::{BotTurnTracker, TurnAction, TurnSeverity, BOT_TURN_LIMIT_
 use crate::config::{
     resolve_project_action, AgentPresentationConfig, AllowBots, AllowUsers, CronJobConfig,
     DiscordIncidentTriageConfig, DiscordProjectActionConfig, DiscordProjectCommandConfig,
+    DiscordSessionAutoCloseConfig,
     DiscordProjectCommandRunner, SttConfig, PROJECT_COMMAND_RUN_CUSTOM_ID_PREFIX,
 };
 use crate::control_db::UiSurface;
@@ -5294,6 +5295,29 @@ impl ChatAdapter for DiscordAdapter {
 
 // --- Handler: serenity EventHandler that delegates to AdapterRouter ---
 
+/// Whether a retained session is safe to close unattended.
+///
+/// Deliberately the same predicate the weekly report uses to list idle
+/// candidates, so what gets closed automatically is exactly the set an operator
+/// was already being shown — a session that is busy, has work waiting, or has
+/// been handed off to a terminal is never eligible no matter how old it looks.
+pub(crate) fn idle_session_is_closable(
+    session: &SessionInventoryItem,
+    now: chrono::DateTime<chrono::Utc>,
+    idle_days: u32,
+) -> bool {
+    let Ok(last_activity) = chrono::DateTime::parse_from_rfc3339(&session.last_activity_at) else {
+        // An unreadable timestamp is not evidence of being idle.
+        return false;
+    };
+    let idle_for = now.signed_duration_since(last_activity.with_timezone(&chrono::Utc));
+    idle_for >= chrono::Duration::days(idle_days as i64)
+        && !matches!(session.state.as_str(), "queued" | "running" | "cursor")
+        && session.queued_messages == 0
+        && !session.prompt_in_flight
+        && !session.externally_detached
+}
+
 fn inventory_pool_state(state: SessionState) -> &'static str {
     match state {
         SessionState::Active => "active",
@@ -5676,6 +5700,10 @@ pub struct Handler {
     pub triage_state_path: Option<PathBuf>,
     /// Prevent duplicate triage loops when Discord reconnects and emits ready again.
     pub triage_watcher_started: AtomicBool,
+    /// Automatic closing of long-idle sessions. Absent leaves closing manual.
+    pub session_auto_close: Option<DiscordSessionAutoCloseConfig>,
+    /// Prevent duplicate closer loops when Discord reconnects and emits ready again.
+    pub idle_closer_started: AtomicBool,
 }
 
 pub(crate) struct DiscordCommandScope {
@@ -5718,6 +5746,112 @@ impl Handler {
                     warn!(%report_error, "failed to report session inventory");
                 }
                 tokio::time::sleep(std::time::Duration::from_secs(6 * 60 * 60)).await;
+            }
+        });
+    }
+
+    /// Close sessions that have sat idle past the configured threshold.
+    ///
+    /// Only ever enabled where a stale session has nothing left to lose — see
+    /// [`crate::config::DiscordSessionAutoCloseConfig`]. Every close is
+    /// announced, because a session disappearing without explanation is worse
+    /// than one lingering.
+    fn start_idle_session_closer(&self, http: Arc<Http>) {
+        let Some(config) = self.session_auto_close.clone() else {
+            return;
+        };
+        if !config.enabled {
+            return;
+        }
+        if self
+            .idle_closer_started
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            return;
+        }
+        let Some(source_id) = self
+            .admin_reporter
+            .as_ref()
+            .map(|reporter| reporter.source_id().to_string())
+        else {
+            warn!("idle session closer needs a report source id; not starting");
+            return;
+        };
+        let router = self.router.clone();
+        let task_registry = self.task_registry.clone();
+        let dispatcher = self.dispatcher.clone();
+
+        info!(
+            idle_days = config.idle_days,
+            max_per_run = config.max_per_run,
+            "idle session closer started"
+        );
+
+        tokio::spawn(async move {
+            loop {
+                // Offset from the inventory reporter's own cadence so the two
+                // are not always contending for the same pool read.
+                tokio::time::sleep(std::time::Duration::from_secs(6 * 60 * 60)).await;
+                let (sessions, complete, _) =
+                    collect_session_inventory(&source_id, &http, &router, &task_registry, &dispatcher)
+                        .await;
+                // An incomplete snapshot means some session could not be
+                // described; closing from a partial view risks closing the
+                // wrong thing. The weekly report refuses to list candidates for
+                // the same reason.
+                if !complete {
+                    warn!("skipping idle session close: the inventory snapshot is incomplete");
+                    continue;
+                }
+                let now = chrono::Utc::now();
+                let closable: Vec<&SessionInventoryItem> = sessions
+                    .iter()
+                    .filter(|session| idle_session_is_closable(session, now, config.idle_days))
+                    .take(config.max_per_run)
+                    .collect();
+                if closable.is_empty() {
+                    continue;
+                }
+                let mut closed = Vec::new();
+                for session in closable {
+                    let key = format!("discord:{}", session.thread_id);
+                    match router.pool().reset_session(&key).await {
+                        Ok(()) => {
+                            info!(
+                                thread_id = session.thread_id,
+                                idle_days = config.idle_days,
+                                "closed an idle session"
+                            );
+                            closed.push(session.thread_id);
+                        }
+                        Err(error) => {
+                            warn!(%error, thread_id = session.thread_id, "failed to close an idle session");
+                        }
+                    }
+                }
+                if closed.is_empty() {
+                    continue;
+                }
+                let listed = closed
+                    .iter()
+                    .map(|thread_id| format!("<#{thread_id}>"))
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                let notice = format!(
+                    "🧹 已自動關閉 {} 個閒置超過 {} 天的 session：\n{listed}\n\
+                     Discord thread 與訊息都保留；之後在該 thread 發言會開新的 session。",
+                    closed.len(),
+                    config.idle_days,
+                );
+                if let Ok(channel_id) = config.channel_id.parse::<u64>() {
+                    if let Err(error) = ChannelId::new(channel_id)
+                        .send_message(&http, CreateMessage::new().content(notice))
+                        .await
+                    {
+                        warn!(%error, "failed to announce automatically closed sessions");
+                    }
+                }
             }
         });
     }
@@ -7210,6 +7344,7 @@ impl EventHandler for Handler {
         self.reconcile_project_channels(&ctx).await;
         self.start_session_inventory_reporter(ctx.http.clone());
         self.start_incident_triage_watcher(self.discord_adapter(&ctx));
+        self.start_idle_session_closer(ctx.http.clone());
 
         // Running jobs are restored as Waiting during load. Resume one FIFO
         // worker per repository only after Discord and project routing are ready.
@@ -15700,6 +15835,54 @@ mod tests {
         assert!(audit.contains("完整 pagination"));
         assert!(audit.contains("reading_list_epub_audit"));
         assert!(knowledge_reading_list_prompt("delete").is_none());
+    }
+
+    #[test]
+    fn only_genuinely_idle_and_genuinely_quiet_sessions_are_closable() {
+        fn session() -> SessionInventoryItem {
+            SessionInventoryItem {
+                thread_id: 1,
+                state: "suspended".into(),
+                last_activity_at: "2026-08-20T00:00:00Z".into(),
+                queued_messages: 0,
+                prompt_in_flight: false,
+                externally_detached: false,
+                title: "idle thread".into(),
+                workspace_alias: String::new(),
+            }
+        }
+        let now = chrono::DateTime::parse_from_rfc3339("2026-09-22T00:00:00Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+
+        // 33 days idle and quiet.
+        assert!(idle_session_is_closable(&session(), now, 20));
+        // Same session, threshold not yet reached.
+        assert!(!idle_session_is_closable(&session(), now, 40));
+
+        // Every exclusion the weekly report applies has to hold here too —
+        // these are sessions that look old but are not actually finished.
+        for mutate in [
+            (|s: &mut SessionInventoryItem| s.state = "running".into())
+                as fn(&mut SessionInventoryItem),
+            |s: &mut SessionInventoryItem| s.state = "queued".into(),
+            |s: &mut SessionInventoryItem| s.state = "cursor".into(),
+            |s: &mut SessionInventoryItem| s.queued_messages = 1,
+            |s: &mut SessionInventoryItem| s.prompt_in_flight = true,
+            |s: &mut SessionInventoryItem| s.externally_detached = true,
+        ] {
+            let mut busy = session();
+            mutate(&mut busy);
+            assert!(
+                !idle_session_is_closable(&busy, now, 20),
+                "a session with outstanding work must never be closed automatically"
+            );
+        }
+
+        // An unreadable timestamp is not evidence of being idle.
+        let mut undated = session();
+        undated.last_activity_at = "whenever".into();
+        assert!(!idle_session_is_closable(&undated, now, 20));
     }
 
     #[test]

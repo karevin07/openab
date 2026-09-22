@@ -526,6 +526,8 @@ pub struct DiscordConfig {
     /// Optional automatic failure triage. Recording incidents is unconditional;
     /// this only governs whether a diagnostic agent session is opened for them.
     pub incident_triage: Option<DiscordIncidentTriageConfig>,
+    /// Optional automatic closing of long-idle sessions.
+    pub session_auto_close: Option<DiscordSessionAutoCloseConfig>,
     /// Allow administrators with Manage Channels to provision private project
     /// channels through `/project`. Disabled by default.
     #[serde(default)]
@@ -692,6 +694,39 @@ fn default_incident_triage_cooldown_secs() -> u64 {
 
 fn default_incident_triage_max_per_day() -> u32 {
     6
+}
+
+/// Close sessions that have sat idle past `idle_days`.
+///
+/// Enable this only where a stale session has nothing left to lose. The
+/// knowledge runtime qualifies because opencode prunes its own session store
+/// after seven days, so a mapping idle for weeks already points at content that
+/// is gone — closing it discards a pointer, not a conversation. The coding
+/// runtime does not: its sessions carry workspace context and Cursor chat
+/// checkpoints that are still resumable, so it leaves this unset and closing
+/// stays a human decision in the Session Manager.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct DiscordSessionAutoCloseConfig {
+    /// Close idle sessions. When false nothing is ever closed.
+    #[serde(default)]
+    pub enabled: bool,
+    /// Idle days before a session becomes eligible.
+    #[serde(default = "default_session_auto_close_idle_days")]
+    pub idle_days: u32,
+    /// Channel that receives the "closed N sessions" notice. Closing silently
+    /// would be worse than not closing at all.
+    pub channel_id: String,
+    /// Ceiling per sweep, so a misconfiguration cannot clear everything at once.
+    #[serde(default = "default_session_auto_close_max_per_run")]
+    pub max_per_run: usize,
+}
+
+fn default_session_auto_close_idle_days() -> u32 {
+    20
+}
+
+fn default_session_auto_close_max_per_run() -> usize {
+    5
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
