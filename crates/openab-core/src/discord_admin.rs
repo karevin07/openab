@@ -611,10 +611,12 @@ fn validate_knowledge_weekly_audit(audit: &mut KnowledgeWeeklyAudit) -> Result<(
                 "failed sources require an error and no items"
             ),
         }
-        anyhow::ensure!(
-            source.error.chars().count() <= 300,
-            "knowledge weekly error is too long"
-        );
+        // Models explain partial/failed sources at length (2026-10-06: 718
+        // chars). Rejecting the payload would also drop every healthy
+        // source's result, so clip the explanation instead of failing.
+        if source.error.chars().count() > 300 {
+            source.error = source.error.chars().take(299).collect::<String>() + "…";
+        }
         let mut page_ids = HashSet::new();
         for item in &mut source.items {
             anyhow::ensure!(
@@ -1528,6 +1530,24 @@ OPENAB_KNOWLEDGE_WEEKLY_V1
             audit.sources[0].items[0].created_at,
             "2026-09-14T00:59:03Z"
         );
+    }
+
+    #[test]
+    fn knowledge_weekly_clips_overlong_error() {
+        // Regression for the 2026-10-06 payload_rejected incident: a 718-char
+        // partial-source explanation made the whole weekly report vanish.
+        let long_error = "x".repeat(718);
+        let payload = format!(
+            r#"
+OPENAB_KNOWLEDGE_WEEKLY_V1
+{{"window_start":"2026-09-29T00:00:00+08:00","window_end":"2026-10-06T00:00:00+08:00","queried_at":"2026-10-06T08:31:52+08:00","sources":[{{"source_id":"source_a","title":"Source A","url":"https://www.notion.so/source-a","status":"partial","error":"{long_error}","items":[]}},{{"source_id":"source_b","title":"Source B","url":"https://www.notion.so/source-b","status":"no_updates","items":[]}},{{"source_id":"source_c","title":"Source C","url":"https://www.notion.so/source-c","status":"no_updates","items":[]}}]}}
+"#
+        );
+
+        let audit = parse_knowledge_weekly_audit(&payload).unwrap().unwrap();
+        let error = &audit.sources[0].error;
+        assert_eq!(error.chars().count(), 300);
+        assert!(error.ends_with('…'));
     }
 
     #[test]
