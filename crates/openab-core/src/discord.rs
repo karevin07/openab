@@ -2829,6 +2829,18 @@ impl ConfigScope {
     }
 }
 
+fn config_refresh_row(scope: ConfigScope, category: &str) -> CreateActionRow {
+    let scope = match scope {
+        ConfigScope::Thread => "thread",
+        ConfigScope::Default => "default",
+    };
+    CreateActionRow::Buttons(vec![CreateButton::new(format!(
+        "acp_cfgrefresh:{scope}:{category}"
+    ))
+    .label("🔄 重新整理清單")
+    .style(ButtonStyle::Secondary)])
+}
+
 fn config_category_label(category: &str) -> &'static str {
     match category {
         "agent" => "模式",
@@ -7669,12 +7681,10 @@ impl EventHandler for Handler {
                 self.handle_pagination(&ctx, &comp).await;
             }
             Interaction::Component(comp) if comp.data.custom_id == "oab_cfg:model" => {
-                let response = self
-                    .config_picker_response(comp.channel_id.get(), "model", ConfigScope::Thread)
-                    .await;
-                if let Err(e) = comp.create_response(&ctx.http, response).await {
-                    tracing::error!(error = %e, "failed to open model picker");
-                }
+                self.handle_config_open_button(&ctx, &comp, "model").await;
+            }
+            Interaction::Component(comp) if comp.data.custom_id.starts_with("acp_cfgrefresh:") => {
+                self.handle_config_refresh_button(&ctx, &comp).await;
             }
             _ => {}
         }
@@ -13704,7 +13714,9 @@ impl Handler {
     ///
     /// Reads the pool's stored view, never the live connection, so it answers
     /// within Discord's interaction deadline even while a turn is running, and
-    /// works before the thread has a session.
+    /// works before the thread has a session. When the stored model list is
+    /// stale (for example right after a provider login) the response is
+    /// deferred while a short-lived agent reports the current list.
     async fn handle_config_command(
         &self,
         ctx: &Context,
@@ -13712,51 +13724,155 @@ impl Handler {
         category: &str,
         scope: ConfigScope,
     ) {
-        let response = self
-            .config_picker_response(cmd.channel_id.get(), category, scope)
-            .await;
-        if let Err(e) = cmd.create_response(&ctx.http, response).await {
-            tracing::error!(error = %e, category, "failed to respond to slash command");
+        let channel_id = cmd.channel_id.get();
+        if !self.router.pool().config_catalog_stale() {
+            let card = self.config_picker_card(channel_id, category, scope, None).await;
+            let response = CreateInteractionResponse::Message(card.into_message().ephemeral(true));
+            if let Err(e) = cmd.create_response(&ctx.http, response).await {
+                tracing::error!(error = %e, category, "failed to respond to slash command");
+            }
+            return;
+        }
+        if let Err(e) = cmd.defer_ephemeral(&ctx.http).await {
+            tracing::error!(error = %e, category, "failed to defer config picker");
+            return;
+        }
+        let note = self.refresh_config_catalog_note(false).await;
+        let card = self.config_picker_card(channel_id, category, scope, note).await;
+        if let Err(e) = cmd.edit_response(&ctx.http, card.into_edit()).await {
+            tracing::error!(error = %e, category, "failed to show config picker");
         }
     }
 
-    async fn config_picker_response(
+    /// Open the picker from a button (`oab_cfg:model` on the session card).
+    async fn handle_config_open_button(
+        &self,
+        ctx: &Context,
+        comp: &serenity::model::application::ComponentInteraction,
+        category: &str,
+    ) {
+        let channel_id = comp.channel_id.get();
+        if !self.router.pool().config_catalog_stale() {
+            let card = self
+                .config_picker_card(channel_id, category, ConfigScope::Thread, None)
+                .await;
+            let response = CreateInteractionResponse::Message(card.into_message().ephemeral(true));
+            if let Err(e) = comp.create_response(&ctx.http, response).await {
+                tracing::error!(error = %e, "failed to open model picker");
+            }
+            return;
+        }
+        if let Err(e) = comp.defer_ephemeral(&ctx.http).await {
+            tracing::error!(error = %e, "failed to defer model picker");
+            return;
+        }
+        let note = self.refresh_config_catalog_note(false).await;
+        let card = self
+            .config_picker_card(channel_id, category, ConfigScope::Thread, note)
+            .await;
+        if let Err(e) = comp.edit_response(&ctx.http, card.into_edit()).await {
+            tracing::error!(error = %e, "failed to show model picker");
+        }
+    }
+
+    /// `🔄 重新整理清單` in an open picker: always asks the agent again.
+    async fn handle_config_refresh_button(
+        &self,
+        ctx: &Context,
+        comp: &serenity::model::application::ComponentInteraction,
+    ) {
+        // acp_cfgrefresh:{thread|default}:{category}
+        let parts: Vec<&str> = comp.data.custom_id.splitn(3, ':').collect();
+        let (scope, category) = match parts.as_slice() {
+            [_, "thread", category] => (ConfigScope::Thread, *category),
+            [_, "default", category] => (ConfigScope::Default, *category),
+            _ => return,
+        };
+        if !matches!(category, "model" | "agent") {
+            return;
+        }
+        if let Err(e) = comp
+            .create_response(&ctx.http, CreateInteractionResponse::Acknowledge)
+            .await
+        {
+            tracing::error!(error = %e, "failed to acknowledge config refresh");
+            return;
+        }
+        let note = self
+            .refresh_config_catalog_note(true)
+            .await
+            .or_else(|| Some("🔄 已重新取得最新清單。".to_string()));
+        let card = self
+            .config_picker_card(comp.channel_id.get(), category, scope, note)
+            .await;
+        if let Err(e) = comp.edit_response(&ctx.http, card.into_edit()).await {
+            tracing::error!(error = %e, "failed to show refreshed config picker");
+        }
+    }
+
+    /// Refresh the stored model list; returns a note only when it failed, so
+    /// the picker can say it is showing the older list.
+    async fn refresh_config_catalog_note(&self, force: bool) -> Option<String> {
+        match self.router.pool().refresh_config_catalog(force).await {
+            Ok(()) => None,
+            Err(error) => {
+                tracing::warn!(%error, "failed to refresh config catalog");
+                Some(format!(
+                    "⚠️ 無法取得最新清單（{}），以下是先前存下的清單。",
+                    truncate_for_discord(&error.to_string(), 200)
+                ))
+            }
+        }
+    }
+
+    async fn config_picker_card(
         &self,
         channel_id: u64,
         category: &str,
         scope: ConfigScope,
-    ) -> CreateInteractionResponse {
+        note: Option<String>,
+    ) -> InteractionCard {
         let options = self.config_options_for_scope(channel_id, scope).await;
         let label = config_category_label(category);
         let current = crate::acp::config_prefs::current_label(&options, category)
             .unwrap_or_else(|| "未知".to_string());
-        match Self::build_config_components(&options, category, None, scope) {
-            Some(rows) => {
-                let (title, description) = match scope {
-                    ConfigScope::Thread => (
-                        format!("⚙️ 選擇這個 thread 的 {label}"),
-                        format!(
-                            "目前：**{current}**\n選擇後套用到這個 thread，之後 reset、重啟或新的 session 都會沿用。"
+        let refresh = config_refresh_row(scope, category);
+        let (title, description, colour, mut components) =
+            match Self::build_config_components(&options, category, None, scope) {
+                Some(rows) => {
+                    let (title, description) = match scope {
+                        ConfigScope::Thread => (
+                            format!("⚙️ 選擇這個 thread 的 {label}"),
+                            format!(
+                                "目前：**{current}**\n選擇後套用到這個 thread，之後 reset、重啟或新的 session 都會沿用。"
+                            ),
                         ),
-                    ),
-                    ConfigScope::Default => (
-                        format!("⚙️ 選擇預設 {label}"),
-                        format!(
-                            "目前預設：**{current}**\n只影響之後建立、且沒有自選 {label} 的 session；進行中的 thread 不受影響。"
+                        ConfigScope::Default => (
+                            format!("⚙️ 選擇預設 {label}"),
+                            format!(
+                                "目前預設：**{current}**\n只影響之後建立、且沒有自選 {label} 的 session；進行中的 thread 不受影響。"
+                            ),
                         ),
+                    };
+                    (title, description, 0x5865F2, rows)
+                }
+                None => (
+                    format!("⚠️ 還沒有可選的 {label}"),
+                    format!(
+                        "Bot 還沒取得 {label} 清單。按下「🔄 重新整理清單」，或在任一 task thread 傳送一則訊息後再試。"
                     ),
-                };
-                CreateInteractionResponse::Message(
-                    command_feedback_card(title, description, 0x5865F2).components(rows),
-                )
-            }
-            None => CreateInteractionResponse::Message(command_feedback_card(
-                format!("⚠️ 還沒有可選的 {label}"),
-                format!(
-                    "Bot 還沒取得 {label} 清單。先在任一 task thread 傳送一則訊息，讓 agent 回報可用選項後再試。"
+                    0xFEE75C,
+                    Vec::new(),
                 ),
-                0xFEE75C,
-            )),
+            };
+        components.push(refresh);
+        InteractionCard {
+            content: note.unwrap_or_default(),
+            embed: CreateEmbed::new()
+                .title(title)
+                .description(description)
+                .colour(colour),
+            components,
         }
     }
 
@@ -14748,9 +14864,12 @@ impl Handler {
             .await;
         let label = config_category_label(category);
         let response = match Self::build_config_components(&options, category, Some(page), scope) {
-            Some(rows) => CreateInteractionResponse::UpdateMessage(
-                CreateInteractionResponseMessage::new().components(rows),
-            ),
+            Some(mut rows) => {
+                rows.push(config_refresh_row(scope, category));
+                CreateInteractionResponse::UpdateMessage(
+                    CreateInteractionResponseMessage::new().components(rows),
+                )
+            }
             None => CreateInteractionResponse::UpdateMessage(
                 CreateInteractionResponseMessage::new()
                     .content(format!("⚠️ 目前沒有可選的 {label}。"))

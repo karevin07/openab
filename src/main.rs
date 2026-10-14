@@ -602,6 +602,13 @@ async fn main() -> anyhow::Result<()> {
             .saturating_add(cfg.pool.hung_grace_secs),
         cfg.pool.default_config_options,
     );
+    let pool_inner = pool_inner.with_config_catalog_watch(
+        cfg.pool
+            .config_catalog_watch_files
+            .iter()
+            .map(std::path::PathBuf::from)
+            .collect(),
+    );
     #[cfg(feature = "discord")]
     let pool_inner = pool_inner.with_control_db(control_db.clone())?;
     // Facade session wiring: only when the facade is actually serving. With no `[mcp]` there is

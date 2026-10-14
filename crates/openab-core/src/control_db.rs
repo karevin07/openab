@@ -305,15 +305,16 @@ impl ControlDb {
         Ok(())
     }
 
-    /// The last config option list an agent reported, as JSON. Lets Discord
-    /// offer a model picker before a thread has a live session.
-    pub fn load_config_catalog(&self) -> anyhow::Result<Option<String>> {
+    /// The last config option list an agent reported, as JSON, with the UTC
+    /// time it was saved (`YYYY-MM-DD HH:MM:SS`). Lets Discord offer a model
+    /// picker before a thread has a live session, and tell when it is stale.
+    pub fn load_config_catalog(&self) -> anyhow::Result<Option<(String, String)>> {
         Ok(self
             .lock()
             .query_row(
-                "SELECT payload FROM agent_config_catalog WHERE singleton = 1",
+                "SELECT payload, updated_at FROM agent_config_catalog WHERE singleton = 1",
                 [],
-                |row| row.get::<_, String>(0),
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
             )
             .optional()?)
     }
@@ -1029,7 +1030,10 @@ mod tests {
         assert_eq!(preferences["discord:1"]["model"], "b");
         assert_eq!(preferences["discord:1"]["mode"], "plan");
         assert_eq!(db.load_config_defaults().unwrap()["model"], "c");
-        assert_eq!(db.load_config_catalog().unwrap().as_deref(), Some("[]"));
+        assert_eq!(
+            db.load_config_catalog().unwrap().map(|(payload, _)| payload).as_deref(),
+            Some("[]")
+        );
     }
 
     #[test]

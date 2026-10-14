@@ -65,6 +65,12 @@ pub(crate) struct ConfigPreferences {
     pub catalog: Vec<ConfigOption>,
     /// Last options each live session reported.
     pub views: HashMap<String, Vec<ConfigOption>>,
+    /// When `catalog` was last taken from the agent.
+    pub catalog_refreshed_at: Option<std::time::SystemTime>,
+    /// When each live session's agent process started. A session started
+    /// before the catalog was refreshed may not know models added since (for
+    /// example after a new provider login).
+    pub session_started: HashMap<String, std::time::SystemTime>,
 }
 
 impl ConfigPreferences {
@@ -100,7 +106,21 @@ impl ConfigPreferences {
         live: bool,
     ) -> Vec<ConfigOption> {
         let (mut options, desired) = match self.views.get(thread).filter(|_| live) {
-            Some(options) => (options.clone(), self.desired(thread, file_defaults, false)),
+            Some(options) => {
+                let mut options = options.clone();
+                // Offer models the catalog learned after this agent started;
+                // choosing one reloads the session on the next message.
+                for option in &mut options {
+                    if let Some(known) = self.catalog.iter().find(|c| c.id == option.id) {
+                        for value in &known.options {
+                            if !offers(option, &value.value) {
+                                option.options.push(value.clone());
+                            }
+                        }
+                    }
+                }
+                (options, self.desired(thread, file_defaults, false))
+            }
             None => (self.base(), self.desired(thread, file_defaults, true)),
         };
         overlay(&mut options, &desired);
@@ -117,6 +137,30 @@ impl ConfigPreferences {
         desired.extend(self.defaults.iter().map(|(k, v)| (k.clone(), v.clone())));
         overlay(&mut options, &desired);
         options
+    }
+
+    /// Does `thread`'s stored choice need an agent restart to take effect?
+    /// True when the live agent lacks a value the newer catalog offers.
+    pub fn choice_needs_reload(&self, thread: &str, live: &[ConfigOption]) -> bool {
+        let started = self.session_started.get(thread);
+        let refreshed = self.catalog_refreshed_at.as_ref();
+        if !matches!((started, refreshed), (Some(s), Some(r)) if s < r) {
+            return false;
+        }
+        let Some(choices) = self.thread.get(thread) else {
+            return false;
+        };
+        choices.iter().any(|(id, value)| {
+            let Some(option) = live.iter().find(|o| &o.id == id) else {
+                return false;
+            };
+            !offers(option, value)
+                && self
+                    .catalog
+                    .iter()
+                    .find(|c| &c.id == id)
+                    .is_some_and(|c| offers(c, value))
+        })
     }
 
     /// The fresh-session catalog, or any live session's list before the first
@@ -242,6 +286,39 @@ mod tests {
             current_label(&prefs.view("t", &HashMap::new(), false), "model").as_deref(),
             Some("B")
         );
+    }
+
+    #[test]
+    fn live_session_offers_newer_catalog_models_and_reloads_for_them() {
+        use std::time::{Duration, SystemTime};
+        let mut catalog = model_option("a");
+        catalog.options.push(ConfigOptionValue {
+            value: "gpt".into(),
+            name: "GPT".into(),
+            description: None,
+        });
+        let started = SystemTime::now() - Duration::from_secs(60);
+        let mut prefs = ConfigPreferences {
+            catalog: vec![catalog],
+            catalog_refreshed_at: Some(SystemTime::now()),
+            ..Default::default()
+        };
+        prefs.views.insert("t".into(), vec![model_option("a")]);
+        prefs.session_started.insert("t".into(), started);
+        let view = prefs.view("t", &HashMap::new(), true);
+        assert!(validate_choice(&view, "model", "gpt").is_ok());
+
+        let live = vec![model_option("a")];
+        assert!(!prefs.choice_needs_reload("t", &live));
+        prefs
+            .thread
+            .entry("t".into())
+            .or_default()
+            .insert("model".into(), "gpt".into());
+        assert!(prefs.choice_needs_reload("t", &live));
+        // An agent started after the refresh is not reloaded again.
+        prefs.session_started.insert("t".into(), SystemTime::now());
+        assert!(!prefs.choice_needs_reload("t", &live));
     }
 
     #[test]

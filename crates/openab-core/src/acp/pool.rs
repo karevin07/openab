@@ -76,6 +76,11 @@ pub struct SessionPool {
     /// mutex on purpose: every access is a short in-memory lookup, so Discord
     /// can render the current model without waiting on a busy connection.
     config_prefs: std::sync::Mutex<ConfigPreferences>,
+    /// See `PoolConfig::config_catalog_watch_files`.
+    catalog_watch_files: Vec<PathBuf>,
+    /// Serialises catalog refreshes so two pickers opened together spawn one
+    /// agent, not two.
+    catalog_refresh_gate: Mutex<()>,
     #[cfg(feature = "acp-mcp")]
     session_registrar: Option<Arc<dyn crate::acp_mcp::SessionTokenRegistrar>>,
     #[cfg(feature = "acp-mcp")]
@@ -410,6 +415,8 @@ impl SessionPool {
             handoff_dir,
             default_config_options,
             config_prefs: std::sync::Mutex::new(ConfigPreferences::default()),
+            catalog_watch_files: Vec::new(),
+            catalog_refresh_gate: Mutex::new(()),
             #[cfg(feature = "acp-mcp")]
             session_registrar: None,
             #[cfg(feature = "acp-mcp")]
@@ -429,9 +436,15 @@ impl SessionPool {
             let prefs = self.config_prefs.get_mut().unwrap_or_else(|e| e.into_inner());
             prefs.thread = db.load_config_preferences()?;
             prefs.defaults = db.load_config_defaults()?;
-            if let Some(payload) = db.load_config_catalog()? {
+            if let Some((payload, updated_at)) = db.load_config_catalog()? {
                 match serde_json::from_str(&payload) {
-                    Ok(catalog) => prefs.catalog = catalog,
+                    Ok(catalog) => {
+                        prefs.catalog = catalog;
+                        prefs.catalog_refreshed_at =
+                            chrono::NaiveDateTime::parse_from_str(&updated_at, "%Y-%m-%d %H:%M:%S")
+                                .ok()
+                                .map(|at| at.and_utc().into());
+                    }
                     Err(error) => warn!(%error, "ignoring unreadable config catalog"),
                 }
             }
@@ -446,31 +459,119 @@ impl SessionPool {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
+    pub fn with_config_catalog_watch(mut self, files: Vec<PathBuf>) -> Self {
+        self.catalog_watch_files = files;
+        self
+    }
+
     /// Remember the options a live session reported. A fresh session's list,
     /// taken before any choice is applied, also becomes the catalog.
     fn record_config_view(&self, thread_id: &str, options: &[ConfigOption], fresh: bool) {
-        let catalog_payload = {
+        self.prefs()
+            .views
+            .insert(thread_id.to_string(), options.to_vec());
+        if fresh {
+            self.store_config_catalog(options);
+        }
+    }
+
+    /// Replace the catalog with a list taken from a fresh agent session.
+    fn store_config_catalog(&self, options: &[ConfigOption]) {
+        if options.is_empty() {
+            return;
+        }
+        {
             let mut prefs = self.prefs();
-            prefs.views.insert(thread_id.to_string(), options.to_vec());
-            if !fresh || options.is_empty() {
-                return;
-            }
-            let payload = serde_json::to_string(options).ok();
-            let unchanged = serde_json::to_string(&prefs.catalog).ok() == payload;
             prefs.catalog = options.to_vec();
-            if unchanged {
-                return;
-            }
-            payload
-        };
+            prefs.catalog_refreshed_at = Some(std::time::SystemTime::now());
+        }
+        // Saved every time, unchanged or not: the row's timestamp is what
+        // `config_catalog_stale` compares against after a restart.
         #[cfg(feature = "discord")]
-        if let (Some(db), Some(payload)) = (&self.control_db, catalog_payload) {
+        if let (Some(db), Ok(payload)) = (&self.control_db, serde_json::to_string(options)) {
             if let Err(error) = db.save_config_catalog(&payload) {
                 warn!(%error, "failed to persist config catalog");
             }
         }
-        #[cfg(not(feature = "discord"))]
-        let _ = catalog_payload;
+    }
+
+    /// Is the stored model list likely out of date? True when there is none,
+    /// it is older than six hours, or a watched file (such as the agent's
+    /// provider credentials) changed after it was taken.
+    pub fn config_catalog_stale(&self) -> bool {
+        const MAX_AGE: std::time::Duration = std::time::Duration::from_secs(6 * 60 * 60);
+        let (empty, refreshed_at) = {
+            let prefs = self.prefs();
+            (prefs.catalog.is_empty(), prefs.catalog_refreshed_at)
+        };
+        let Some(refreshed_at) = refreshed_at else {
+            return true;
+        };
+        if empty || refreshed_at.elapsed().map_or(true, |age| age > MAX_AGE) {
+            return true;
+        }
+        self.catalog_watch_files.iter().any(|path| {
+            std::fs::metadata(path)
+                .and_then(|meta| meta.modified())
+                .is_ok_and(|modified| modified > refreshed_at)
+        })
+    }
+
+    /// Ask a short-lived agent process for its current option list. This
+    /// opens one empty agent session, so callers only do it when the list is
+    /// stale or the user asked for it.
+    pub async fn refresh_config_catalog(&self, force: bool) -> Result<()> {
+        let _gate = self.catalog_refresh_gate.lock().await;
+        if !force && !self.config_catalog_stale() {
+            return Ok(());
+        }
+        let workdir = self.config.working_dir.clone();
+        let probe = async {
+            let mut conn = AcpConnection::spawn(
+                &self.config.command,
+                &self.config.args,
+                &workdir,
+                &self.config.env,
+                &self.config.inherit_env,
+            )
+            .await?;
+            conn.initialize().await?;
+            conn.session_new(&workdir).await?;
+            Ok::<_, anyhow::Error>(conn.config_options.clone())
+        };
+        let options = tokio::time::timeout(std::time::Duration::from_secs(90), probe)
+            .await
+            .map_err(|_| anyhow!("timed out asking the agent for its options"))??;
+        if options.is_empty() {
+            return Err(anyhow!("the agent reported no config options"));
+        }
+        info!(count = options.len(), "refreshed config catalog");
+        self.store_config_catalog(&options);
+        Ok(())
+    }
+
+    /// Take a live connection out of the pool, keeping its session id so the
+    /// next message resumes the same conversation in a new agent process.
+    async fn suspend_for_reload(
+        &self,
+        thread_id: &str,
+        expected: &Arc<Mutex<AcpConnection>>,
+        session_id: Option<String>,
+    ) {
+        let mut state = self.state.write().await;
+        if remove_if_same_handle(&mut state.active, thread_id, expected).is_none() {
+            return;
+        }
+        state.cancel_handles.remove(thread_id);
+        state.activity.remove(thread_id);
+        state.pgids.remove(thread_id);
+        #[cfg(feature = "acp-mcp")]
+        revoke_facade_token_for_key(&mut state, thread_id, self.session_registrar.as_ref());
+        if let Some(sid) = session_id {
+            state.persisted.insert(thread_id.to_string(), sid.clone());
+            state.suspended.insert(thread_id.to_string(), sid);
+        }
+        self.save_mapping(&state.persisted);
     }
 
     /// Bring `conn` in line with the stored choices for `thread_id`. Values
@@ -551,6 +652,16 @@ impl SessionPool {
         let Ok(mut conn) = conn.try_lock() else {
             return Ok(ConfigChoiceOutcome::NextTurn);
         };
+        // The live agent predates this value (e.g. a provider login since it
+        // started); the next message reloads the session to pick it up.
+        let live_offers = conn
+            .config_options
+            .iter()
+            .find(|option| option.id == config_id)
+            .is_some_and(|option| option.options.iter().any(|v| v.value == value));
+        if !live_offers {
+            return Ok(ConfigChoiceOutcome::NextTurn);
+        }
         // The choice is already stored; a failure here only delays it.
         let options = match conn.set_config_option(config_id, value).await {
             Ok(options) => options,
@@ -828,22 +939,36 @@ impl SessionPool {
 
         let had_existing = existing.is_some();
         let mut saved_session_id = saved_session_id;
-        if let Some(conn) = existing.clone() {
+        if let Some(handle) = existing {
             // Never await the existing connection's mutex here: we hold the
             // per-thread creating gate, so blocking on a hung connection would
             // permanently jam ALL future messages for this thread_id (F1).
             // Lock held = busy streaming = alive (same convention as
             // has_active_session); cleanup_idle owns hung recovery.
-            let Ok(mut conn) = conn.try_lock() else {
+            let Ok(mut conn) = handle.try_lock() else {
                 return Ok(false);
             };
             if conn.alive() {
-                // A choice made while the previous turn was running lands
-                // here, before the next prompt is sent.
-                self.apply_config_choices(thread_id, &mut conn, false).await;
-                return Ok(false);
-            }
-            if saved_session_id.is_none() {
+                let needs_reload = self
+                    .prefs()
+                    .choice_needs_reload(thread_id, &conn.config_options);
+                if !needs_reload {
+                    // A choice made while the previous turn was running lands
+                    // here, before the next prompt is sent.
+                    self.apply_config_choices(thread_id, &mut conn, false).await;
+                    return Ok(false);
+                }
+                // The chosen model is newer than this agent process (for
+                // example a provider login since it started). Restart the
+                // agent and resume the same session so it can see it.
+                info!(thread_id = %crate::redact::redact_session_ids(thread_id), "reloading session to apply a newly available config choice");
+                let sid = conn.acp_session_id.clone();
+                drop(conn);
+                self.suspend_for_reload(thread_id, &handle, sid.clone()).await;
+                if saved_session_id.is_none() {
+                    saved_session_id = sid;
+                }
+            } else if saved_session_id.is_none() {
                 saved_session_id = conn.acp_session_id.clone();
             }
         }
@@ -1004,6 +1129,9 @@ impl SessionPool {
             ));
         }
 
+        self.prefs()
+            .session_started
+            .insert(thread_id.to_string(), std::time::SystemTime::now());
         if resumed {
             self.apply_config_choices(thread_id, &mut new_conn, false)
                 .await;

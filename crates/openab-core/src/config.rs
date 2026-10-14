@@ -2340,6 +2340,11 @@ pub struct PoolConfig {
     /// Sent via `session/set_config_option` after each `session/new`.
     #[serde(default)]
     pub default_config_options: HashMap<String, String>,
+    /// Files whose change makes the stored model list stale, such as the
+    /// agent's provider credentials. The next model picker refreshes the list
+    /// from the agent instead of waiting for a new session.
+    #[serde(default)]
+    pub config_catalog_watch_files: Vec<String>,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
@@ -2633,6 +2638,7 @@ impl Default for PoolConfig {
             liveness_check_secs: default_liveness_check_secs(),
             hung_grace_secs: default_hung_grace_secs(),
             default_config_options: HashMap::new(),
+            config_catalog_watch_files: Vec::new(),
         }
     }
 }
