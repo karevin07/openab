@@ -41,6 +41,9 @@ pub struct TaskRecord {
     /// without migration because the field defaults to `None`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_prompt: Option<String>,
+    /// Display name of the model the latest turn ran with.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }
@@ -223,6 +226,19 @@ impl TaskRegistry {
         })
     }
 
+    /// Record the model a turn runs with. Returns `None` when it is unchanged,
+    /// so callers can skip redrawing the Task Status Card.
+    pub fn set_model(&self, thread_id: u64, model: &str) -> anyhow::Result<Option<TaskRecord>> {
+        if self
+            .task_for_thread(thread_id)
+            .is_some_and(|task| task.model.as_deref() == Some(model))
+        {
+            return Ok(None);
+        }
+        self.update(thread_id, |task| task.model = Some(model.to_string()))
+            .map(Some)
+    }
+
     pub fn record_prompt(&self, thread_id: u64, prompt: &str) -> anyhow::Result<TaskRecord> {
         self.update(thread_id, |task| {
             let prompt = prompt.trim();
@@ -359,6 +375,7 @@ mod tests {
             queued_messages: 0,
             last_error: None,
             last_prompt: None,
+            model: None,
             created_at: now,
             updated_at: now,
         }

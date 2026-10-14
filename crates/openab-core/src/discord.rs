@@ -1,5 +1,7 @@
 use crate::acp::protocol::{ConfigOption, UsageReport};
-use crate::acp::{ContentBlock, SessionPoolEntry, SessionSnapshot, SessionState};
+use crate::acp::{
+    ConfigChoiceOutcome, ContentBlock, SessionPoolEntry, SessionSnapshot, SessionState,
+};
 use crate::adapter::{
     AdapterRouter, ChannelRef, ChatAdapter, MessageRef, SenderContext, TaskLifecycleEvent,
 };
@@ -384,6 +386,7 @@ fn session_control_card(
     channel_id: u64,
     task: Option<&TaskRecord>,
     note: Option<String>,
+    config: &[ConfigOption],
 ) -> InteractionCard {
     let (state, colour, guidance) =
         session_state_presentation(snapshot.state, snapshot.externally_detached);
@@ -392,12 +395,20 @@ fn session_control_card(
         .as_deref()
         .map(|path| workspace_display(path, aliases))
         .unwrap_or_else(|| "_Not assigned_".to_string());
-    let embed = CreateEmbed::new()
+    let mut embed = CreateEmbed::new()
         .title("🧵 Session 狀態與控制")
         .description(guidance)
         .colour(colour)
         .field("狀態", format!("**{state}**"), true)
-        .field("Workspace", workspace, true)
+        .field("Workspace", workspace, true);
+    let model = crate::acp::config_prefs::current_label(config, "model");
+    if let Some(model) = &model {
+        embed = embed.field("Model", inline_code(model), true);
+    }
+    if let Some(mode) = crate::acp::config_prefs::current_label(config, "agent") {
+        embed = embed.field("模式", inline_code(&mode), true);
+    }
+    let embed = embed
         .field(
             "Discord thread",
             inline_code(&channel_id.to_string()),
@@ -423,6 +434,13 @@ fn session_control_card(
                 .label(format!("↗ Prepare for {}", agent_presentation().name))
                 .style(ButtonStyle::Primary)
                 .disabled(!has_session || snapshot.externally_detached),
+        );
+    }
+    if model.is_some() {
+        buttons.push(
+            CreateButton::new("oab_cfg:model")
+                .label("⚙️ Model")
+                .style(ButtonStyle::Secondary),
         );
     }
     buttons.extend([
@@ -455,8 +473,9 @@ fn session_control_message(
     channel_id: u64,
     task: Option<&TaskRecord>,
     note: Option<String>,
+    config: &[ConfigOption],
 ) -> CreateInteractionResponseMessage {
-    session_control_card(snapshot, aliases, channel_id, task, note).into_message()
+    session_control_card(snapshot, aliases, channel_id, task, note, config).into_message()
 }
 
 fn session_control_edit(
@@ -465,8 +484,9 @@ fn session_control_edit(
     channel_id: u64,
     task: Option<&TaskRecord>,
     note: Option<String>,
+    config: &[ConfigOption],
 ) -> EditInteractionResponse {
-    session_control_card(snapshot, aliases, channel_id, task, note).into_edit()
+    session_control_card(snapshot, aliases, channel_id, task, note, config).into_edit()
 }
 
 fn project_access_display(binding: &ProjectBinding) -> String {
@@ -553,8 +573,11 @@ fn task_status_embed(task: &TaskRecord) -> CreateEmbed {
             inline_code(&format!("@{}", task.workspace_alias)),
             true,
         )
-        .field("Started by", format!("<@{}>", task.created_by), true)
-        .field("Task thread", format!("<#{}>", task.thread_id), false);
+        .field("Started by", format!("<@{}>", task.created_by), true);
+    if let Some(model) = task.model.as_deref() {
+        embed = embed.field("Model", inline_code(model), true);
+    }
+    embed = embed.field("Task thread", format!("<#{}>", task.thread_id), false);
     if task.queued_messages > 0 {
         embed = embed.field(
             "訊息 Queue",
@@ -2517,7 +2540,12 @@ fn development_slash_commands() -> Vec<CreateCommand> {
         .add_option(CreateCommandOption::new(
             CommandOptionType::SubCommand,
             "model",
-            "選擇目前工作階段使用的 AI model",
+            "查看或選擇這個 thread 使用的 AI model",
+        ))
+        .add_option(CreateCommandOption::new(
+            CommandOptionType::SubCommand,
+            "model-default",
+            "查看或選擇新 session 的預設 AI model",
         ))
         .add_option(CreateCommandOption::new(
             CommandOptionType::SubCommand,
@@ -2767,6 +2795,44 @@ fn apply_knowledge_command_profile(
         vec![knowledge_slash_command(), knowledge_session_slash_command()]
     } else {
         default_commands
+    }
+}
+
+/// Which choice a config picker edits: this thread's, or the bot-wide default.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ConfigScope {
+    Thread,
+    Default,
+}
+
+impl ConfigScope {
+    fn select_prefix(self) -> &'static str {
+        match self {
+            Self::Thread => "acp_config_",
+            Self::Default => "acp_cfgdef_",
+        }
+    }
+
+    fn page_prefix(self) -> &'static str {
+        match self {
+            Self::Thread => "acp_pg",
+            Self::Default => "acp_pgdef",
+        }
+    }
+
+    fn from_page_prefix(prefix: &str) -> Option<Self> {
+        match prefix {
+            "acp_pg" => Some(Self::Thread),
+            "acp_pgdef" => Some(Self::Default),
+            _ => None,
+        }
+    }
+}
+
+fn config_category_label(category: &str) -> &'static str {
+    match category {
+        "agent" => "模式",
+        _ => "model",
     }
 }
 
@@ -5181,6 +5247,12 @@ impl ChatAdapter for DiscordAdapter {
         let Some(previous) = task else {
             return Ok(());
         };
+        if let TaskLifecycleEvent::ModelResolved { model } = &event {
+            if let Some(task) = registry.set_model(previous.thread_id, model)? {
+                self.refresh_task_ui(&task).await?;
+            }
+            return Ok(());
+        }
         let post_queue_notice =
             matches!(&event, TaskLifecycleEvent::Enqueued) && should_post_queue_notice(&previous);
         let task = match event {
@@ -5188,7 +5260,9 @@ impl ChatAdapter for DiscordAdapter {
             TaskLifecycleEvent::Started { batch_size } => {
                 registry.start_turn(thread_id, batch_size)?
             }
-            TaskLifecycleEvent::SessionOpened => unreachable!(),
+            TaskLifecycleEvent::SessionOpened | TaskLifecycleEvent::ModelResolved { .. } => {
+                unreachable!()
+            }
             TaskLifecycleEvent::Finished => registry.finish_turn(thread_id, None)?,
             TaskLifecycleEvent::Failed { message } => {
                 registry.finish_turn(thread_id, Some(truncate_for_discord(&message, 900)))?
@@ -7408,11 +7482,15 @@ impl EventHandler for Handler {
                         self.handle_knowledge_sessions_command(&ctx, &cmd).await;
                     }
                     Some("model") => {
-                        self.handle_config_command(&ctx, &cmd, "model", "model")
+                        self.handle_config_command(&ctx, &cmd, "model", ConfigScope::Thread)
+                            .await;
+                    }
+                    Some("model-default") => {
+                        self.handle_config_command(&ctx, &cmd, "model", ConfigScope::Default)
                             .await;
                     }
                     Some("agent") => {
-                        self.handle_config_command(&ctx, &cmd, "agent", "agent")
+                        self.handle_config_command(&ctx, &cmd, "agent", ConfigScope::Thread)
                             .await;
                     }
                     Some("stop") => self.handle_cancel_command(&ctx, &cmd).await,
@@ -7578,11 +7656,25 @@ impl EventHandler for Handler {
             Interaction::Modal(modal) if modal.data.custom_id.starts_with("oab_queue_replace:") => {
                 self.handle_queue_replace_modal(&ctx, &modal).await;
             }
-            Interaction::Component(comp) if comp.data.custom_id.starts_with("acp_config_") => {
+            Interaction::Component(comp)
+                if comp.data.custom_id.starts_with("acp_config_")
+                    || comp.data.custom_id.starts_with("acp_cfgdef_") =>
+            {
                 self.handle_config_select(&ctx, &comp).await;
             }
-            Interaction::Component(comp) if comp.data.custom_id.starts_with("acp_pg:") => {
+            Interaction::Component(comp)
+                if comp.data.custom_id.starts_with("acp_pg:")
+                    || comp.data.custom_id.starts_with("acp_pgdef:") =>
+            {
                 self.handle_pagination(&ctx, &comp).await;
+            }
+            Interaction::Component(comp) if comp.data.custom_id == "oab_cfg:model" => {
+                let response = self
+                    .config_picker_response(comp.channel_id.get(), "model", ConfigScope::Thread)
+                    .await;
+                if let Err(e) = comp.create_response(&ctx.http, response).await {
+                    tracing::error!(error = %e, "failed to open model picker");
+                }
             }
             _ => {}
         }
@@ -8179,6 +8271,7 @@ impl Handler {
                 queued_messages: 0,
                 last_error: None,
                 last_prompt: None,
+                model: None,
                 created_at: now,
                 updated_at: now,
             })
@@ -11124,6 +11217,7 @@ impl Handler {
                 .session_snapshot(&scope.session_key)
                 .await;
             let task = self.task_registry.task_for_thread(cmd.channel_id.get());
+            let config = self.router.pool().config_view(&scope.session_key).await;
             let response = CreateInteractionResponse::Message(
                 session_control_message(
                     &snapshot,
@@ -11131,6 +11225,7 @@ impl Handler {
                     cmd.channel_id.get(),
                     task.as_ref(),
                     None,
+                    &config,
                 )
                 .ephemeral(true),
             );
@@ -11416,6 +11511,7 @@ impl Handler {
                 comp.channel_id.get(),
                 None,
                 note,
+                &self.router.pool().config_view(&scope.session_key).await,
             ),
         };
         if let Err(error) = comp.edit_response(&ctx.http, message).await {
@@ -13486,10 +13582,9 @@ impl Handler {
         options: &[ConfigOption],
         category: &str,
         page: usize,
+        scope: ConfigScope,
     ) -> Option<CreateSelectMenu> {
-        let opt = options
-            .iter()
-            .find(|o| o.category.as_deref() == Some(category))?;
+        let opt = crate::acp::config_prefs::find_category(options, category)?;
 
         // Put current selection first so it always lands on page 0,
         // then fill remaining slots in original order.
@@ -13531,24 +13626,19 @@ impl Handler {
             .unwrap_or(&opt.current_value);
         let total_pages = sorted.len().div_ceil(SELECT_MENU_PAGE_SIZE);
         let placeholder = if total_pages > 1 {
-            format!(
-                "Current: {} (page {}/{})",
-                current_name,
-                page + 1,
-                total_pages
-            )
+            format!("目前：{} （第 {}/{} 頁）", current_name, page + 1, total_pages)
         } else {
-            format!("Current: {}", current_name)
+            format!("目前：{}", current_name)
         };
 
         Some(
             CreateSelectMenu::new(
-                format!("acp_config_{}", opt.id),
+                format!("{}{}", scope.select_prefix(), opt.id),
                 CreateSelectMenuKind::String {
                     options: menu_options,
                 },
             )
-            .placeholder(placeholder),
+            .placeholder(truncate_for_discord(&placeholder, SELECT_OPTION_TEXT_MAX)),
         )
     }
 
@@ -13557,15 +13647,17 @@ impl Handler {
         category: &str,
         page: usize,
         total_pages: usize,
+        scope: ConfigScope,
     ) -> Option<CreateActionRow> {
         if total_pages <= 1 {
             return None;
         }
-        let prev = CreateButton::new(format!("acp_pg:{}:{}", category, page.saturating_sub(1)))
+        let prefix = scope.page_prefix();
+        let prev = CreateButton::new(format!("{prefix}:{category}:{}", page.saturating_sub(1)))
             .label("◀")
             .style(ButtonStyle::Secondary)
             .disabled(page == 0);
-        let next = CreateButton::new(format!("acp_pg:{}:{}", category, page + 1))
+        let next = CreateButton::new(format!("{prefix}:{category}:{}", page + 1))
             .label("▶")
             .style(ButtonStyle::Secondary)
             .disabled(page + 1 >= total_pages);
@@ -13577,64 +13669,94 @@ impl Handler {
     }
 
     /// Build the full component rows (select menu + optional pagination) for a config category.
-    /// When `page` is `None`, auto-selects the page containing the current value.
+    /// When `page` is `None`, opens on page 0, which always holds the current value.
     fn build_config_components(
         options: &[ConfigOption],
         category: &str,
         page: Option<usize>,
+        scope: ConfigScope,
     ) -> Option<Vec<CreateActionRow>> {
-        let opt = options
-            .iter()
-            .find(|o| o.category.as_deref() == Some(category))?;
+        let opt = crate::acp::config_prefs::find_category(options, category)?;
         let total_pages = opt.options.len().div_ceil(SELECT_MENU_PAGE_SIZE);
-        let page = match page {
-            Some(p) => p.min(total_pages.saturating_sub(1)),
-            None => opt
-                .options
-                .iter()
-                .position(|o| o.value == opt.current_value)
-                .map(|i| i / SELECT_MENU_PAGE_SIZE)
-                .unwrap_or(0),
-        };
+        let page = page.unwrap_or(0).min(total_pages.saturating_sub(1));
 
-        let select = Self::build_config_select(options, category, page)?;
+        let select = Self::build_config_select(options, category, page, scope)?;
         let mut rows = vec![CreateActionRow::SelectMenu(select)];
-        if let Some(buttons) = Self::build_pagination_buttons(category, page, total_pages) {
+        if let Some(buttons) = Self::build_pagination_buttons(category, page, total_pages, scope) {
             rows.push(buttons);
         }
         Some(rows)
     }
 
+    async fn config_options_for_scope(&self, channel_id: u64, scope: ConfigScope) -> Vec<ConfigOption> {
+        match scope {
+            ConfigScope::Thread => {
+                self.router
+                    .pool()
+                    .config_view(&format!("discord:{channel_id}"))
+                    .await
+            }
+            ConfigScope::Default => self.router.pool().config_default_view(),
+        }
+    }
+
+    /// `/session model`, `/session agent`, `/session model-default`.
+    ///
+    /// Reads the pool's stored view, never the live connection, so it answers
+    /// within Discord's interaction deadline even while a turn is running, and
+    /// works before the thread has a session.
     async fn handle_config_command(
         &self,
         ctx: &Context,
         cmd: &serenity::model::application::CommandInteraction,
         category: &str,
-        label: &str,
+        scope: ConfigScope,
     ) {
-        let thread_key = format!("discord:{}", cmd.channel_id.get());
-        let config_options = self.router.pool().get_config_options(&thread_key).await;
-
-        let response = match Self::build_config_components(&config_options, category, None) {
-            Some(rows) => CreateInteractionResponse::Message(
-                command_feedback_card(
-                    "⚙️ Session settings",
-                    format!("Select the {label} for this session."),
-                    0x5865F2,
-                )
-                .components(rows),
-            ),
-            None => CreateInteractionResponse::Message(
-                command_feedback_card(
-                    "⚠️ Session not ready",
-                    format!("No {label} options are available. Start a conversation by mentioning the Bot first."),
-                    0xFEE75C,
-                ),
-            ),
-        };
-
+        let response = self
+            .config_picker_response(cmd.channel_id.get(), category, scope)
+            .await;
         if let Err(e) = cmd.create_response(&ctx.http, response).await {
             tracing::error!(error = %e, category, "failed to respond to slash command");
+        }
+    }
+
+    async fn config_picker_response(
+        &self,
+        channel_id: u64,
+        category: &str,
+        scope: ConfigScope,
+    ) -> CreateInteractionResponse {
+        let options = self.config_options_for_scope(channel_id, scope).await;
+        let label = config_category_label(category);
+        let current = crate::acp::config_prefs::current_label(&options, category)
+            .unwrap_or_else(|| "未知".to_string());
+        match Self::build_config_components(&options, category, None, scope) {
+            Some(rows) => {
+                let (title, description) = match scope {
+                    ConfigScope::Thread => (
+                        format!("⚙️ 選擇這個 thread 的 {label}"),
+                        format!(
+                            "目前：**{current}**\n選擇後套用到這個 thread，之後 reset、重啟或新的 session 都會沿用。"
+                        ),
+                    ),
+                    ConfigScope::Default => (
+                        format!("⚙️ 選擇預設 {label}"),
+                        format!(
+                            "目前預設：**{current}**\n只影響之後建立、且沒有自選 {label} 的 session；進行中的 thread 不受影響。"
+                        ),
+                    ),
+                };
+                CreateInteractionResponse::Message(
+                    command_feedback_card(title, description, 0x5865F2).components(rows),
+                )
+            }
+            None => CreateInteractionResponse::Message(command_feedback_card(
+                format!("⚠️ 還沒有可選的 {label}"),
+                format!(
+                    "Bot 還沒取得 {label} 清單。先在任一 task thread 傳送一則訊息，讓 agent 回報可用選項後再試。"
+                ),
+                0xFEE75C,
+            )),
         }
     }
 
@@ -14495,13 +14617,14 @@ impl Handler {
         ctx: &Context,
         comp: &serenity::model::application::ComponentInteraction,
     ) {
-        let config_id = comp
-            .data
-            .custom_id
-            .strip_prefix("acp_config_")
-            .unwrap_or("")
-            .to_string();
-
+        let custom_id = comp.data.custom_id.as_str();
+        let (scope, config_id) = if let Some(id) = custom_id.strip_prefix("acp_cfgdef_") {
+            (ConfigScope::Default, id.to_string())
+        } else if let Some(id) = custom_id.strip_prefix("acp_config_") {
+            (ConfigScope::Thread, id.to_string())
+        } else {
+            return;
+        };
         if config_id.is_empty() {
             return;
         }
@@ -14514,33 +14637,62 @@ impl Handler {
             _ => return,
         };
 
-        let thread_key = format!("discord:{}", comp.channel_id.get());
+        let channel_id = comp.channel_id.get();
+        let thread_key = format!("discord:{channel_id}");
+        let pool = self.router.pool();
+        let name_in = |options: &[ConfigOption]| {
+            options
+                .iter()
+                .find(|o| o.id == config_id)
+                .and_then(|o| o.options.iter().find(|v| v.value == selected_value))
+                .map(|v| v.name.clone())
+                .unwrap_or_else(|| selected_value.clone())
+        };
 
-        let result = self
-            .router
-            .pool()
-            .set_config_option(&thread_key, &config_id, &selected_value)
-            .await;
-
-        let response_msg = match result {
-            Ok(updated_options) => {
-                let display_name = updated_options
-                    .iter()
-                    .find(|o| o.id == config_id)
-                    .and_then(|o| o.options.iter().find(|v| v.value == selected_value))
-                    .map(|v| v.name.as_str())
-                    .unwrap_or(&selected_value);
-                format!("✅ Switched to **{}**", display_name)
-            }
-            Err(e) => {
-                tracing::error!(error = %e, "failed to set config option");
-                format!("❌ Failed to switch: {}", e)
+        let response_msg = match scope {
+            ConfigScope::Thread => match pool
+                .choose_config(&thread_key, &config_id, &selected_value)
+                .await
+            {
+                Ok(outcome) => {
+                    let options = pool.config_view(&thread_key).await;
+                    let name = name_in(&options);
+                    if config_id == "model" {
+                        self.show_task_model(ctx, channel_id, &name).await;
+                    }
+                    match outcome {
+                        ConfigChoiceOutcome::Applied => format!("✅ 已切換為 **{name}**。"),
+                        ConfigChoiceOutcome::NextTurn => format!(
+                            "✅ 已改為 **{name}**。目前這一輪不受影響，下一則訊息開始使用。"
+                        ),
+                        ConfigChoiceOutcome::NextSession => {
+                            format!("✅ 已改為 **{name}**，下一個 session 開始時套用。")
+                        }
+                    }
+                }
+                Err(e) => {
+                    tracing::error!(error = %e, "failed to set config option");
+                    format!("❌ 無法切換：{e}")
+                }
+            },
+            ConfigScope::Default => {
+                match pool.choose_default_config(&config_id, &selected_value) {
+                    Ok(()) => format!(
+                        "✅ 預設已改為 **{}**。之後沒有自選的新 session 會使用它；進行中的 thread 不受影響。",
+                        name_in(&pool.config_default_view())
+                    ),
+                    Err(e) => {
+                        tracing::error!(error = %e, "failed to set default config option");
+                        format!("❌ 無法更新預設：{e}")
+                    }
+                }
             }
         };
 
         let response = CreateInteractionResponse::UpdateMessage(
             CreateInteractionResponseMessage::new()
                 .content(response_msg)
+                .embeds(vec![])
                 .components(vec![]),
         );
 
@@ -14549,17 +14701,39 @@ impl Handler {
         }
     }
 
+    /// Show a newly chosen model on the thread's Task Status Card right away
+    /// instead of after the next turn.
+    async fn show_task_model(&self, ctx: &Context, thread_id: u64, model: &str) {
+        let task = match self.task_registry.set_model(thread_id, model) {
+            Ok(Some(task)) => task,
+            Ok(None) => return,
+            Err(error) => {
+                tracing::debug!(%error, thread_id, "no task record to show the chosen model on");
+                return;
+            }
+        };
+        let Some(message_id) = task.status_message_id else {
+            return;
+        };
+        if let Err(error) = ChannelId::new(task.thread_id)
+            .edit_message(&ctx.http, MessageId::new(message_id), task_status_edit(&task))
+            .await
+        {
+            tracing::warn!(%error, thread_id, "failed to refresh Task Status after model change");
+        }
+    }
+
     async fn handle_pagination(
         &self,
         ctx: &Context,
         comp: &serenity::model::application::ComponentInteraction,
     ) {
-        // Parse custom_id format: acp_pg:{category}:{page}
+        // Parse custom_id format: acp_pg:{category}:{page} / acp_pgdef:{category}:{page}
         let parts: Vec<&str> = comp.data.custom_id.splitn(3, ':').collect();
-        let (category, page) = match parts.as_slice() {
-            [_, cat, pg] => match pg.parse::<usize>() {
-                Ok(p) => (*cat, p),
-                Err(_) => return,
+        let (scope, category, page) = match parts.as_slice() {
+            [prefix, cat, pg] => match (ConfigScope::from_page_prefix(prefix), pg.parse::<usize>()) {
+                (Some(scope), Ok(p)) => (scope, *cat, p),
+                _ => return,
             },
             _ => return,
         };
@@ -14569,18 +14743,18 @@ impl Handler {
             return;
         }
 
-        let thread_key = format!("discord:{}", comp.channel_id.get());
-        let config_options = self.router.pool().get_config_options(&thread_key).await;
-
-        let response = match Self::build_config_components(&config_options, category, Some(page)) {
+        let options = self
+            .config_options_for_scope(comp.channel_id.get(), scope)
+            .await;
+        let label = config_category_label(category);
+        let response = match Self::build_config_components(&options, category, Some(page), scope) {
             Some(rows) => CreateInteractionResponse::UpdateMessage(
-                CreateInteractionResponseMessage::new()
-                    .content(format!("🔧 Select a {category}:"))
-                    .components(rows),
+                CreateInteractionResponseMessage::new().components(rows),
             ),
             None => CreateInteractionResponse::UpdateMessage(
                 CreateInteractionResponseMessage::new()
-                    .content(format!("⚠️ No {category} options available."))
+                    .content(format!("⚠️ 目前沒有可選的 {label}。"))
+                    .embeds(vec![])
                     .components(vec![]),
             ),
         };
@@ -15560,6 +15734,7 @@ mod tests {
             queued_messages: 0,
             last_error: (state == TaskState::Failed).then(|| "agent exited".into()),
             last_prompt: last_prompt.map(str::to_string),
+            model: None,
             created_at: now,
             updated_at: now,
         }
@@ -15658,7 +15833,14 @@ mod tests {
         for available in ["manage", "status", "stop", "close"] {
             assert!(rendered.contains(&format!(r#""name":"{available}""#)));
         }
-        for development_only in ["model", "agent", "reset", "attach", "detach"] {
+        for development_only in [
+            "model",
+            "model-default",
+            "agent",
+            "reset",
+            "attach",
+            "detach",
+        ] {
             assert!(!rendered.contains(&format!(r#""name":"{development_only}""#)));
         }
 
@@ -15741,7 +15923,16 @@ mod tests {
 
         let rendered = value.to_string();
         for grouped in [
-            "model", "agent", "stop", "stop-all", "reset", "usage", "auth", "export", "remind",
+            "model",
+            "model-default",
+            "agent",
+            "stop",
+            "stop-all",
+            "reset",
+            "usage",
+            "auth",
+            "export",
+            "remind",
         ] {
             assert!(
                 rendered.contains(&format!(r#""name":"{grouped}""#)),
@@ -17003,6 +17194,7 @@ mod tests {
                 running.thread_id,
                 Some(&running),
                 None,
+                &[],
             )
             .into_message(),
         )

@@ -1020,6 +1020,11 @@ pub trait DispatchTarget: Send + Sync + 'static {
     /// Destroy the session for `session_key` (used to rollback on directive failure).
     async fn reset_session(&self, session_key: &str);
 
+    /// Display name of the model the session for `session_key` runs with.
+    async fn session_model_label(&self, _session_key: &str) -> Option<String> {
+        None
+    }
+
     /// Drive one ACP turn with the pre-packed `content_blocks`.
     #[allow(clippy::too_many_arguments)]
     async fn stream_prompt_blocks(
@@ -1062,6 +1067,11 @@ impl DispatchTarget for AdapterRouter {
 
     async fn reset_session(&self, session_key: &str) {
         let _ = self.pool().reset_session(session_key).await;
+    }
+
+    async fn session_model_label(&self, session_key: &str) -> Option<String> {
+        let options = self.pool().config_view(session_key).await;
+        crate::acp::config_prefs::current_label(&options, "model")
     }
 
     async fn stream_prompt_blocks(
@@ -2044,6 +2054,14 @@ async fn dispatch_batch(
             .await
         {
             warn!(%error, "failed to report opened session");
+        }
+    }
+    if let Some(model) = target.session_model_label(&session_key).await {
+        if let Err(error) = adapter
+            .update_task_lifecycle(thread_channel, TaskLifecycleEvent::ModelResolved { model })
+            .await
+        {
+            warn!(%error, "failed to report session model");
         }
     }
 

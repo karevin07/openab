@@ -486,6 +486,8 @@ pub enum TaskLifecycleEvent {
     Enqueued,
     Started { batch_size: usize },
     SessionOpened,
+    /// The session for this turn is ready; `model` is the model it runs with.
+    ModelResolved { model: String },
     Finished,
     Failed { message: String },
 }

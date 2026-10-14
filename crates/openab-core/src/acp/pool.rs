@@ -1,3 +1,4 @@
+use crate::acp::config_prefs::{validate_choice, ConfigPreferences};
 use crate::acp::connection::{AcpConnection, SessionActivity};
 use crate::acp::protocol::ConfigOption;
 use crate::config::AgentConfig;
@@ -71,6 +72,10 @@ pub struct SessionPool {
     control_db: Option<crate::control_db::ControlDb>,
     handoff_dir: PathBuf,
     default_config_options: HashMap<String, String>,
+    /// Durable model/mode choices and the last reported option lists. A std
+    /// mutex on purpose: every access is a short in-memory lookup, so Discord
+    /// can render the current model without waiting on a busy connection.
+    config_prefs: std::sync::Mutex<ConfigPreferences>,
     #[cfg(feature = "acp-mcp")]
     session_registrar: Option<Arc<dyn crate::acp_mcp::SessionTokenRegistrar>>,
     #[cfg(feature = "acp-mcp")]
@@ -86,6 +91,17 @@ pub enum SessionState {
     Suspended,
     Persisted,
     None,
+}
+
+/// Whether a stored config choice already reached the agent.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConfigChoiceOutcome {
+    /// Applied to the idle live session.
+    Applied,
+    /// A turn is running; applied before the next message is sent.
+    NextTurn,
+    /// No live session; applied when the next session starts or resumes.
+    NextSession,
 }
 
 /// Read-only session metadata used by platform status commands.
@@ -393,6 +409,7 @@ impl SessionPool {
             control_db: None,
             handoff_dir,
             default_config_options,
+            config_prefs: std::sync::Mutex::new(ConfigPreferences::default()),
             #[cfg(feature = "acp-mcp")]
             session_registrar: None,
             #[cfg(feature = "acp-mcp")]
@@ -408,8 +425,157 @@ impl SessionPool {
         state.suspended = persisted.clone();
         state.persisted = persisted;
         state.session_workdirs = session_workdirs;
+        {
+            let prefs = self.config_prefs.get_mut().unwrap_or_else(|e| e.into_inner());
+            prefs.thread = db.load_config_preferences()?;
+            prefs.defaults = db.load_config_defaults()?;
+            if let Some(payload) = db.load_config_catalog()? {
+                match serde_json::from_str(&payload) {
+                    Ok(catalog) => prefs.catalog = catalog,
+                    Err(error) => warn!(%error, "ignoring unreadable config catalog"),
+                }
+            }
+        }
         self.control_db = Some(db);
         Ok(self)
+    }
+
+    fn prefs(&self) -> std::sync::MutexGuard<'_, ConfigPreferences> {
+        self.config_prefs
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// Remember the options a live session reported. A fresh session's list,
+    /// taken before any choice is applied, also becomes the catalog.
+    fn record_config_view(&self, thread_id: &str, options: &[ConfigOption], fresh: bool) {
+        let catalog_payload = {
+            let mut prefs = self.prefs();
+            prefs.views.insert(thread_id.to_string(), options.to_vec());
+            if !fresh || options.is_empty() {
+                return;
+            }
+            let payload = serde_json::to_string(options).ok();
+            let unchanged = serde_json::to_string(&prefs.catalog).ok() == payload;
+            prefs.catalog = options.to_vec();
+            if unchanged {
+                return;
+            }
+            payload
+        };
+        #[cfg(feature = "discord")]
+        if let (Some(db), Some(payload)) = (&self.control_db, catalog_payload) {
+            if let Err(error) = db.save_config_catalog(&payload) {
+                warn!(%error, "failed to persist config catalog");
+            }
+        }
+        #[cfg(not(feature = "discord"))]
+        let _ = catalog_payload;
+    }
+
+    /// Bring `conn` in line with the stored choices for `thread_id`. Values
+    /// the agent no longer offers are skipped rather than failing the turn.
+    /// File defaults for ids the agent does not report are still sent, which
+    /// is how `[pool] default_config_options` behaved before choices existed.
+    async fn apply_config_choices(
+        &self,
+        thread_id: &str,
+        conn: &mut AcpConnection,
+        include_defaults: bool,
+    ) {
+        let desired = self
+            .prefs()
+            .desired(thread_id, &self.default_config_options, include_defaults);
+        for (config_id, value) in desired {
+            match conn.config_options.iter().find(|option| option.id == config_id) {
+                Some(option) if option.current_value == value => continue,
+                Some(option) if !option.options.iter().any(|v| v.value == value) => {
+                    warn!(config_id, value, "stored config choice is no longer offered; skipping");
+                    continue;
+                }
+                None if !(include_defaults
+                    && self.default_config_options.get(&config_id) == Some(&value)) =>
+                {
+                    continue;
+                }
+                _ => {}
+            }
+            if let Err(e) = conn.set_config_option(&config_id, &value).await {
+                warn!(config_id, value, error = %e, "failed to apply config option");
+            }
+        }
+        let options = conn.config_options.clone();
+        self.record_config_view(thread_id, &options, false);
+    }
+
+    /// Options to show for `thread_id`, with current values reflecting what
+    /// the thread runs with (including a choice not yet applied). Never waits
+    /// on the session's connection.
+    pub async fn config_view(&self, thread_id: &str) -> Vec<ConfigOption> {
+        let live = self.state.read().await.active.contains_key(thread_id);
+        self.prefs()
+            .view(thread_id, &self.default_config_options, live)
+    }
+
+    /// Options for choosing the bot-wide default.
+    pub fn config_default_view(&self) -> Vec<ConfigOption> {
+        self.prefs().default_view(&self.default_config_options)
+    }
+
+    /// Store a thread's choice and apply it now when the session is idle.
+    /// Returns the outcome so the caller can say whether it took effect.
+    pub async fn choose_config(
+        &self,
+        thread_id: &str,
+        config_id: &str,
+        value: &str,
+    ) -> Result<ConfigChoiceOutcome> {
+        validate_choice(&self.config_view(thread_id).await, config_id, value)
+            .map_err(|e| anyhow!(e))?;
+        #[cfg(feature = "discord")]
+        if let Some(db) = &self.control_db {
+            db.set_config_preference(thread_id, config_id, value)?;
+        }
+        self.prefs()
+            .thread
+            .entry(thread_id.to_string())
+            .or_default()
+            .insert(config_id.to_string(), value.to_string());
+
+        let conn = self.state.read().await.active.get(thread_id).cloned();
+        let Some(conn) = conn else {
+            return Ok(ConfigChoiceOutcome::NextSession);
+        };
+        // A running turn holds the connection; the choice is applied when the
+        // next message reaches `get_or_create`.
+        let Ok(mut conn) = conn.try_lock() else {
+            return Ok(ConfigChoiceOutcome::NextTurn);
+        };
+        // The choice is already stored; a failure here only delays it.
+        let options = match conn.set_config_option(config_id, value).await {
+            Ok(options) => options,
+            Err(error) => {
+                warn!(config_id, value, %error, "could not apply config choice now; retrying next turn");
+                return Ok(ConfigChoiceOutcome::NextTurn);
+            }
+        };
+        drop(conn);
+        self.record_config_view(thread_id, &options, false);
+        Ok(ConfigChoiceOutcome::Applied)
+    }
+
+    /// Store the bot-wide default. Live sessions keep their current values;
+    /// new sessions without their own choice start with it.
+    pub fn choose_default_config(&self, config_id: &str, value: &str) -> Result<()> {
+        validate_choice(&self.config_default_view(), config_id, value).map_err(|e| anyhow!(e))?;
+        #[cfg(feature = "discord")]
+        if let Some(db) = &self.control_db {
+            db.set_config_default(config_id, value)?;
+        }
+        self.prefs()
+            .defaults
+            .insert(config_id.to_string(), value.to_string());
+        Ok(())
     }
 
     /// Wire the facade session-token registrar + facade URL, set by the root
@@ -668,10 +834,13 @@ impl SessionPool {
             // permanently jam ALL future messages for this thread_id (F1).
             // Lock held = busy streaming = alive (same convention as
             // has_active_session); cleanup_idle owns hung recovery.
-            let Ok(conn) = conn.try_lock() else {
+            let Ok(mut conn) = conn.try_lock() else {
                 return Ok(false);
             };
             if conn.alive() {
+                // A choice made while the previous turn was running lands
+                // here, before the next prompt is sent.
+                self.apply_config_choices(thread_id, &mut conn, false).await;
                 return Ok(false);
             }
             if saved_session_id.is_none() {
@@ -835,15 +1004,18 @@ impl SessionPool {
             ));
         }
 
-        if !resumed {
+        if resumed {
+            self.apply_config_choices(thread_id, &mut new_conn, false)
+                .await;
+        } else {
             new_conn.session_new(&effective_workdir).await?;
+            let reported = new_conn.config_options.clone();
+            self.record_config_view(thread_id, &reported, true);
 
-            // Apply default config options (e.g. mode=bypass, model=swe-1-6)
-            for (config_id, value) in &self.default_config_options {
-                if let Err(e) = new_conn.set_config_option(config_id, value).await {
-                    warn!(config_id, value, error = %e, "failed to set default config option");
-                }
-            }
+            // Defaults (e.g. mode=bypass, model=swe-1-6), then this thread's
+            // own choices.
+            self.apply_config_choices(thread_id, &mut new_conn, true)
+                .await;
 
             // Surface the reset banner both for restored sessions and for stale
             // live entries that died before we could recover a resumable
@@ -1032,7 +1204,10 @@ impl SessionPool {
             })?
         };
         let mut conn = conn.lock().await;
-        conn.set_config_option(config_id, value).await
+        let options = conn.set_config_option(config_id, value).await?;
+        drop(conn);
+        self.record_config_view(thread_id, &options, false);
+        Ok(options)
     }
 
     /// Query account-level usage/billing from the backend agent for a session

@@ -16,7 +16,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard};
 use tracing::info;
 
-const SCHEMA_VERSION: i64 = 3;
+const SCHEMA_VERSION: i64 = 4;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct UiSurface {
@@ -242,6 +242,89 @@ impl ControlDb {
         let tx = connection.transaction()?;
         replace_session_column(&tx, "workdir", entries)?;
         tx.commit()?;
+        Ok(())
+    }
+
+    /// Per-thread ACP config choices (model, mode), keyed by thread then
+    /// config id. A choice outlives the session it was made in, so a reset
+    /// or a container restart does not quietly fall back to the default.
+    pub fn load_config_preferences(
+        &self,
+    ) -> anyhow::Result<HashMap<String, HashMap<String, String>>> {
+        let connection = self.lock();
+        let mut statement = connection
+            .prepare("SELECT thread_key, config_id, value FROM session_config_preferences")?;
+        let rows = statement.query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+            ))
+        })?;
+        let mut preferences: HashMap<String, HashMap<String, String>> = HashMap::new();
+        for row in rows {
+            let (thread_key, config_id, value) = row?;
+            preferences
+                .entry(thread_key)
+                .or_default()
+                .insert(config_id, value);
+        }
+        Ok(preferences)
+    }
+
+    pub fn set_config_preference(
+        &self,
+        thread_key: &str,
+        config_id: &str,
+        value: &str,
+    ) -> anyhow::Result<()> {
+        self.lock().execute(
+            "INSERT INTO session_config_preferences(thread_key, config_id, value) \
+             VALUES (?1, ?2, ?3) \
+             ON CONFLICT(thread_key, config_id) DO UPDATE SET \
+             value = excluded.value, updated_at = CURRENT_TIMESTAMP",
+            params![thread_key, config_id, value],
+        )?;
+        Ok(())
+    }
+
+    /// Bot-wide config defaults chosen from Discord. They take precedence over
+    /// `[pool] default_config_options` so the default can change without a
+    /// config edit and restart.
+    pub fn load_config_defaults(&self) -> anyhow::Result<HashMap<String, String>> {
+        self.read_string_map("SELECT config_id, value FROM agent_config_defaults")
+    }
+
+    pub fn set_config_default(&self, config_id: &str, value: &str) -> anyhow::Result<()> {
+        self.lock().execute(
+            "INSERT INTO agent_config_defaults(config_id, value) VALUES (?1, ?2) \
+             ON CONFLICT(config_id) DO UPDATE SET \
+             value = excluded.value, updated_at = CURRENT_TIMESTAMP",
+            params![config_id, value],
+        )?;
+        Ok(())
+    }
+
+    /// The last config option list an agent reported, as JSON. Lets Discord
+    /// offer a model picker before a thread has a live session.
+    pub fn load_config_catalog(&self) -> anyhow::Result<Option<String>> {
+        Ok(self
+            .lock()
+            .query_row(
+                "SELECT payload FROM agent_config_catalog WHERE singleton = 1",
+                [],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?)
+    }
+
+    pub fn save_config_catalog(&self, payload: &str) -> anyhow::Result<()> {
+        self.lock().execute(
+            "INSERT INTO agent_config_catalog(singleton, payload) VALUES (1, ?1) \
+             ON CONFLICT(singleton) DO UPDATE SET \
+             payload = excluded.payload, updated_at = CURRENT_TIMESTAMP",
+            params![payload],
+        )?;
         Ok(())
     }
 
@@ -719,7 +802,12 @@ fn apply_migrations(connection: &mut Connection) -> anyhow::Result<()> {
         );
     }
 
-    for (version, sql) in [(1_i64, SCHEMA_V1), (2_i64, SCHEMA_V2), (3_i64, SCHEMA_V3)] {
+    for (version, sql) in [
+        (1_i64, SCHEMA_V1),
+        (2_i64, SCHEMA_V2),
+        (3_i64, SCHEMA_V3),
+        (4_i64, SCHEMA_V4),
+    ] {
         let applied = connection
             .query_row(
                 "SELECT 1 FROM control_schema_migrations WHERE version = ?1",
@@ -899,10 +987,50 @@ INSERT OR IGNORE INTO ui_surfaces(surface_id, title, accent_color, empty_text) V
     ('repository_queue', 'Repository Command Queue', 16705372, '目前沒有排隊中的指令。');
 "#;
 
+const SCHEMA_V4: &str = r#"
+CREATE TABLE IF NOT EXISTS session_config_preferences (
+    thread_key TEXT NOT NULL,
+    config_id TEXT NOT NULL,
+    value TEXT NOT NULL,
+    updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    PRIMARY KEY (thread_key, config_id)
+);
+CREATE TABLE IF NOT EXISTS agent_config_defaults (
+    config_id TEXT PRIMARY KEY,
+    value TEXT NOT NULL,
+    updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+CREATE TABLE IF NOT EXISTS agent_config_catalog (
+    singleton INTEGER PRIMARY KEY CHECK(singleton = 1),
+    payload TEXT NOT NULL,
+    updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+"#;
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use chrono::Utc;
+
+    #[test]
+    fn config_preferences_defaults_and_catalog_round_trip() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("control.db");
+        {
+            let db = ControlDb::open(path.clone()).unwrap();
+            db.set_config_preference("discord:1", "model", "a").unwrap();
+            db.set_config_preference("discord:1", "model", "b").unwrap();
+            db.set_config_preference("discord:1", "mode", "plan").unwrap();
+            db.set_config_default("model", "c").unwrap();
+            db.save_config_catalog("[]").unwrap();
+        }
+        let db = ControlDb::open(path).unwrap();
+        let preferences = db.load_config_preferences().unwrap();
+        assert_eq!(preferences["discord:1"]["model"], "b");
+        assert_eq!(preferences["discord:1"]["mode"], "plan");
+        assert_eq!(db.load_config_defaults().unwrap()["model"], "c");
+        assert_eq!(db.load_config_catalog().unwrap().as_deref(), Some("[]"));
+    }
 
     #[test]
     fn imports_projects_once_and_keeps_backup() {
@@ -969,7 +1097,7 @@ mod tests {
             .unwrap()
             .collect::<Result<Vec<_>, _>>()
             .unwrap();
-        assert_eq!(versions, vec![1, 2, 3]);
+        assert_eq!(versions, vec![1, 2, 3, 4]);
     }
 
     #[test]
@@ -1005,7 +1133,7 @@ mod tests {
                     |row| row.get::<_, i64>(0)
                 )
                 .unwrap(),
-            3
+            4
         );
         assert_eq!(
             connection
