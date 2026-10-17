@@ -51,7 +51,7 @@ FROM node:22-trixie-slim AS opencode-installer
 
 # Install opencode and keep only the executable for the runtime stage. Copying
 # the whole npm tree retains both the platform package and postinstall copy.
-ARG OPENCODE_VERSION=1.18.31
+ARG OPENCODE_VERSION=1.19.3
 RUN npm install -g opencode-ai@${OPENCODE_VERSION} --retry 3 \
     && test "$(opencode --version)" = "${OPENCODE_VERSION}"
 
